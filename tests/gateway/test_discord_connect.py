@@ -440,6 +440,81 @@ async def test_safe_sync_slash_commands_only_mutates_diffs():
 
 
 @pytest.mark.asyncio
+async def test_safe_sync_ignores_server_default_integration_types_when_unset():
+    """Discord expands an unset install scope to [guild, user] on readback.
+
+    An unconstrained local command must compare equal to that server-applied
+    default; otherwise every gateway restart deletes and recreates the entire
+    global slash-command set.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    desired = {
+        "name": "status",
+        "description": "Show Hermes session status",
+        "type": 1,
+        "options": [],
+        "nsfw": False,
+        "dm_permission": True,
+        "default_member_permissions": None,
+    }
+
+    class _DesiredCommand:
+        def to_dict(self, tree):
+            assert tree is not None
+            return dict(desired)
+
+    class _ExistingCommand:
+        id = 11
+        name = "status"
+        type = SimpleNamespace(value=1)
+        nsfw = False
+        guild_only = False
+        default_member_permissions = None
+
+        def to_dict(self):
+            return {
+                "id": self.id,
+                "application_id": 999,
+                **desired,
+                "integration_types": [0, 1],
+                "contexts": None,
+                "name_localizations": {},
+                "description_localizations": {},
+            }
+
+    fake_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand()],
+        fetch_commands=AsyncMock(return_value=[_ExistingCommand()]),
+    )
+    fake_http = SimpleNamespace(
+        upsert_global_command=AsyncMock(),
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        tree=fake_tree,
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary == {
+        "total": 1,
+        "unchanged": 1,
+        "updated": 0,
+        "recreated": 0,
+        "created": 0,
+        "deleted": 0,
+    }
+    fake_http.edit_global_command.assert_not_awaited()
+    fake_http.delete_global_command.assert_not_awaited()
+    fake_http.upsert_global_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_post_connect_initialization_retries_fingerprint_after_timeout(tmp_path, monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)

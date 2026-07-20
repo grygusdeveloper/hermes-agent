@@ -13,6 +13,7 @@ Covers four fix paths:
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 from types import SimpleNamespace
 
 import pytest
@@ -45,7 +46,7 @@ class StubAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append({"chat_id": chat_id, "content": content})
-        return SendResult(success=True, message_id="msg1")
+        return SendResult(success=True, message_id="1528825062260740297")
 
     async def send_typing(self, chat_id, metadata=None):
         pass
@@ -122,6 +123,84 @@ class TestBaseInterruptSuppression:
         # The pending message's response SHOULD have been sent.
         pending_sends = [s for s in adapter.sent if s["content"] == pending_response]
         assert len(pending_sends) == 1, "Pending message response should be sent"
+
+    @pytest.mark.asyncio
+    async def test_response_not_suppressed_without_interrupt(self):
+        """Normal case: no interrupt, response should be sent."""
+        adapter = StubAdapter()
+
+        async def fake_handler(event):
+            return "Normal response"
+
+        adapter.set_message_handler(fake_handler)
+        event = _make_event()
+        session_key = build_session_key(event.source)
+
+        await adapter._process_message_background(event, session_key)
+
+        assert any(s["content"] == "Normal response" for s in adapter.sent)
+
+    @pytest.mark.asyncio
+    async def test_successful_final_delivery_emits_exact_message_event(self):
+        adapter = StubAdapter()
+        hooks = SimpleNamespace(emit=AsyncMock())
+        setattr(adapter, "gateway_runner", SimpleNamespace(hooks=hooks))
+
+        async def fake_handler(event):
+            return "Normal response"
+
+        adapter.set_message_handler(fake_handler)
+        event = _make_event(
+            chat_id="1505353433685950710",
+            user_id="1922673",
+        )
+        session_key = build_session_key(event.source)
+
+        await adapter._process_message_background(event, session_key)
+
+        hooks.emit.assert_awaited_once()
+        event_type, context = hooks.emit.await_args.args
+        assert event_type == "message:sent"
+        assert context["kind"] == "final_response"
+        assert context["message_id"] == "1528825062260740297"
+        assert context["message_url"].endswith("/1528825062260740297")
+
+    @pytest.mark.asyncio
+    async def test_command_reply_does_not_emit_final_delivery_event(self):
+        adapter = StubAdapter()
+        hooks = SimpleNamespace(emit=AsyncMock())
+        setattr(adapter, "gateway_runner", SimpleNamespace(hooks=hooks))
+
+        async def fake_handler(event):
+            return "Status response"
+
+        adapter.set_message_handler(fake_handler)
+        event = _make_event(text="/status", chat_id="1505353433685950710")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        hooks.emit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_response_not_suppressed_with_interrupt_but_no_pending(self):
+        """Interrupt event set but no pending message (race already resolved) —
+        response should still be sent."""
+        adapter = StubAdapter()
+
+        async def fake_handler(event):
+            return "Valid response"
+
+        adapter.set_message_handler(fake_handler)
+        event = _make_event()
+        session_key = build_session_key(event.source)
+
+        # Set interrupt but no pending message
+        interrupt_event = asyncio.Event()
+        interrupt_event.set()
+        adapter._active_sessions[session_key] = interrupt_event
+
+        await adapter._process_message_background(event, session_key)
+
+        assert any(s["content"] == "Valid response" for s in adapter.sent)
 
 
 # Test 2: run.py — partial streamed output must not suppress final send

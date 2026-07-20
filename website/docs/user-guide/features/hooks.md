@@ -85,7 +85,12 @@ async def handle(event_type: str, context: dict):
 | `agent:end` | Agent finishes processing | same keys as `agent:start`, plus `response` (truncated to 500 chars) |
 | `reaction:added` | An emoji reaction was added to a message the bot can see (Slack adapter currently). Requires the `reactions:read` scope + the `reaction_added` bot event subscription; the bot must be a member of the channel. | `platform`, `reaction`, `user_id`, `item_user_id`, `item_type`, `channel_id`, `message_ts`, `team_id`, `event_ts`, `raw_event` |
 | `reaction:removed` | An emoji reaction was removed from a message the bot can see. Requires the `reaction_removed` bot event subscription. | same shape as `reaction:added` |
+| `message:sent` | Final assistant response is successfully delivered | `event_id`, `kind`, `platform`, `chat_id`, `thread_id`, `message_id`, `message_url`, `preview`, optional session/scope IDs |
+| `approval:sent` | Dangerous-command approval prompt is successfully delivered | Same safe delivery keys; `kind` is `approval` and `preview` contains only the redacted reason |
+| `clarify:sent` | Clarify/input prompt is successfully delivered | Same safe delivery keys; `kind` is `clarify` |
 | `command:*` | Any slash command executed | `platform`, `user_id`, `command`, `args` |
+
+Delivery events fire only after a platform ACK. Their `preview` is force-redacted and capped at 240 characters; `message_url` is populated only for validated Discord IDs. Raw adapter responses and raw approval commands are never exposed to hooks.
 
 #### Wildcard Matching
 

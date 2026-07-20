@@ -65,6 +65,13 @@ class TurnContext:
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
 
+    # Send metadata for the streaming consumer only.  It is derived from
+    # ``_status_thread_metadata`` but may carry extra keys (e.g. Discord's
+    # ``save_prompt``) that must NOT leak into the progress/status routing
+    # metadata shared by the other callbacks.  None → use
+    # ``_status_thread_metadata`` unchanged.
+    _stream_thread_metadata: Optional[dict] = None
+
     # ------------------------------------------------------------------
     # run_sync extraction (second wave of the seam): the closed-over locals
     # of ``_run_agent_inner`` that ``run_sync`` (and the four sibling bridge

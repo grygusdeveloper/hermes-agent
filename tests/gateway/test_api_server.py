@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import stat
@@ -314,6 +315,12 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    app.router.add_get("/v1/vault/roots", adapter._handle_vault_roots)
+    app.router.add_get("/v1/vault/tree", adapter._handle_vault_tree)
+    app.router.add_get("/v1/vault/search", adapter._handle_vault_search)
+    app.router.add_get("/v1/vault/attachments", adapter._handle_vault_attachments)
+    app.router.add_get("/v1/vault/note", adapter._handle_vault_note)
+    app.router.add_post("/v1/vault/update", adapter._handle_vault_update)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -2866,3 +2873,224 @@ class TestCreateAgentModelRecovery:
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
+
+
+class TestRemoteVaultEndpoints:
+    def _configure(self, monkeypatch, tmp_path, *, writable=True):
+        base = tmp_path / "hermes-vault"
+        (base / "staging" / "drafts").mkdir(parents=True)
+        (base / "staging" / "drafts" / "note.md").write_text("# Remote\nbody\n", encoding="utf-8")
+        (base / "staging" / "skip.bin").write_bytes(b"binary")
+        (base / "outside").mkdir()
+        monkeypatch.setenv("HERMES_REMOTE_VAULT_BASE_DIR", str(base))
+        monkeypatch.setenv("HERMES_REMOTE_VAULT_ENABLED", "true")
+        monkeypatch.setenv("HERMES_REMOTE_VAULT_ROOTS", "staging,research")
+        monkeypatch.setenv("HERMES_REMOTE_VAULT_WRITABLE", "true" if writable else "false")
+        return base
+
+    @pytest.mark.asyncio
+    async def test_roots_tree_and_note_are_scoped(self, monkeypatch, tmp_path):
+        base = self._configure(monkeypatch, tmp_path)
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            roots = await cli.get("/v1/vault/roots")
+            assert roots.status == 200
+            roots_body = await roots.json()
+            assert roots_body["roots"] == ["staging"]
+
+            tree = await cli.get("/v1/vault/tree?root=staging")
+            assert tree.status == 200
+            tree_body = await tree.json()
+            paths = {entry["path"] for entry in tree_body["entries"]}
+            assert "staging/drafts" in paths
+            assert "staging/drafts/note.md" in paths
+            assert "staging/skip.bin" not in paths
+
+            note = await cli.get("/v1/vault/note?path=staging/drafts/note.md")
+            assert note.status == 200
+            note_body = await note.json()
+            assert note_body["content"] == "# Remote\nbody\n"
+            assert note_body["sha256"] == hashlib.sha256((base / "staging" / "drafts" / "note.md").read_bytes()).hexdigest()
+
+            traversal = await cli.get("/v1/vault/note?path=staging/../outside/x.md")
+            assert traversal.status in {400, 404}
+
+    @pytest.mark.asyncio
+    async def test_update_is_base_hash_checked(self, monkeypatch, tmp_path):
+        base = self._configure(monkeypatch, tmp_path)
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        note_path = base / "staging" / "drafts" / "note.md"
+        original_hash = hashlib.sha256(note_path.read_bytes()).hexdigest()
+        async with TestClient(TestServer(app)) as cli:
+            ok = await cli.post("/v1/vault/update", json={
+                "path": "staging/drafts/note.md",
+                "content": "# Changed\n",
+                "baseHash": original_hash,
+            })
+            assert ok.status == 200
+            ok_body = await ok.json()
+            assert ok_body["accepted"] is True
+            assert note_path.read_text(encoding="utf-8") == "# Changed\n"
+
+            stale = await cli.post("/v1/vault/update", json={
+                "path": "staging/drafts/note.md",
+                "content": "# Clobber\n",
+                "baseHash": original_hash,
+            })
+            assert stale.status == 409
+            stale_body = await stale.json()
+            assert stale_body["accepted"] is False
+            assert "hash mismatch" in stale_body["detail"]
+
+    @pytest.mark.asyncio
+    async def test_update_can_be_disabled(self, monkeypatch, tmp_path):
+        self._configure(monkeypatch, tmp_path, writable=False)
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/vault/update", json={"path": "staging/x.md", "content": "x"})
+            assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_auth_is_enforced_on_vault_endpoints(self, monkeypatch, tmp_path):
+        self._configure(monkeypatch, tmp_path)
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            missing = await cli.get("/v1/vault/roots")
+            assert missing.status == 401
+            wrong = await cli.get("/v1/vault/roots", headers={"Authorization": "Bearer wrong"})
+            assert wrong.status == 401
+            ok = await cli.get("/v1/vault/roots", headers={"Authorization": "Bearer sk-secret"})
+            assert ok.status == 200
+
+    @pytest.mark.asyncio
+    async def test_symlink_escape_is_blocked(self, monkeypatch, tmp_path):
+        base = self._configure(monkeypatch, tmp_path)
+        outside_note = base / "outside" / "secret.md"
+        outside_note.write_text("secret", encoding="utf-8")
+        os.symlink(outside_note, base / "staging" / "link.md")
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            tree = await cli.get("/v1/vault/tree?root=staging")
+            assert tree.status == 200
+            tree_body = await tree.json()
+            assert "staging/link.md" not in {entry["path"] for entry in tree_body["entries"]}
+            note = await cli.get("/v1/vault/note?path=staging/link.md")
+            assert note.status == 404
+
+    @pytest.mark.asyncio
+    async def test_existing_update_requires_base_hash(self, monkeypatch, tmp_path):
+        self._configure(monkeypatch, tmp_path)
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/vault/update", json={
+                "path": "staging/drafts/note.md",
+                "content": "# Blind overwrite\n",
+            })
+            assert resp.status == 428
+
+    @pytest.mark.asyncio
+    async def test_remote_vault_can_be_disabled(self, monkeypatch, tmp_path):
+        self._configure(monkeypatch, tmp_path)
+        monkeypatch.setenv("HERMES_REMOTE_VAULT_ENABLED", "false")
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/vault/roots")
+            assert resp.status == 503
+
+            search = await cli.get("/v1/vault/search?q=remote")
+            assert search.status == 503
+
+            attachments = await cli.get("/v1/vault/attachments")
+            assert attachments.status == 503
+
+    @pytest.mark.asyncio
+    async def test_search_is_literal_scoped_and_bounded(self, monkeypatch, tmp_path):
+        base = self._configure(monkeypatch, tmp_path)
+        (base / "staging" / "drafts" / "tokens.json").write_text(
+            '{"note":"alpha rocket", "api_key":"sk-test-secret-value"}',
+            encoding="utf-8",
+        )
+        (base / "staging" / ".hidden.md").write_text("alpha hidden", encoding="utf-8")
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            too_short = await cli.get("/v1/vault/search?q=a")
+            assert too_short.status == 400
+
+            literal = await cli.get("/v1/vault/search?q=.*")
+            assert literal.status == 200
+            literal_body = await literal.json()
+            assert literal_body["entries"] == []
+
+            resp = await cli.get("/v1/vault/search?q=alpha&root=staging&limit=99999")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["limit"] == 100
+            paths = {entry["path"] for entry in body["entries"]}
+            assert "staging/drafts/tokens.json" in paths
+            assert "staging/.hidden.md" not in paths
+            hit = next(entry for entry in body["entries"] if entry["path"].endswith("tokens.json"))
+            assert len(hit["snippet"]) <= 160
+            assert "«redacted:sk-…»" not in hit["snippet"]
+            assert hit["sourceKind"] == "hermes"
+            assert hit["sourceLabel"] == "Hermes Remote Vault"
+            assert hit["canonical"] is False
+            assert hit["badge"] == "🟪 Hermes"
+            assert hit["openMode"] == "remote-vault-mirror"
+            assert hit["title"] == "tokens"
+
+            bad_root = await cli.get("/v1/vault/search?q=alpha&root=../outside")
+            assert bad_root.status == 400
+
+    @pytest.mark.asyncio
+    async def test_search_blocks_symlink_escapes(self, monkeypatch, tmp_path):
+        base = self._configure(monkeypatch, tmp_path)
+        outside_note = base / "outside" / "secret.md"
+        outside_note.write_text("escape-needle", encoding="utf-8")
+        os.symlink(outside_note, base / "staging" / "escaped.md")
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/vault/search?q=escape-needle&root=staging")
+            assert resp.status == 200
+            body = await resp.json()
+            assert "staging/escaped.md" not in {entry["path"] for entry in body["entries"]}
+
+    @pytest.mark.asyncio
+    async def test_attachments_are_metadata_only_and_scoped(self, monkeypatch, tmp_path):
+        base = self._configure(monkeypatch, tmp_path)
+        (base / "staging" / "image.png").write_bytes(b"\x89PNG\r\n")
+        (base / "staging" / ".hidden.png").write_bytes(b"hidden")
+        outside_file = base / "outside" / "leak.png"
+        outside_file.write_bytes(b"leak")
+        os.symlink(outside_file, base / "staging" / "leak.png")
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/vault/attachments?root=staging&limit=abc")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["limit"] == 100
+            paths = {entry["path"] for entry in body["entries"]}
+            assert "staging/image.png" in paths
+            assert "staging/skip.bin" in paths
+            assert "staging/drafts/note.md" not in paths
+            assert "staging/.hidden.png" not in paths
+            assert "staging/leak.png" not in paths
+            image = next(entry for entry in body["entries"] if entry["path"] == "staging/image.png")
+            assert image["mediaType"] == "image/png"
+            assert image["sourceKind"] == "hermes"
+            assert image["sourceLabel"] == "Hermes Remote Vault"
+            assert image["canonical"] is False
+            assert image["openMode"] == "remote-vault-mirror"
+            assert "content" not in image
+
+            bad_root = await cli.get("/v1/vault/attachments?root=../outside")
+            assert bad_root.status == 400

@@ -2277,20 +2277,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
+        _fallback_reason = getattr(reason, "value", None) or str(reason or "unknown")
+        _fallback_status = (
+            f"🔄 Provider fallback: {old_provider}/{old_model} → "
+            f"{fb_provider}/{fb_model} ({_fallback_reason})"
         )
-        # The buffered line above is dropped on successful recovery, but a
-        # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
+        _notify_immediately = bool(getattr(agent, "notify_on_fallback", False))
+        if os.getenv("HERMES_NOTIFY_ON_FALLBACK", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            _notify_immediately = True
+
+        if _notify_immediately:
+            # Explicit operator opt-in: surface the provider switch as soon as
+            # it happens. Do not also queue the success-path notice below.
+            agent._emit_status(_fallback_status)
+            agent._pending_fallback_notice = None
+        else:
+            # Keep the upstream retry-buffer contract: terminal failure flushes
+            # this detail, while successful recovery clears the noisy buffer.
+            agent._buffer_status(_fallback_status)
+            # A provider/model switch is still a durable state change. The
+            # success path emits this once immediately before clearing retries.
+            agent._pending_fallback_notice = _fallback_status
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,

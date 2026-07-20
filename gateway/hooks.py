@@ -14,6 +14,9 @@ Events:
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
+  - message:sent        -- Final assistant response successfully delivered
+  - approval:sent       -- Dangerous-command approval prompt delivered
+  - clarify:sent        -- Clarify/input prompt delivered
   - command:*           -- Any slash command executed (wildcard match)
 
 Errors in hooks are caught and logged but never block the main pipeline.
@@ -32,6 +35,19 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   response     -- agent response text (truncated to 500 chars)
   model        -- model name that handled the turn
   provider     -- provider that handled the turn
+
+Successful-delivery events (``message:sent``, ``approval:sent``, and
+``clarify:sent``) fire only after the platform ACKs a real message. Their
+contexts are deliberately bounded and safe for outbound notification hooks:
+  event_id     -- stable ``kind:platform:channel:message`` dedupe key
+  kind         -- ``final_response`` | ``approval`` | ``clarify``
+  platform, user_id, chat_id, thread_id, chat_type, scope_id
+  session_id, session_key (when available)
+  message_id   -- exact delivered platform message id
+  message_url  -- exact Discord HTTPS link when all IDs validate, else ``None``
+  preview      -- force-redacted, whitespace-normalized, max 240 characters
+
+Raw adapter responses and unredacted commands are never included.
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``

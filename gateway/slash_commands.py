@@ -34,6 +34,7 @@ from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.topic_links import sanitize_discord_topic_label
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
@@ -133,6 +134,16 @@ class GatewaySlashCommandsMixin:
         # Snapshot the old entry so on_session_finalize can report the
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
+        # A spawned workspace binds its selected model to the routing key, not
+        # to one transcript generation. Preserve it across /new while ordinary
+        # ad-hoc /model overrides keep the historical clear-on-reset behavior.
+        _spawn_model_binding = (
+            dict(old_entry.model_override)
+            if old_entry is not None
+            and old_entry.execution_profile
+            and old_entry.model_override
+            else None
+        )
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
@@ -215,6 +226,10 @@ class GatewaySlashCommandsMixin:
 
         # Reset the session
         new_entry = await self.async_session_store.reset_session(session_key)
+        if new_entry is not None and _spawn_model_binding:
+            await self.async_session_store.set_model_override(
+                session_key, _spawn_model_binding
+            )
 
         # (Conversation-scoped overrides + security state were already
         # cleared via _clear_conversation_scope above.)
@@ -1667,6 +1682,117 @@ class GatewaySlashCommandsMixin:
             reply.text,
             getattr(getattr(event, "source", None), "platform", None),
         )
+
+    async def _handle_topics_command(self, event: MessageEvent) -> str:
+        """Handle /topics — link to the first message of recent Discord replies."""
+        source = getattr(event, "source", None)
+        if source is None or source.platform != Platform.DISCORD:
+            return "`/topics` is currently available in Discord chats."
+
+        raw_args = event.get_command_args().strip()
+        if raw_args:
+            try:
+                count = int(raw_args.split()[0])
+            except (TypeError, ValueError):
+                return "Usage: `/topics [count]` (count must be from 1 to 25)"
+        else:
+            count = 10
+        if count < 1 or count > 25:
+            return "Usage: `/topics [count]` (count must be from 1 to 25)"
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        indexer = getattr(adapter, "get_recent_response_topics", None)
+        if indexer is None:
+            return "The Discord topic index is unavailable until the gateway is restarted."
+
+        before_message_id = (
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+        )
+        try:
+            topics = await indexer(
+                str(source.thread_id or source.chat_id),
+                before_message_id=before_message_id,
+                limit=count,
+            )
+        except Exception:
+            logger.warning("Discord /topics history scan failed", exc_info=True)
+            return (
+                "I couldn't read this chat's message history. Check that Hermes "
+                "has **View Channel** and **Read Message History** permissions."
+            )
+
+        if not topics:
+            return "No completed Hermes responses were found in the recent chat history."
+
+        lines = ["## Recent answered topics"]
+        for idx, topic in enumerate(topics, 1):
+            title = sanitize_discord_topic_label(
+                str(topic.get("title") or "Untitled response")
+            )
+            # Escape Markdown link-label delimiters without changing the snippet.
+            title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            jump_url = str(topic.get("jump_url") or "")
+            if jump_url:
+                lines.append(f"{idx}. [{title}]({jump_url})")
+            else:
+                lines.append(f"{idx}. {title}")
+        lines.extend(["", f"Newest first · showing {len(topics)} · `/topics [1–25]`"])
+        return "\n".join(lines)
+
+    async def _handle_favorites_command(self, event: MessageEvent) -> str:
+        """Handle /favorites — list the user's newest saved Discord responses."""
+        source = getattr(event, "source", None)
+        if source is None or source.platform != Platform.DISCORD:
+            return "`/favorites` is currently available in Discord chats."
+
+        raw_args = event.get_command_args().strip()
+        if raw_args:
+            try:
+                count = int(raw_args.split()[0])
+            except (TypeError, ValueError):
+                return "Usage: `/favorites [count]` (count must be from 1 to 25)"
+        else:
+            count = 10
+        if count < 1 or count > 25:
+            return "Usage: `/favorites [count]` (count must be from 1 to 25)"
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        lister = getattr(adapter, "list_user_favorites", None)
+        if lister is None:
+            return "Saved favorites are unavailable until the gateway is restarted."
+
+        user_id = getattr(source, "user_id", None)
+        if not user_id:
+            return "I couldn't determine who you are to look up your favorites."
+
+        try:
+            favorites = await lister(str(user_id), count)
+        except Exception:
+            logger.warning("Discord /favorites lookup failed", exc_info=True)
+            return "I couldn't read your saved favorites right now."
+
+        if not favorites:
+            return (
+                "You haven't saved any favorites yet. Tap **⭐ Favorite** under a "
+                "Hermes response to save it."
+            )
+
+        lines = ["## Your favorites"]
+        for idx, fav in enumerate(favorites, 1):
+            title = sanitize_discord_topic_label(
+                str(fav.get("prompt") or fav.get("content") or "Saved response")
+            )
+            title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            jump_url = str(fav.get("jump_url") or "")
+            if jump_url:
+                lines.append(f"{idx}. [{title}]({jump_url})")
+            else:
+                lines.append(f"{idx}. {title}")
+        lines.extend(
+            ["", f"Newest first · showing {len(favorites)} · `/favorites [1–25]`"]
+        )
+        return "\n".join(lines)
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
@@ -3301,6 +3427,274 @@ class GatewaySlashCommandsMixin:
                 "use /diff --stat for a summary)"
             )
         return f"```diff\n{diff}{note}\n```"
+
+    async def _handle_spawn_command(self, event: MessageEvent) -> str:
+        """Create a Main-owned Discord thread bound to a profile and model.
+
+        Plain-text syntax supports ``/spawn [agent] [model] [title...]`` and
+        an optional explicit ``--prompt``. The native Discord command emits
+        explicit ``--agent``, ``--model``, ``--title`` and ``--prompt`` flags
+        so values containing spaces remain unambiguous.
+        """
+        if event.source.platform != Platform.DISCORD:
+            return "`/spawn` is available only on Discord."
+
+        raw = event.get_command_args().strip()
+        try:
+            tokens = shlex.split(raw) if raw else []
+        except ValueError as exc:
+            return f"❌ Invalid `/spawn` arguments: {exc}"
+
+        values: dict[str, str] = {
+            "agent": "",
+            "model": "",
+            "title": "",
+            "prompt": "",
+        }
+        positional: list[str] = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token in {"--agent", "--model", "--title", "--prompt"}:
+                key = token[2:]
+                i += 1
+                if i >= len(tokens):
+                    return f"❌ `{token}` requires a value."
+                values[key] = tokens[i].strip()
+            else:
+                positional.append(token)
+            i += 1
+        if not values["agent"] and positional:
+            values["agent"] = positional.pop(0)
+        if not values["model"] and positional:
+            values["model"] = positional.pop(0)
+        if not values["title"] and positional:
+            values["title"] = " ".join(positional)
+
+        from gateway.run import _load_gateway_config
+        from hermes_cli.profiles import (
+            list_profiles,
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
+
+        raw_config = _load_gateway_config() or {}
+        gateway_cfg = raw_config.get("gateway") if isinstance(raw_config, dict) else {}
+        gateway_cfg = gateway_cfg if isinstance(gateway_cfg, dict) else {}
+        spawn_cfg = gateway_cfg.get("spawn") or {}
+        spawn_cfg = spawn_cfg if isinstance(spawn_cfg, dict) else {}
+
+        agents_cfg = spawn_cfg.get("agents") or {}
+        agents_cfg = agents_cfg if isinstance(agents_cfg, dict) else {}
+        requested_agent = (
+            values["agent"]
+            or str(spawn_cfg.get("default_agent") or "main")
+        ).strip().lower()
+        agent_spec = agents_cfg.get(requested_agent)
+        if isinstance(agent_spec, str):
+            profile_name = agent_spec
+            agent_spec = {"profile": profile_name}
+        elif isinstance(agent_spec, dict):
+            profile_name = str(agent_spec.get("profile") or requested_agent)
+        elif requested_agent in {"main", "default"}:
+            profile_name = "default"
+            agent_spec = {}
+        else:
+            profile_name = requested_agent
+            agent_spec = {}
+
+        try:
+            profile_name = normalize_profile_name(profile_name)
+            validate_profile_name(profile_name)
+        except ValueError as exc:
+            return f"❌ Invalid agent/profile `{requested_agent}`: {exc}"
+        if not profile_exists(profile_name):
+            available = sorted({"main", *(p.name for p in list_profiles())})
+            return (
+                f"❌ Agent `{requested_agent}` maps to profile `{profile_name}`, "
+                "but that profile is not installed.\n"
+                f"Available agents/profiles: {', '.join(f'`{p}`' for p in available)}"
+            )
+
+        parent_channel_id = str(
+            spawn_cfg.get("parent_channel_id")
+            or spawn_cfg.get("channel_id")
+            or ""
+        ).strip()
+        if not parent_channel_id:
+            return (
+                "❌ `/spawn` has no parent channel configured. Set "
+                "`gateway.spawn.parent_channel_id` in `config.yaml`."
+            )
+
+        requested_model = values["model"].strip()
+        model_override: dict[str, str] | None = None
+        model_aliases: dict[str, Any] = {}
+        global_models = spawn_cfg.get("models")
+        if isinstance(global_models, dict):
+            model_aliases.update(global_models)
+        agent_models = agent_spec.get("models") if isinstance(agent_spec, dict) else None
+        if isinstance(agent_models, dict):
+            model_aliases.update(agent_models)
+        if requested_model:
+            model_key = requested_model.lower()
+            mapped_model = model_aliases.get(model_key)
+            if mapped_model is None:
+                available_models = sorted(str(name) for name in model_aliases)
+                available_hint = (
+                    ", ".join(f"`{name}`" for name in available_models)
+                    if available_models
+                    else "none configured"
+                )
+                return (
+                    f"❌ Unknown model alias `{requested_model}`. "
+                    f"Available for `{requested_agent}`: {available_hint}"
+                )
+            if isinstance(mapped_model, str):
+                model_override = {"model": mapped_model.strip()}
+            elif isinstance(mapped_model, dict):
+                model_override = {
+                    key: str(mapped_model[key]).strip()
+                    for key in ("model", "provider", "base_url")
+                    if mapped_model.get(key) not in (None, "")
+                }
+            if not model_override or not model_override.get("model"):
+                return f"❌ Model alias `{requested_model}` has no model configured."
+
+        prompt = values["prompt"].strip()
+        title = values["title"].strip()
+        if not title:
+            if prompt:
+                title = prompt.splitlines()[0]
+            else:
+                model_label = requested_model or "default-model"
+                title = f"{requested_agent} · {model_label}"
+        title = re.sub(r"\s+", " ", title).strip()[:80] or "Hermes task"
+
+        adapter = self._adapter_for_source(event.source)
+        create_spawn_thread = getattr(adapter, "create_spawn_thread", None)
+        if adapter is None or not callable(create_spawn_thread):
+            return "❌ The active Discord adapter does not support `/spawn`."
+
+        model_display = requested_model or "profile default"
+        if prompt:
+            next_step = "The initial task is queued below and will run immediately."
+        else:
+            next_step = (
+                "Post your first real task in this thread. Mention HermesGPT if "
+                "the thread requires mentions."
+            )
+        starter = (
+            "🧵 **Hermes workspace spawned**\n"
+            f"- Agent: `{requested_agent}` (profile `{profile_name}`)\n"
+            f"- Model: `{model_display}`\n"
+            "- Visible responder: `HermesGPT / Main`\n\n"
+            f"{next_step}"
+        )
+        result = await create_spawn_thread(
+            parent_chat_id=parent_channel_id,
+            name=title,
+            starter_content=starter,
+            owner_user_id=event.source.user_id,
+        )
+        if not isinstance(result, dict) or not result.get("success"):
+            error = result.get("error") if isinstance(result, dict) else "unknown error"
+            return f"❌ Failed to create spawned thread: {error}"
+
+        thread_id = str(result.get("thread_id") or "").strip()
+        if not thread_id:
+            return "❌ Discord created a thread without returning its ID."
+        guild_id = str(result.get("guild_id") or "").strip() or None
+        thread_name = str(result.get("thread_name") or title)
+        spawned_source = dataclasses.replace(
+            event.source,
+            chat_id=thread_id,
+            chat_name=thread_name,
+            chat_type="thread",
+            thread_id=thread_id,
+            parent_chat_id=parent_channel_id,
+            scope_id=guild_id,
+            guild_id=guild_id,
+            message_id=None,
+            profile=None,
+        )
+        session_entry = await self.async_session_store.get_or_create_session(
+            spawned_source
+        )
+        await self.async_session_store.set_execution_profile(
+            session_entry.session_key, profile_name
+        )
+        if model_override:
+            await self.async_session_store.set_model_override(
+                session_entry.session_key, model_override
+            )
+            # Force first-turn credential re-resolution inside the selected
+            # profile's secret scope rather than Main's current scope.
+            self._session_model_overrides.pop(session_entry.session_key, None)
+
+        if prompt:
+            send_prompt = getattr(adapter, "send", None)
+            if callable(send_prompt):
+                try:
+                    sender = event.source.user_name or event.source.user_id or "user"
+                    visible_prompt = f"👤 **Initial task from {sender}**\n\n{prompt}"
+                    pending_send = send_prompt(
+                        thread_id,
+                        visible_prompt,
+                        metadata={
+                            "thread_id": thread_id,
+                            "parent_chat_id": parent_channel_id,
+                        },
+                    )
+                    send_result = (
+                        await pending_send
+                        if inspect.isawaitable(pending_send)
+                        else pending_send
+                    )
+                    if getattr(send_result, "success", True) is False:
+                        logger.warning(
+                            "Discord /spawn initial task display failed for thread=%s: %s",
+                            thread_id,
+                            getattr(send_result, "error", "unknown send error"),
+                        )
+                except Exception:
+                    logger.warning(
+                        "Discord /spawn could not display the initial task in thread=%s",
+                        thread_id,
+                        exc_info=True,
+                    )
+
+            kickoff_event = MessageEvent(
+                text=prompt,
+                message_type=MessageType.TEXT,
+                source=spawned_source,
+                channel_prompt=event.channel_prompt,
+            )
+            dispatch_prompt = getattr(adapter, "handle_message", None)
+            if not callable(dispatch_prompt):
+                raise RuntimeError(
+                    "active Discord adapter cannot dispatch the spawned prompt"
+                )
+            pending_dispatch = dispatch_prompt(kickoff_event)
+            if inspect.isawaitable(pending_dispatch):
+                await pending_dispatch
+
+        logger.info(
+            "Discord /spawn created thread=%s parent=%s agent=%s profile=%s model=%s user=%s",
+            thread_id,
+            parent_channel_id,
+            requested_agent,
+            profile_name,
+            requested_model or "(profile default)",
+            event.source.user_id,
+        )
+        prompt_status = "\nInitial task: queued" if prompt else ""
+        return (
+            f"✅ Spawned <#{thread_id}>\n"
+            f"Agent: `{requested_agent}` · Model: `{model_display}`"
+            f"{prompt_status}"
+        )
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.

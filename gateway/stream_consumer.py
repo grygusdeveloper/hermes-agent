@@ -326,6 +326,8 @@ class GatewayStreamConsumer:
         *,
         final: bool = False,
         expect_edits: bool = False,
+        controls: bool = False,
+        save_content: str | None = None,
     ) -> dict | None:
         """Return per-send metadata for stream-created messages.
 
@@ -337,6 +339,15 @@ class GatewayStreamConsumer:
         preview messages that may be edited later must stay on the editable
         legacy send path, while fresh/fallback final sends can still use richer
         final-message delivery.
+
+        ``controls`` marks ``final_response`` so the Discord save controls
+        attach to this message, and ``save_content`` carries the complete
+        logical response so the controls persist the full answer even when the
+        streaming consumer delivered it across multiple chunks.  ``controls``
+        defaults to ``final`` so single-message finals behave as before; multi
+        chunk fallbacks pass ``controls`` on the first chunk only (while still
+        marking every chunk ``final`` for ``notify`` semantics) so the ⭐/📚
+        buttons land on exactly one message.
         """
         meta = dict(self.metadata) if self.metadata else {}
         if self._initial_reply_to_id:
@@ -345,6 +356,10 @@ class GatewayStreamConsumer:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+        if controls:
+            meta["final_response"] = True
+            if save_content is not None:
+                meta["save_response_content"] = save_content
         return meta or None
 
     @property
@@ -388,8 +403,15 @@ class GatewayStreamConsumer:
         message_id: str,
         content: str,
         finalize: bool = False,
+        metadata_override: dict | None = None,
     ):
-        """Edit via the adapter, passing routing metadata when supported."""
+        """Edit via the adapter, passing routing metadata when supported.
+
+        ``metadata_override`` supplies the finalize-edit metadata (carrying
+        ``final_response`` + the complete ``save_response_content``) so the
+        Discord save controls attach to the finalized message; when omitted the
+        stored session ``self.metadata`` is forwarded unchanged.
+        """
         kwargs = {
             "chat_id": self.chat_id,
             "message_id": message_id,
@@ -399,14 +421,15 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        _meta = metadata_override if metadata_override is not None else self.metadata
+        if _meta:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = _meta
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -916,6 +939,12 @@ class GatewayStreamConsumer:
                         chunks_delivered = False
                         reply_to = self._initial_reply_to_id
                         all_heads_delivered = len(chunks) > 1
+                        # The COMPLETE logical response, captured before the
+                        # split loop rewrites ``_accumulated`` to the tail.  The
+                        # Discord save controls attach to exactly ONE message —
+                        # the sealed heads never carry them — and that message
+                        # must persist the whole answer, not just its own chunk.
+                        _full_final = self._accumulated
                         for chunk in chunks[:-1]:
                             new_id = await self._send_new_chunk(
                                 chunk,
@@ -963,7 +992,12 @@ class GatewayStreamConsumer:
                             tail_delivered = True
                             if self._accumulated:
                                 tail_delivered = await self._send_or_edit(
-                                    self._accumulated, finalize=True,
+                                    self._accumulated,
+                                    finalize=True,
+                                    # The tail is the one message that carries
+                                    # the save controls for this split answer,
+                                    # so it must persist the whole response.
+                                    save_content_override=_full_final,
                                 )
                             # Only claim final delivery if the sealed chunks and
                             # final tail actually landed.  ``_already_sent`` may
@@ -1244,10 +1278,17 @@ class GatewayStreamConsumer:
         reply_to_id: Optional[str],
         *,
         final: bool = False,
+        controls: bool = False,
+        save_content: str | None = None,
     ) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
         Returns the message_id so callers can thread subsequent chunks.
+
+        ``controls``/``save_content`` attach the Discord save controls to this
+        chunk with the complete logical response.  When a turn-final answer is
+        delivered across multiple new chunks, only the first should pass
+        ``controls=True`` so the ⭐/📚 buttons land on exactly one message.
         """
         text = self._clean_for_display(text)
         if not text.strip():
@@ -1260,6 +1301,8 @@ class GatewayStreamConsumer:
                 metadata=self._metadata_for_send(
                     final=final,
                     expect_edits=not final,
+                    controls=controls,
+                    save_content=save_content
                 ),
             )
             if result.success and result.message_id:
@@ -1465,14 +1508,22 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks):
+            # Only the FIRST fallback chunk carries the save controls (and the
+            # complete logical response); later chunks suppress them so the
+            # ⭐/📚 buttons land on exactly one message.
+            _is_first_chunk = chunk_index == 0
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=self._metadata_for_send(
+                        final=True,
+                        controls=_is_first_chunk,
+                        save_content=(final_text if _is_first_chunk else None),
+                    ),
                 )
                 if result.success:
                     break
@@ -1937,7 +1988,13 @@ class GatewayStreamConsumer:
         # fresh-final path.  Mirrors the REQUIRES_EDIT_FINALIZE gate in __init__.
         return result is True
 
-    async def _try_fresh_final(self, text: str, *, is_turn_final: bool = True) -> bool:
+    async def _try_fresh_final(
+        self,
+        text: str,
+        *,
+        is_turn_final: bool = True,
+        save_content_override: Optional[str] = None,
+    ) -> bool:
         """Send ``text`` as a brand-new message (best-effort delete the old
         preview) so the platform's visible timestamp reflects completion
         time.  Returns True on successful delivery, False on any failure so
@@ -1970,7 +2027,15 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=self._metadata_for_send(
+                    final=True,
+                    controls=is_turn_final,
+                    save_content=(
+                        (text if save_content_override is None else save_content_override)
+                        if is_turn_final
+                        else None
+                    ),
+                ),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2062,7 +2127,12 @@ class GatewayStreamConsumer:
         )
 
     async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        is_turn_final: bool = True,
+        save_content_override: Optional[str] = None,
     ) -> bool:
         """Send or edit the streaming message.
 
@@ -2072,6 +2142,11 @@ class GatewayStreamConsumer:
 
         ``finalize`` is True when this is the last edit in a streaming
         sequence.
+
+        ``save_content_override`` supplies the complete logical response for the
+        Discord save controls when ``text`` is only the tail of an answer that
+        was split across several messages; without it the controls would
+        persist just the visible fragment.
         """
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
@@ -2091,6 +2166,9 @@ class GatewayStreamConsumer:
         _visible_stripped = visible_without_cursor.strip()
         if not _visible_stripped:
             return True  # cursor-only / whitespace-only update
+        # What the save controls persist: the complete logical response when the
+        # caller split it across messages, otherwise this message's own text.
+        _save_text = text if save_content_override is None else save_content_override
         if not text.strip():
             return True  # nothing to send is "success"
         # Guard: do not create a brand-new standalone message when the only
@@ -2201,7 +2279,9 @@ class GatewayStreamConsumer:
                             )
                         )
                         and await self._try_fresh_final(
-                            text, is_turn_final=is_turn_final,
+                            text,
+                            is_turn_final=is_turn_final,
+                            save_content_override=save_content_override,
                         )
                     ):
                         return True
@@ -2210,6 +2290,17 @@ class GatewayStreamConsumer:
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,
+                        metadata_override=(
+                            self._metadata_for_send(
+                                final=True,
+                                controls=(finalize and is_turn_final),
+                                save_content=(
+                                    _save_text if (finalize and is_turn_final) else None
+                                ),
+                            )
+                            if finalize
+                            else None
+                        ),
                     )
                     if result.success:
                         self._already_sent = True
@@ -2375,6 +2466,8 @@ class GatewayStreamConsumer:
                     metadata=self._metadata_for_send(
                         final=finalize,
                         expect_edits=not finalize,
+                        controls=finalize,
+                        save_content=(_save_text if finalize else None)
                     ),
                 )
                 if result.success:

@@ -307,6 +307,151 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     assert event.source.chat_type == "group"
 
 
+
+
+@pytest.mark.asyncio
+async def test_discord_voice_linked_parent_thread_still_requires_mention(adapter, monkeypatch):
+    """Threads under a voice-linked channel should still require @mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    adapter._voice_text_channels[111] = 789
+    message = make_message(
+        channel=FakeThread(channel_id=790, parent=FakeTextChannel(channel_id=789)),
+        content="thread reply without mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_default_keeps_responding_after_participation(adapter, monkeypatch):
+    """Default behavior: once the bot is in a thread, it auto-responds without @mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_THREAD_REQUIRE_MENTION", raising=False)
+
+    thread = FakeThread(channel_id=456, name="follow-up")
+    adapter._threads.mark("456")  # bot has previously participated
+
+    message = make_message(channel=thread, content="follow-up without mention")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_require_mention_gates_followups(adapter, monkeypatch):
+    """When thread_require_mention=true, even bot-participated threads need @mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="multi-bot thread")
+    adapter._threads.mark("456")  # bot has previously participated
+
+    message = make_message(channel=thread, content="ambient chatter — not for me")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_spawn_thread_owner_bypasses_thread_mention_gate(adapter, monkeypatch):
+    """The human who invoked /spawn can continue without repeated mentions."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="owned spawn thread")
+    adapter._threads.mark("456")
+    adapter._spawn_owners.mark("456:42")
+
+    message = make_message(channel=thread, content="follow-up without mention")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "follow-up without mention"
+
+
+@pytest.mark.asyncio
+async def test_spawn_thread_other_user_still_requires_mention(adapter, monkeypatch):
+    """The spawned-owner exemption must not turn the thread into ambient chat."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="owned spawn thread")
+    adapter._threads.mark("456")
+    adapter._spawn_owners.mark("456:42")
+
+    message = make_message(channel=thread, content="ambient message from someone else")
+    message.author.id = 43
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovered_spawn_owner_message_bypasses_thread_mention_gate(adapter, monkeypatch):
+    """Startup backfill replays a missed owner follow-up after a gateway restart."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="owned spawn thread")
+    adapter._spawn_owners.mark("456:42")
+    adapter._discord_message_admission = MagicMock(return_value=(True, False))
+    message = make_message(channel=thread, content="missed while restarting")
+
+    dispatched = await adapter._dispatch_recovered_message(message)
+
+    assert dispatched is True
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_require_mention_still_responds_when_mentioned(adapter, monkeypatch):
+    """thread_require_mention=true still lets explicit @mentions through in threads."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="multi-bot thread")
+    adapter._threads.mark("456")
+    bot_user = adapter._client.user
+
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> hey, this one's for you",
+        mentions=[bot_user],
+    )
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_require_mention_via_config_extra(adapter, monkeypatch):
+    """thread_require_mention can also be set via config.extra (yaml)."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_THREAD_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["thread_require_mention"] = True
+
+    thread = FakeThread(channel_id=456, name="multi-bot thread")
+    adapter._threads.mark("456")
+
+    message = make_message(channel=thread, content="ambient — should be ignored")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+
 @pytest.mark.asyncio
 async def test_fetch_channel_context_stops_at_self_message_and_reverses_to_chronological_order(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
@@ -707,6 +852,29 @@ async def test_discord_send_does_not_cache_nonconversational_status_as_history_b
     assert result.success is True
     assert adapter._last_self_message_id["777"] == "111"
     assert "222" in adapter._nonconversational_messages
+
+
+@pytest.mark.asyncio
+async def test_discord_send_persists_first_completed_response_message(adapter):
+    class SendingChannel(FakeTextChannel):
+        async def send(self, content, reference=None):
+            return SimpleNamespace(id=333)
+
+    channel = SendingChannel(channel_id=777)
+    adapter._client = SimpleNamespace(
+        user=adapter._client.user,
+        get_channel=lambda channel_id: channel if channel_id == 777 else None,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+
+    result = await adapter.send(
+        "777",
+        "Completed response",
+        metadata={"final_response": True},
+    )
+
+    assert result.success is True
+    assert "333" in adapter._final_response_messages
 
 
 @pytest.mark.asyncio

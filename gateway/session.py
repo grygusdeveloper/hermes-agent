@@ -770,6 +770,25 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     return cleaned or None
 
 
+def sanitize_execution_profile(profile: Any) -> Optional[str]:
+    """Return a safe canonical profile id for a brokered spawned session.
+
+    The value is later resolved beneath ``~/.hermes/profiles``. Persist only
+    profile identifiers accepted by the normal profile CLI and reject malformed
+    or path-like values on rehydration as defence in depth.
+    """
+    if profile in (None, ""):
+        return None
+    try:
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        canonical = normalize_profile_name(str(profile))
+        validate_profile_name(canonical)
+        return canonical
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class SessionEntry:
     """
@@ -868,6 +887,12 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Brokered Discord /spawn binding. This is deliberately separate from
+    # ``origin.profile``: origin.profile selects a reply adapter in a normal
+    # multiplexer; execution_profile changes only the per-turn runtime scope.
+    # Replies therefore stay on the Main bot that created the thread.
+    execution_profile: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -911,6 +936,10 @@ class SessionEntry:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.execution_profile:
+            result["execution_profile"] = sanitize_execution_profile(
+                self.execution_profile
+            )
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -1000,6 +1029,9 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
+            execution_profile=sanitize_execution_profile(
+                data.get("execution_profile")
+            ),
         )
 
 
@@ -2550,6 +2582,21 @@ class SessionStore:
             else:
                 _reset_reason = self._should_reset(_entry_for_checks, source)
 
+        # A /spawn binding belongs to the routing key (the Discord thread), not
+        # one transcript generation. Carry it across automatic resets and
+        # force-new transitions. The selected model is part of that binding.
+        _binding_entry = _entry_for_checks or force_new_observed_entry
+        _carried_execution_profile = (
+            sanitize_execution_profile(_binding_entry.execution_profile)
+            if _binding_entry is not None
+            else None
+        )
+        _carried_model_override = (
+            sanitize_model_override(_binding_entry.model_override)
+            if _carried_execution_profile and _binding_entry is not None
+            else None
+        )
+
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
         # Healthy-path saves only bump updated_at on one entry; they take
@@ -2663,6 +2710,8 @@ class SessionStore:
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
                 prev_session_id=prev_session_id,
+                execution_profile=_carried_execution_profile,
+                model_override=_carried_model_override,
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -2853,6 +2902,30 @@ class SessionStore:
             if entry is None:
                 return None
             return dict(entry.model_override) if entry.model_override else None
+
+    def set_execution_profile(
+        self, session_key: str, profile: Optional[str]
+    ) -> None:
+        """Persist the brokered execution profile for a spawned session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            cleaned = sanitize_execution_profile(profile)
+            if entry.execution_profile == cleaned:
+                return
+            entry.execution_profile = cleaned
+            self._save()
+
+    def get_execution_profile(self, session_key: str) -> Optional[str]:
+        """Return the spawned session's execution profile, if any."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            return sanitize_execution_profile(entry.execution_profile)
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.
@@ -3168,6 +3241,12 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                execution_profile=old_entry.execution_profile,
+                model_override=(
+                    old_entry.model_override
+                    if old_entry.execution_profile
+                    else None
+                ),
             )
 
             self._entries[session_key] = new_entry
@@ -3305,6 +3384,12 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                execution_profile=old_entry.execution_profile,
+                model_override=(
+                    old_entry.model_override
+                    if old_entry.execution_profile
+                    else None
+                ),
             )
 
             self._entries[session_key] = new_entry

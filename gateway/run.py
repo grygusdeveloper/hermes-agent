@@ -492,6 +492,19 @@ def _seed_hygiene_system_prompt(
     return bool(stored_prompt)
 
 
+def _final_response_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    platform: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Mark completed Discord answers so history indexes can target them."""
+    if _gateway_platform_value(platform) != "discord":
+        return metadata
+    merged = dict(metadata or {})
+    merged["final_response"] = True
+    return merged
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -613,6 +626,23 @@ def _redact_approval_command(cmd: "str | None") -> str:
     from agent.redact import redact_sensitive_text
 
     return redact_sensitive_text(str(cmd or ""), force=True)
+
+
+def _attach_confirmed_stream_delivery_id(response, consumer) -> None:
+    """Attach the exact streamed-final message ID to an agent result.
+
+    The marker is present only after the duplicate-suppression path has set
+    ``already_sent``.  A partial stream or fallback normal send therefore
+    cannot emit a premature or duplicate post-delivery notification.
+    """
+    if (
+        isinstance(response, dict)
+        and response.get("already_sent")
+        and consumer is not None
+        and getattr(consumer, "message_id", None)
+    ):
+        response["_delivery_message_id"] = str(consumer.message_id)
+
 
 
 def _format_exec_approval_fallback(
@@ -1873,12 +1903,19 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     the process-global ``os.environ`` here would defeat that isolation and leak
     the default profile's keys to every profile's turns and subprocesses.
     """
-    from agent.secret_scope import is_multiplex_active
-    if is_multiplex_active():
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+    if is_multiplex_active() or current_secret_scope() is not None:
         # Credentials are resolved from the active profile's secret scope, not
-        # os.environ. Still honor config.yaml's agent.max_turns bridge below
-        # using the scoped home, but never reload .env into global env.
-        _bridge_max_turns_from_config(_hermes_home)
+        # os.environ. This also covers brokered /spawn turns on an otherwise
+        # single-profile gateway. Never mutate global env while a scoped agent
+        # is running; bridge only the scoped profile's non-secret iteration cap.
+        try:
+            from hermes_constants import get_hermes_home
+
+            scoped_home = Path(get_hermes_home())
+        except Exception:
+            scoped_home = _hermes_home
+        _bridge_max_turns_from_config(scoped_home)
         return
 
     load_hermes_dotenv(
@@ -4658,7 +4695,11 @@ class TurnRunner:
                         adapter=_adapter,
                         chat_id=ctx.source.chat_id,
                         config=_consumer_cfg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=(
+                            ctx._stream_thread_metadata
+                            if ctx._stream_thread_metadata is not None
+                            else ctx._status_thread_metadata
+                        ),
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",)))
                             if ctx.progress_queue is not None
@@ -5121,6 +5162,37 @@ class TurnRunner:
         agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
 
         # ------------------------------------------------------------------
+        # User-blocking prompt delivery events.  The adapter send remains
+        # authoritative; notification hooks run only after a successful ACK
+        # and can never change the send result.
+        # ------------------------------------------------------------------
+        async def _send_prompt_with_delivery_event(
+            send_coro,
+            *,
+            event_type: str,
+            kind: str,
+            preview: str,
+        ):
+            result = await send_coro
+            if (
+                getattr(result, "success", False)
+                and getattr(result, "message_id", None)
+            ):
+                from gateway.notification_events import emit_delivery_event
+
+                await emit_delivery_event(
+                    hooks=self._runner.hooks,
+                    event_type=event_type,
+                    source=ctx.source,
+                    message_id=result.message_id,
+                    kind=kind,
+                    preview=preview,
+                    session_key=ctx.session_key,
+                    session_id=ctx.session_id,
+                )
+            return result
+
+        # ------------------------------------------------------------------
         # Clarify callback: present a clarify prompt and block on a response.
         #
         # Runs on the agent's worker thread (see clarify_tool's synchronous
@@ -5177,13 +5249,18 @@ class TurnRunner:
 
             send_ok = False
             fut = safe_schedule_threadsafe(
-                ctx._status_adapter.send_clarify(
-                    chat_id=ctx._status_chat_id,
-                    question=question,
-                    choices=list(choices) if choices else None,
-                    clarify_id=clarify_id,
-                    session_key=ctx.session_key or "",
-                    metadata=ctx._status_thread_metadata,
+                _send_prompt_with_delivery_event(
+                    ctx._status_adapter.send_clarify(
+                        chat_id=ctx._status_chat_id,
+                        question=question,
+                        choices=list(choices) if choices else None,
+                        clarify_id=clarify_id,
+                        session_key=ctx.session_key or "",
+                        metadata=ctx._status_thread_metadata,
+                    ),
+                    event_type="clarify:sent",
+                    kind="clarify",
+                    preview=question,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -5331,15 +5408,20 @@ class TurnRunner:
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
                     _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
+                        _send_prompt_with_delivery_event(
+                            ctx._status_adapter.send_exec_approval(
+                                chat_id=ctx._status_chat_id,
+                                command=cmd,
+                                session_key=_approval_session_key,
+                                description=desc,
+                                metadata=ctx._status_thread_metadata,
+                                allow_permanent=approval_data.get("allow_permanent", True),
+                                allow_session=approval_data.get("allow_session", True),
+                                smart_denied=approval_data.get("smart_denied", False),
+                            ),
+                            event_type="approval:sent",
+                            kind="approval",
+                            preview=desc,
                         ),
                         ctx._loop_for_step,
                         logger=logger,
@@ -5374,10 +5456,15 @@ class TurnRunner:
             )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
-                        ctx._status_chat_id,
-                        msg,
-                        metadata=ctx._status_thread_metadata,
+                    _send_prompt_with_delivery_event(
+                        ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            msg,
+                            metadata=ctx._status_thread_metadata,
+                        ),
+                        event_type="approval:sent",
+                        kind="approval",
+                        preview=desc,
                     ),
                     ctx._loop_for_step,
                     logger=logger,
@@ -9527,13 +9614,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=getattr(source, "chat_type", None) if source is not None else None,
-                    reply_to_message_id=reply_to_message_id,
-                    adapter=adapter,
+                metadata = _non_conversational_metadata(
+                    self._thread_metadata_for_target(
+                        platform,
+                        chat_id,
+                        thread_id,
+                        chat_type=getattr(source, "chat_type", None) if source is not None else None,
+                        reply_to_message_id=reply_to_message_id,
+                        adapter=adapter,
+                    ),
+                    platform=platform,
                 )
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
@@ -14433,6 +14523,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "profile": self._handle_profile_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
+                # Control-plane only: /spawn creates a *different* Discord
+                # thread/session, and /topics + /favorites are read-only
+                # index lookups. None of them touch this session's agent, so
+                # they must stay usable while it is busy.
+                "spawn": self._handle_spawn_command,
+                "topics": self._handle_topics_command,
+                "favorites": self._handle_favorites_command,
             }.get(name)
             if plain is not None:
                 return await plain(event)
@@ -15470,7 +15567,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
-        
+
+        if canonical == "topics":
+            return await self._handle_topics_command(event)
+
+        if canonical == "favorites":
+            return await self._handle_favorites_command(event)
+
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
@@ -15708,6 +15811,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "background":
             return await self._handle_background_command(event)
+
+        if canonical == "spawn":
+            return await self._handle_spawn_command(event)
 
         if canonical == "queue":
             queue_payload = event.get_command_args().strip()
@@ -16992,8 +17098,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             pass
                         await adapter.send(
-                            source.chat_id, notice,
-                            metadata=self._thread_metadata_for_source(source),
+                            source.chat_id,
+                            notice,
+                            metadata={
+                                **self._thread_metadata_for_source(source),
+                                "non_conversational": True,
+                            },
                         )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
@@ -18641,6 +18751,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                _stream_delivery_message_id = agent_result.get("_delivery_message_id")
+                if _stream_delivery_message_id:
+                    from gateway.notification_events import emit_delivery_event
+
+                    await emit_delivery_event(
+                        hooks=self.hooks,
+                        event_type="message:sent",
+                        source=source,
+                        message_id=_stream_delivery_message_id,
+                        kind="final_response",
+                        preview=response,
+                        session_key=session_key,
+                        session_id=getattr(session_entry, "session_id", None),
+                    )
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -24711,6 +24835,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        if source.platform == Platform.DISCORD:
+            # Carry the originating prompt through to the one final message
+            # that owns the save controls, so favorites and Notion get a useful
+            # title even when delivery happened through streaming edits.
+            _thread_metadata = dict(_thread_metadata or {})
+            _thread_metadata["save_prompt"] = getattr(event, "text", None)
 
         if _streaming_enabled:
             try:
@@ -24905,6 +25035,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        # Brokered /spawn sessions deliberately keep ``source.profile`` empty so
+        # replies use Main's platform adapter. Resolve their execution profile
+        # from the durable session entry and scope only the agent turn.
+        execution_profile = None
+        if session_key:
+            try:
+                execution_profile = await self.async_session_store.get_execution_profile(
+                    session_key
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to resolve spawned execution profile for %s",
+                    session_key,
+                    exc_info=True,
+                )
+        if execution_profile and execution_profile != "default":
+            from hermes_cli.profiles import get_profile_dir, profile_exists
+
+            if not profile_exists(execution_profile):
+                return {
+                    "final_response": (
+                        f"⚠️ Spawned agent profile `{execution_profile}` is no "
+                        "longer installed. Create that profile or use `/spawn` "
+                        "with another agent."
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "completed": False,
+                    "history_offset": len(history),
+                    "session_id": session_id,
+                }
+            with _profile_runtime_scope(get_profile_dir(execution_profile)):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth,
+                    event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -25558,6 +25730,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx._status_chat_id = _status_chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
+        if source.platform == Platform.DISCORD:
+            # Preserve the originating prompt for the final response record
+            # (favorites / Notion titles) without changing the progress/status
+            # routing metadata shared by the other callbacks.
+            turn_ctx._stream_thread_metadata = {
+                **(_status_thread_metadata or {}),
+                "save_prompt": getattr(event, "text", None),
+            }
 
         # ---- Streaming TTS consumer setup (#60671) ----
         # Created on the gateway event-loop thread (here, in _run_agent_inner),
@@ -26416,7 +26596,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 first_response,
                                 source=source,
                                 adapter=adapter,
-                                metadata=_status_thread_metadata,
+                                metadata=_final_response_metadata(
+                                    _status_thread_metadata,
+                                    platform=source.platform,
+                                ),
                                 event_message_id=event_message_id,
                                 text_already_delivered=_already_streamed,
                                 deliver_media=not _delivery_result.get("failed"),
@@ -26764,6 +26947,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,
                         )
+
+            # Carry the exact confirmed platform message into the outer gateway
+            # return path.  The base adapter suppresses its normal send when
+            # ``already_sent`` is true, so this is the only post-delivery event
+            # seam for successfully streamed finals.  Fallback normal sends do
+            # not receive this marker and therefore cannot double-emit.
+            _attach_confirmed_stream_delivery_id(response, _sc)
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

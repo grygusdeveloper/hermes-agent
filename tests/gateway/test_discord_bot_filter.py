@@ -3,7 +3,7 @@
 import os
 import re
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 def _make_author(*, bot: bool = False, is_self: bool = False):
@@ -138,8 +138,10 @@ class TestDiscordBotFilter(unittest.TestCase):
 
     def test_default_is_none(self):
         """Default behavior (no env var) should be 'none'."""
-        default = os.getenv("DISCORD_ALLOW_BOTS", "none")
-        self.assertEqual(default, "none")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISCORD_ALLOW_BOTS", None)
+            default = os.getenv("DISCORD_ALLOW_BOTS", "none")
+            self.assertEqual(default, "none")
 
 
 if __name__ == "__main__":

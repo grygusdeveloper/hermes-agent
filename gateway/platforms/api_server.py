@@ -8,6 +8,14 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET  /v1/vault/roots             — list scoped Hermes Vault roots for Obsidian bridge
+- GET  /v1/vault/tree              — list scoped server-side Hermes Vault notes
+- GET  /v1/vault/note              — read one scoped server-side Hermes Vault note
+- POST /v1/vault/update            — base-hash-checked server-side Hermes Vault note update
+- GET  /v1/vault/search            — search scoped server-side Hermes Vault text notes
+- GET  /v1/vault/attachments       — list scoped server-side Hermes Vault attachment metadata
+- POST /v1/kanban/cards            — create/dry-run server-side Kanban cards for trusted clients
+- GET  /v1/kanban/cards            — list server-side Kanban tasks (Cockpit view) for trusted clients
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -49,6 +57,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import mimetypes
 import os
 import re
 import sqlite3
@@ -56,7 +65,7 @@ import sys
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
@@ -119,6 +128,11 @@ def _get_scoped_secret(name, default=None):
     return val if val is not None else default
 
 
+try:
+    from .automation_connector import AutomationError, AutomationService
+except ImportError:  # copied-file/focused-test execution
+    from automation_connector import AutomationError, AutomationService
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,6 +170,35 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+
+REMOTE_VAULT_DEFAULT_ROOTS = (
+    "Inbox",
+    "Ideas",
+    "Operations",
+    "Projects",
+    "Research",
+    "System",
+    "research",
+    "inner-brain",
+    "staging",
+    "drafts",
+)
+REMOTE_VAULT_TEXT_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".json", ".yaml", ".yml"})
+REMOTE_VAULT_SEARCH_DEFAULT_LIMIT = 20
+REMOTE_VAULT_SEARCH_MAX_LIMIT = 100
+REMOTE_VAULT_ATTACHMENTS_DEFAULT_LIMIT = 100
+REMOTE_VAULT_ATTACHMENTS_MAX_LIMIT = 500
+REMOTE_VAULT_MAX_SCAN_FILES = 5000
+REMOTE_VAULT_SNIPPET_CHARS = 160
+
+
+def _coerce_request_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """Parse and clamp untrusted integer query/body values."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(parsed, maximum))
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):
@@ -1418,6 +1461,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # Privileged provider credentials and durable action state live only on
+        # Main. An unconfigured service advertises no executable actions.
+        self._automation_service = AutomationService()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1471,6 +1517,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Remote Vault search cache: path -> (mtime_ns, size, decoded_text, sha256).
+        # This makes repeated Obsidian vault searches avoid re-reading and re-hashing unchanged notes.
+        self._remote_vault_text_cache: Dict[str, tuple[int, int, str, str]] = {}
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1664,6 +1713,419 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return resolve_effective_model(explicit, profile_name, "hermes-agent")
+
+    @staticmethod
+    def _coerce_remote_vault_roots(value: Any, *, allow_hidden: bool = False) -> tuple[str, ...]:
+        """Normalize configured remote-vault roots to safe POSIX-relative paths."""
+        if isinstance(value, str):
+            items = [x.strip() for x in value.split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            items = [str(x).strip() for x in value]
+        else:
+            items = list(REMOTE_VAULT_DEFAULT_ROOTS)
+
+        roots: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            rel = APIServerAdapter._normalize_remote_vault_rel(item, allow_hidden=allow_hidden)
+            if not rel:
+                continue
+            if rel not in seen:
+                roots.append(rel)
+                seen.add(rel)
+        return tuple(roots)
+
+    @staticmethod
+    def _normalize_remote_vault_rel(value: Any, *, allow_hidden: bool = False) -> Optional[str]:
+        """Return a safe vault-relative POSIX path, or None when unsafe."""
+        raw = str(value or "").strip()
+        if not raw or "\\" in raw:
+            return None
+        posix = PurePosixPath(raw)
+        if posix.is_absolute():
+            return None
+        parts = posix.parts
+        if not parts:
+            return None
+        safe: list[str] = []
+        for part in parts:
+            if part in {"", ".", ".."}:
+                return None
+            if part == ".git" or (part.startswith(".") and not allow_hidden):
+                return None
+            safe.append(part)
+        return "/".join(safe)
+
+    @staticmethod
+    def _path_within(child: Path, parent: Path) -> bool:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _remote_vault_iso_mtime(path: Path) -> str:
+        try:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(path.stat().st_mtime))
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _remote_vault_hash_bytes(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def _remote_vault_settings(self) -> Dict[str, Any]:
+        """Load remote-vault settings from config with safe env overrides."""
+        raw: Dict[str, Any] = {}
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            cfg = cfg_get(load_config(), "gateway", "api_server", "remote_vault", default={})
+            if isinstance(cfg, dict):
+                raw = cfg
+        except Exception:
+            raw = {}
+
+        # Filesystem exposure must fail closed.  Older drafts used True here,
+        # but if config loading fails or the remote_vault block is absent, the
+        # API must not silently expose the default server vault surface.
+        enabled_default = bool(raw.get("enabled", False))
+        enabled = _coerce_request_bool(os.getenv("HERMES_REMOTE_VAULT_ENABLED"), enabled_default)
+        allow_hidden = _coerce_request_bool(os.getenv("HERMES_REMOTE_VAULT_ALLOW_HIDDEN"), bool(raw.get("allow_hidden", False)))
+        writable = _coerce_request_bool(os.getenv("HERMES_REMOTE_VAULT_WRITABLE"), bool(raw.get("writable", True)))
+        base_dir = os.getenv("HERMES_REMOTE_VAULT_BASE_DIR") or str(raw.get("base_dir") or "/root/workspace/hermes-vault")
+        roots_value: Any = os.getenv("HERMES_REMOTE_VAULT_ROOTS") or raw.get("roots") or list(REMOTE_VAULT_DEFAULT_ROOTS)
+        try:
+            max_file_bytes = int(os.getenv("HERMES_REMOTE_VAULT_MAX_FILE_BYTES") or raw.get("max_file_bytes") or 262144)
+        except (TypeError, ValueError):
+            max_file_bytes = 262144
+        max_file_bytes = max(1024, min(max_file_bytes, MAX_REQUEST_BYTES))
+        return {
+            "enabled": enabled,
+            "base_dir": Path(base_dir).expanduser(),
+            "roots": self._coerce_remote_vault_roots(roots_value, allow_hidden=allow_hidden),
+            "max_file_bytes": max_file_bytes,
+            "allow_hidden": allow_hidden,
+            "writable": writable,
+        }
+
+    def _remote_vault_base(self, settings: Optional[Dict[str, Any]] = None) -> Optional[Path]:
+        settings = settings or self._remote_vault_settings()
+        base = settings["base_dir"]
+        try:
+            resolved = base.resolve(strict=True)
+        except OSError:
+            return None
+        if not resolved.is_dir():
+            return None
+        return resolved
+
+    def _remote_vault_root_for_rel(self, rel: str, settings: Dict[str, Any]) -> Optional[str]:
+        roots = sorted(settings.get("roots") or (), key=len, reverse=True)
+        for root in roots:
+            if rel == root or rel.startswith(root + "/"):
+                return root
+        return None
+
+    def _remote_vault_resolve(self, rel: str, settings: Dict[str, Any]) -> tuple[Optional[Path], Optional[Path], Optional[str]]:
+        base = self._remote_vault_base(settings)
+        if base is None:
+            return None, None, "Remote vault base is unavailable."
+        root = self._remote_vault_root_for_rel(rel, settings)
+        if not root:
+            return None, None, "Path is outside the allowed remote vault roots."
+        root_dir = (base / root).resolve(strict=False)
+        try:
+            if root_dir.exists():
+                root_dir = root_dir.resolve(strict=True)
+        except OSError:
+            return None, None, "Remote vault root is unavailable."
+        if not self._path_within(root_dir, base) or not root_dir.is_dir():
+            return None, None, "Remote vault root is unavailable."
+        try:
+            candidate = (base / rel).resolve(strict=False)
+        except OSError:
+            return None, None, "Remote vault path is invalid."
+        if not self._path_within(candidate, root_dir):
+            return None, None, "Path is outside the allowed remote vault root."
+        return candidate, root_dir, None
+
+    @staticmethod
+    def _remote_vault_file_allowed(path: Path) -> bool:
+        return path.suffix.lower() in REMOTE_VAULT_TEXT_SUFFIXES
+
+    def _remote_vault_existing_roots(
+        self,
+        settings: Dict[str, Any],
+        *,
+        root_filter: Optional[str] = None,
+    ) -> tuple[Optional[Path], list[tuple[str, Path]], Optional[str], int, str]:
+        """Return configured existing root directories under the remote-vault base."""
+        base = self._remote_vault_base(settings)
+        if base is None:
+            return None, [], "Remote vault base is unavailable.", 503, "remote_vault_unavailable"
+
+        roots = tuple(settings.get("roots") or ())
+        if root_filter:
+            normalized = self._normalize_remote_vault_rel(root_filter, allow_hidden=bool(settings.get("allow_hidden")))
+            if not normalized or normalized not in roots:
+                return base, [], "Root is not allowed.", 400, "remote_vault_root_not_allowed"
+            roots = (normalized,)
+
+        resolved_roots: list[tuple[str, Path]] = []
+        for root in roots:
+            root_dir, _, err = self._remote_vault_resolve(root, settings)
+            if err or root_dir is None:
+                if root_filter:
+                    return base, [], err or "Remote vault root is unavailable.", 404, "remote_vault_root_unavailable"
+                continue
+            try:
+                root_dir = root_dir.resolve(strict=True)
+            except OSError:
+                if root_filter:
+                    return base, [], "Remote vault root is unavailable.", 404, "remote_vault_root_unavailable"
+                continue
+            if root_dir.is_dir() and self._path_within(root_dir, base):
+                resolved_roots.append((root, root_dir))
+        return base, resolved_roots, None, 200, ""
+
+    def _remote_vault_iter_files(
+        self,
+        root_dir: Path,
+        settings: Dict[str, Any],
+        *,
+        want_text: Optional[bool] = None,
+        max_scan_files: int = REMOTE_VAULT_MAX_SCAN_FILES,
+        stats: Optional[Dict[str, Any]] = None,
+    ):
+        """Yield safe files under a resolved root without following symlink escapes."""
+        allow_hidden = bool(settings.get("allow_hidden"))
+        scanned = int(stats.get("scanned_files", 0)) if stats is not None else 0
+        for current, dirs, files in os.walk(root_dir, followlinks=False):
+            cur = Path(current)
+            safe_dirs: list[str] = []
+            for dirname in dirs:
+                if dirname == ".git" or (dirname.startswith(".") and not allow_hidden):
+                    continue
+                dpath = cur / dirname
+                try:
+                    resolved_dir = dpath.resolve(strict=True)
+                except OSError:
+                    continue
+                if resolved_dir.is_dir() and self._path_within(resolved_dir, root_dir):
+                    safe_dirs.append(dirname)
+            dirs[:] = safe_dirs
+
+            for filename in files:
+                if filename == ".git" or (filename.startswith(".") and not allow_hidden):
+                    continue
+                fpath = cur / filename
+                is_text = self._remote_vault_file_allowed(fpath)
+                try:
+                    resolved = fpath.resolve(strict=True)
+                except OSError:
+                    continue
+                if not resolved.is_file() or not self._path_within(resolved, root_dir):
+                    continue
+                scanned += 1
+                if stats is not None:
+                    stats["scanned_files"] = scanned
+                if scanned > max_scan_files:
+                    if stats is not None:
+                        stats["truncated"] = True
+                    return
+                if want_text is not None and is_text != want_text:
+                    continue
+                yield resolved
+
+    @staticmethod
+    def _remote_vault_snippet(text: str, match_index: int, needle_len: int) -> str:
+        half = max(20, (REMOTE_VAULT_SNIPPET_CHARS - max(needle_len, 1)) // 2)
+        start = max(0, match_index - half)
+        end = min(len(text), match_index + max(needle_len, 1) + half)
+        snippet = text[start:end]
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(text):
+            snippet += "…"
+        snippet = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", snippet)
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+        return redact_sensitive_text(snippet)[:REMOTE_VAULT_SNIPPET_CHARS]
+
+    @staticmethod
+    def _remote_vault_result_metadata(rel: str, root: str) -> Dict[str, Any]:
+        title = PurePosixPath(rel).stem or rel
+        return {
+            "source": "hermes-remote-vault",
+            "sourceKind": "hermes",
+            "sourceLabel": "Hermes Remote Vault",
+            "canonical": False,
+            "badge": "🟪 Hermes",
+            "title": title,
+            "displayPath": rel,
+            "openMode": "remote-vault-mirror",
+            "root": root,
+        }
+
+    def _remote_vault_cached_text_hash(self, resolved: Path) -> tuple[str, str, int]:
+        stat = resolved.stat()
+        key = str(resolved)
+        cached = self._remote_vault_text_cache.get(key)
+        if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2], cached[3], stat.st_size
+        data = resolved.read_bytes()
+        text = data.decode("utf-8")
+        sha = self._remote_vault_hash_bytes(data)
+        if len(self._remote_vault_text_cache) > 2048:
+            self._remote_vault_text_cache.clear()
+        self._remote_vault_text_cache[key] = (stat.st_mtime_ns, stat.st_size, text, sha)
+        return text, sha, stat.st_size
+
+    def _remote_vault_tree_sync(self, root_rel: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+        base, roots, err, status, code = self._remote_vault_existing_roots(settings, root_filter=root_rel)
+        if err or base is None or not roots:
+            return {"error": err or "Remote vault root is unavailable.", "status": status, "code": code}
+        _, root_dir = roots[0]
+        allow_hidden = bool(settings.get("allow_hidden"))
+        entries: list[Dict[str, Any]] = []
+        for current, dirs, files in os.walk(root_dir, followlinks=False):
+            cur = Path(current)
+            safe_dirs: list[str] = []
+            for dirname in dirs:
+                if dirname == ".git" or (dirname.startswith(".") and not allow_hidden):
+                    continue
+                dpath = cur / dirname
+                try:
+                    resolved = dpath.resolve(strict=True)
+                except OSError:
+                    continue
+                if resolved.is_dir() and self._path_within(resolved, root_dir):
+                    safe_dirs.append(dirname)
+                    rel = resolved.relative_to(base).as_posix()
+                    entries.append({"path": rel, "type": "folder", "state": "server-only"})
+            dirs[:] = safe_dirs
+            for filename in files:
+                if filename == ".git" or (filename.startswith(".") and not allow_hidden):
+                    continue
+                fpath = cur / filename
+                if not self._remote_vault_file_allowed(fpath):
+                    continue
+                try:
+                    resolved = fpath.resolve(strict=True)
+                    if not resolved.is_file() or not self._path_within(resolved, root_dir):
+                        continue
+                    size = resolved.stat().st_size
+                    if size > int(settings.get("max_file_bytes") or 262144):
+                        continue
+                    data = resolved.read_bytes()
+                    rel = resolved.relative_to(base).as_posix()
+                    sha = self._remote_vault_hash_bytes(data)
+                    entries.append({
+                        "path": rel,
+                        "type": "file",
+                        "size": size,
+                        "modified": self._remote_vault_iso_mtime(resolved),
+                        "hash": sha,
+                        "sha256": sha,
+                        "state": "server-only",
+                    })
+                except OSError:
+                    continue
+        entries.sort(key=lambda e: (str(e.get("type")) != "folder", str(e.get("path"))))
+        return {"entries": entries}
+
+    def _remote_vault_search_sync(
+        self,
+        query: str,
+        settings: Dict[str, Any],
+        *,
+        root_filter: Optional[str],
+        limit: int,
+    ) -> Dict[str, Any]:
+        base, roots, err, status, code = self._remote_vault_existing_roots(settings, root_filter=root_filter)
+        if err or base is None:
+            return {"error": err or "Remote vault base is unavailable.", "status": status, "code": code}
+        needle = query.casefold()
+        max_file_bytes = int(settings.get("max_file_bytes") or 262144)
+        matches: list[Dict[str, Any]] = []
+        stats = {"scanned_files": 0, "truncated": False}
+        for root, root_dir in roots:
+            for resolved in self._remote_vault_iter_files(root_dir, settings, want_text=True, stats=stats):
+                try:
+                    size = resolved.stat().st_size
+                    if size > max_file_bytes:
+                        continue
+                    rel = resolved.relative_to(base).as_posix()
+                    basename = resolved.name
+                    path_hit = needle in rel.casefold() or needle in basename.casefold()
+                    try:
+                        text, sha, size = self._remote_vault_cached_text_hash(resolved)
+                    except UnicodeDecodeError:
+                        continue
+                    idx = text.casefold().find(needle)
+                    if not path_hit and idx < 0:
+                        continue
+                    matches.append({
+                        **self._remote_vault_result_metadata(rel, root),
+                        "path": rel,
+                        "type": "file",
+                        "match": "content" if idx >= 0 else "path",
+                        "snippet": self._remote_vault_snippet(text, idx, len(query)) if idx >= 0 else "",
+                        "size": size,
+                        "modified": self._remote_vault_iso_mtime(resolved),
+                        "hash": sha,
+                        "sha256": sha,
+                    })
+                except OSError:
+                    continue
+            if stats.get("truncated"):
+                break
+        matches.sort(key=lambda e: str(e.get("path")))
+        truncated = bool(stats.get("truncated") or len(matches) > limit)
+        matches = matches[:limit]
+        return {"entries": matches, "truncated": truncated, "scanned_files": int(stats.get("scanned_files") or 0)}
+
+    def _remote_vault_attachments_sync(
+        self,
+        settings: Dict[str, Any],
+        *,
+        root_filter: Optional[str],
+        limit: int,
+    ) -> Dict[str, Any]:
+        base, roots, err, status, code = self._remote_vault_existing_roots(settings, root_filter=root_filter)
+        if err or base is None:
+            return {"error": err or "Remote vault base is unavailable.", "status": status, "code": code}
+        attachments: list[Dict[str, Any]] = []
+        stats = {"scanned_files": 0, "truncated": False}
+        for root, root_dir in roots:
+            for resolved in self._remote_vault_iter_files(root_dir, settings, want_text=False, stats=stats):
+                try:
+                    suffix = resolved.suffix.lower()
+                    if not suffix:
+                        continue
+                    media_type, _ = mimetypes.guess_type(str(resolved))
+                    rel = resolved.relative_to(base).as_posix()
+                    attachments.append({
+                        **self._remote_vault_result_metadata(rel, root),
+                        "path": rel,
+                        "type": "attachment",
+                        "extension": suffix.lstrip("."),
+                        "mediaType": media_type or "application/octet-stream",
+                        "size": resolved.stat().st_size,
+                        "modified": self._remote_vault_iso_mtime(resolved),
+                    })
+                except OSError:
+                    continue
+            if stats.get("truncated"):
+                break
+        attachments.sort(key=lambda e: str(e.get("path")))
+        truncated = bool(stats.get("truncated") or len(attachments) > limit)
+        attachments = attachments[:limit]
+        return {"entries": attachments, "truncated": truncated, "scanned_files": int(stats.get("scanned_files") or 0)}
+
+    def _remote_vault_error(self, message: str, *, status: int = 400, code: str = "remote_vault_error") -> "web.Response":
+        return web.json_response(_openai_error(message, code=code), status=status)
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -2051,8 +2513,21 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            # Privileged provider-backed automation actions (Main-only; an
+            # unconfigured AutomationService advertises no executable actions).
+            ("POST", "/v1/automation/actions", self._handle_automation_actions),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            # Remote Obsidian vault surface (roots/tree/search/attachments/note/update).
+            ("GET", "/v1/vault/roots", self._handle_vault_roots),
+            ("GET", "/v1/vault/tree", self._handle_vault_tree),
+            ("GET", "/v1/vault/search", self._handle_vault_search),
+            ("GET", "/v1/vault/attachments", self._handle_vault_attachments),
+            ("GET", "/v1/vault/note", self._handle_vault_note),
+            ("POST", "/v1/vault/update", self._handle_vault_update),
+            # Kanban board cards (list + create/mutate).
+            ("GET", "/v1/kanban/cards", self._handle_kanban_cards_list),
+            ("POST", "/v1/kanban/cards", self._handle_kanban_cards),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3092,6 +3567,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        remote_vault_settings = self._remote_vault_settings()
+        remote_vault_enabled = bool(remote_vault_settings.get("enabled"))
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3132,17 +3610,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
+                "remote_vault": remote_vault_enabled,
+                "remote_vault_update": remote_vault_enabled and bool(remote_vault_settings.get("writable", True)),
+                "remote_vault_search": remote_vault_enabled,
+                "remote_vault_attachments": remote_vault_enabled,
+                "kanban_card_create": True,
+                "kanban_card_list": True,
                 "audio_api": False,
                 "realtime_voice": False,
+                "automation_actions": self._automation_service.config.enabled,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
+            },
+            "limits": {
+                "remote_vault_search_max_results": REMOTE_VAULT_SEARCH_MAX_LIMIT,
+                "remote_vault_attachments_max_results": REMOTE_VAULT_ATTACHMENTS_MAX_LIMIT,
+                "remote_vault_max_scan_files": REMOTE_VAULT_MAX_SCAN_FILES,
+                "remote_vault_snippet_chars": REMOTE_VAULT_SNIPPET_CHARS,
+                "remote_vault_max_file_bytes": int(remote_vault_settings.get("max_file_bytes") or 262144),
             },
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "model_options": {"method": "GET", "path": "/api/model/options"},
+                "automation_actions": {"method": "POST", "path": "/v1/automation/actions"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
@@ -3152,6 +3645,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "remote_vault_roots": {"method": "GET", "path": "/v1/vault/roots"},
+                "remote_vault_tree": {"method": "GET", "path": "/v1/vault/tree?root={root}"},
+                "remote_vault_note": {"method": "GET", "path": "/v1/vault/note?path={path}"},
+                "remote_vault_update": {"method": "POST", "path": "/v1/vault/update"},
+                "remote_vault_search": {"method": "GET", "path": "/v1/vault/search?q={query}&root={root}"},
+                "remote_vault_attachments": {"method": "GET", "path": "/v1/vault/attachments?root={root}"},
+                "kanban_card_create": {"method": "POST", "path": "/v1/kanban/cards"},
+                "kanban_card_list": {"method": "GET", "path": "/v1/kanban/cards?board={board}&view=cockpit"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -3163,7 +3664,684 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
             },
+            "automation": self._automation_service.capability(),
         })
+
+    async def _handle_automation_actions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/automation/actions — one fail-closed Todoist action lane."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise AutomationError(400, "invalid_json", "Automation request must be a JSON object.")
+            status, result = await self._automation_service.dispatch(body)
+            return web.json_response(result, status=status)
+        except AutomationError as exc:
+            return web.json_response(_openai_error(exc.message, code=exc.code), status=exc.status)
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response(_openai_error("Invalid JSON body.", code="invalid_json"), status=400)
+        except Exception:
+            logger.exception("Automation action failed")
+            return web.json_response(
+                _openai_error("Automation action failed safely.", code="automation_error"), status=500
+            )
+
+    async def _handle_vault_roots(self, request: "web.Request") -> "web.Response":
+        """GET /v1/vault/roots — list configured, existing remote Hermes Vault roots."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        settings = self._remote_vault_settings()
+        if not settings.get("enabled"):
+            return self._remote_vault_error("Remote vault API is disabled.", status=503, code="remote_vault_disabled")
+        base = self._remote_vault_base(settings)
+        if base is None:
+            return self._remote_vault_error("Remote vault base is unavailable.", status=503, code="remote_vault_unavailable")
+        roots: list[str] = []
+        for root in settings.get("roots") or ():
+            candidate = (base / root).resolve(strict=False)
+            try:
+                if candidate.exists():
+                    candidate = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if candidate.is_dir() and self._path_within(candidate, base):
+                roots.append(root)
+        return web.json_response({"object": "list", "roots": roots, "data": roots})
+
+    async def _handle_vault_tree(self, request: "web.Request") -> "web.Response":
+        """GET /v1/vault/tree?root=... — recursively list safe text-note entries."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        settings = self._remote_vault_settings()
+        if not settings.get("enabled"):
+            return self._remote_vault_error("Remote vault API is disabled.", status=503, code="remote_vault_disabled")
+        root_rel = self._normalize_remote_vault_rel(request.query.get("root"), allow_hidden=bool(settings.get("allow_hidden")))
+        if not root_rel or root_rel not in (settings.get("roots") or ()):
+            return self._remote_vault_error("Root is not allowed.", status=400, code="remote_vault_root_not_allowed")
+        result = await asyncio.to_thread(self._remote_vault_tree_sync, root_rel, settings)
+        if "error" in result:
+            return self._remote_vault_error(
+                str(result.get("error") or "Remote vault tree failed."),
+                status=int(result.get("status") or 400),
+                code=str(result.get("code") or "remote_vault_error"),
+            )
+        entries = result.get("entries") or []
+        return web.json_response({"object": "list", "root": root_rel, "entries": entries, "data": entries})
+
+    async def _handle_vault_search(self, request: "web.Request") -> "web.Response":
+        """GET /v1/vault/search?q=... — literal text/path search over scoped remote-vault notes."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        settings = self._remote_vault_settings()
+        if not settings.get("enabled"):
+            return self._remote_vault_error("Remote vault API is disabled.", status=503, code="remote_vault_disabled")
+        query = str(request.query.get("q") or "").strip()
+        if len(query) < 2:
+            return self._remote_vault_error("Search query must contain at least 2 characters.", status=400, code="remote_vault_query_too_short")
+        if len(query) > 128:
+            return self._remote_vault_error("Search query is too long.", status=400, code="remote_vault_query_too_long")
+        root_filter = request.query.get("root") or None
+        limit = _coerce_request_int(
+            request.query.get("limit"),
+            REMOTE_VAULT_SEARCH_DEFAULT_LIMIT,
+            1,
+            REMOTE_VAULT_SEARCH_MAX_LIMIT,
+        )
+        result = await asyncio.to_thread(
+            self._remote_vault_search_sync,
+            query,
+            settings,
+            root_filter=root_filter,
+            limit=limit,
+        )
+        if "error" in result:
+            return self._remote_vault_error(
+                str(result.get("error") or "Remote vault search failed."),
+                status=int(result.get("status") or 400),
+                code=str(result.get("code") or "remote_vault_error"),
+            )
+        entries = result.get("entries") or []
+        return web.json_response({
+            "object": "list",
+            "query": query,
+            "root": root_filter,
+            "limit": limit,
+            "truncated": bool(result.get("truncated")),
+            "scannedFiles": int(result.get("scanned_files") or 0),
+            "entries": entries,
+            "data": entries,
+        })
+
+    async def _handle_vault_attachments(self, request: "web.Request") -> "web.Response":
+        """GET /v1/vault/attachments — metadata-only listing of scoped non-text files."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        settings = self._remote_vault_settings()
+        if not settings.get("enabled"):
+            return self._remote_vault_error("Remote vault API is disabled.", status=503, code="remote_vault_disabled")
+        root_filter = request.query.get("root") or None
+        limit = _coerce_request_int(
+            request.query.get("limit"),
+            REMOTE_VAULT_ATTACHMENTS_DEFAULT_LIMIT,
+            1,
+            REMOTE_VAULT_ATTACHMENTS_MAX_LIMIT,
+        )
+        result = await asyncio.to_thread(
+            self._remote_vault_attachments_sync,
+            settings,
+            root_filter=root_filter,
+            limit=limit,
+        )
+        if "error" in result:
+            return self._remote_vault_error(
+                str(result.get("error") or "Remote vault attachments listing failed."),
+                status=int(result.get("status") or 400),
+                code=str(result.get("code") or "remote_vault_error"),
+            )
+        entries = result.get("entries") or []
+        return web.json_response({
+            "object": "list",
+            "root": root_filter,
+            "limit": limit,
+            "truncated": bool(result.get("truncated")),
+            "scannedFiles": int(result.get("scanned_files") or 0),
+            "entries": entries,
+            "data": entries,
+        })
+
+    async def _handle_vault_note(self, request: "web.Request") -> "web.Response":
+        """GET /v1/vault/note?path=... — read one safe remote-vault note."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        settings = self._remote_vault_settings()
+        if not settings.get("enabled"):
+            return self._remote_vault_error("Remote vault API is disabled.", status=503, code="remote_vault_disabled")
+        rel = self._normalize_remote_vault_rel(request.query.get("path"), allow_hidden=bool(settings.get("allow_hidden")))
+        if not rel:
+            return self._remote_vault_error("Path is invalid.", status=400, code="remote_vault_invalid_path")
+        path, _, err = self._remote_vault_resolve(rel, settings)
+        if err or path is None:
+            return self._remote_vault_error(err or "Path is unavailable.", status=404, code="remote_vault_not_found")
+        try:
+            resolved = path.resolve(strict=True)
+            if not resolved.is_file() or not self._remote_vault_file_allowed(resolved):
+                return self._remote_vault_error("Path is not a readable remote-vault note.", status=404, code="remote_vault_not_found")
+            size = resolved.stat().st_size
+            if size > int(settings.get("max_file_bytes") or 262144):
+                return self._remote_vault_error("Remote-vault note exceeds the configured size limit.", status=413, code="remote_vault_too_large")
+            data = resolved.read_bytes()
+            content = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._remote_vault_error("Remote-vault note is not valid UTF-8 text.", status=415, code="remote_vault_not_text")
+        except OSError:
+            return self._remote_vault_error("Remote-vault note is unavailable.", status=404, code="remote_vault_not_found")
+        sha = self._remote_vault_hash_bytes(data)
+        return web.json_response({
+            "path": rel,
+            "content": content,
+            "hash": sha,
+            "sha256": sha,
+            "size": len(data),
+            "modified": self._remote_vault_iso_mtime(resolved),
+        })
+
+    async def _handle_vault_update(self, request: "web.Request") -> "web.Response":
+        """POST /v1/vault/update — base-hash-checked text update."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        settings = self._remote_vault_settings()
+        if not settings.get("enabled"):
+            return self._remote_vault_error("Remote vault API is disabled.", status=503, code="remote_vault_disabled")
+        if not settings.get("writable"):
+            return self._remote_vault_error("Remote vault updates are disabled.", status=403, code="remote_vault_read_only")
+        body, err_resp = await self._read_json_body(request)
+        if err_resp:
+            return err_resp
+        rel = self._normalize_remote_vault_rel(body.get("path"), allow_hidden=bool(settings.get("allow_hidden")))
+        content = body.get("content")
+        base_hash = body.get("baseHash") or body.get("hash") or body.get("sha256")
+        if not rel or not isinstance(content, str):
+            return self._remote_vault_error("Request must include safe path and string content.", status=400, code="remote_vault_invalid_update")
+        encoded = content.encode("utf-8")
+        if len(encoded) > int(settings.get("max_file_bytes") or 262144):
+            return self._remote_vault_error("Remote-vault note exceeds the configured size limit.", status=413, code="remote_vault_too_large")
+        path, root_dir, resolve_err = self._remote_vault_resolve(rel, settings)
+        if resolve_err and "unavailable" in resolve_err:
+            return self._remote_vault_error(resolve_err, status=503, code="remote_vault_unavailable")
+        if resolve_err or path is None or root_dir is None:
+            return self._remote_vault_error(resolve_err or "Path is invalid.", status=400, code="remote_vault_invalid_path")
+        if not self._remote_vault_file_allowed(path):
+            return self._remote_vault_error("Remote-vault updates are limited to text/note file extensions.", status=415, code="remote_vault_not_text")
+        try:
+            parent = path.parent.resolve(strict=False)
+            if not self._path_within(parent, root_dir):
+                return self._remote_vault_error("Path is outside the allowed remote vault root.", status=400, code="remote_vault_invalid_path")
+            current_hash = None
+            if path.exists():
+                resolved = path.resolve(strict=True)
+                if not resolved.is_file() or not self._path_within(resolved, root_dir):
+                    return self._remote_vault_error("Path is not a writable remote-vault note.", status=404, code="remote_vault_not_found")
+                current = resolved.read_bytes()
+                current_hash = self._remote_vault_hash_bytes(current)
+                if not isinstance(base_hash, str) or not base_hash:
+                    return self._remote_vault_error(
+                        "baseHash is required when updating an existing remote-vault note.",
+                        status=428,
+                        code="remote_vault_base_hash_required",
+                    )
+            if isinstance(base_hash, str) and base_hash and current_hash and not hmac.compare_digest(current_hash, base_hash):
+                return web.json_response({
+                    "accepted": False,
+                    "detail": "Remote note changed since it was cached (hash mismatch).",
+                    "currentHash": current_hash,
+                    "hash": current_hash,
+                    "sha256": current_hash,
+                }, status=409)
+            parent.mkdir(parents=True, exist_ok=True)
+            tmp = parent / f".{path.name}.hermes-tmp-{uuid.uuid4().hex}"
+            tmp.write_bytes(encoded)
+            os.replace(tmp, path)
+            new_hash = self._remote_vault_hash_bytes(encoded)
+            return web.json_response({
+                "accepted": True,
+                "detail": "Remote update stored in Hermes Vault.",
+                "path": rel,
+                "hash": new_hash,
+                "sha256": new_hash,
+                "size": len(encoded),
+                "modified": self._remote_vault_iso_mtime(path),
+            })
+        except OSError:
+            return self._remote_vault_error("Remote-vault update failed.", status=500, code="remote_vault_update_failed")
+
+    async def _handle_kanban_cards_list(self, request: "web.Request") -> "web.Response":
+        """GET /v1/kanban/cards — server-mediated Kanban task list for Cockpit.
+
+        Returns bounded, redacted task summaries so trusted UI clients (the
+        Obsidian bridge Cockpit) can render Focus now / Pending review /
+        Recent handoffs without a PC-side Kanban token. The server reads its
+        own board DB; the client never receives secrets or full note dumps.
+
+        Query params:
+          board   — board slug (default: default)
+          limit   — max tasks (1-200, default 80)
+          view    — "cockpit" trims body/summary to keep the payload small
+          status  — optional filter (ready/running/blocked/done/...)
+          assignee— optional filter
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        # Validate board slug
+        from hermes_cli import kanban_db as kb
+
+        raw_board = request.query.get("board", "") or ""
+        try:
+            board = kb._normalize_board_slug(raw_board) or "default"
+        except ValueError:
+            return web.json_response(
+                _openai_error("Invalid board slug.", code="kanban_card_invalid_request"),
+                status=400,
+            )
+
+        # Parse and bound limit
+        raw_limit = request.query.get("limit", "80")
+        try:
+            limit = max(1, min(200, int(raw_limit)))
+        except (TypeError, ValueError):
+            limit = 80
+
+        view = (request.query.get("view", "") or "").strip().lower()
+        trim = view == "cockpit"
+
+        status_filter = (request.query.get("status", "") or "").strip().lower() or None
+        assignee_filter = (request.query.get("assignee", "") or "").strip().lower() or None
+
+        try:
+            tasks_data = await asyncio.to_thread(
+                self._list_kanban_cards_sync,
+                board,
+                limit,
+                status_filter,
+                assignee_filter,
+                trim,
+            )
+        except Exception:
+            logger.exception("GET /v1/kanban/cards failed")
+            return web.json_response(
+                _openai_error(
+                    "Kanban card list failed on the server.",
+                    err_type="server_error",
+                    code="kanban_card_list_failed",
+                ),
+                status=500,
+            )
+
+        return web.json_response(tasks_data, status=200)
+
+    @staticmethod
+    def _kanban_cockpit_artifacts(latest: Any) -> list[Any]:
+        """Return a bounded, redacted artifact-only slice of latest-run metadata.
+
+        Cockpit clients need artifact paths plus immutable identity claims to
+        verify completed handoffs. They must not receive arbitrary run
+        metadata, which can contain private filenames, diagnostics, or secrets.
+        """
+        metadata = latest.metadata if latest and isinstance(latest.metadata, dict) else {}
+        raw_artifacts = metadata.get("artifacts")
+        if isinstance(raw_artifacts, (list, tuple)):
+            candidates = list(raw_artifacts)
+        elif raw_artifacts is not None:
+            candidates = [raw_artifacts]
+        else:
+            candidates = []
+
+        allowed_string_fields = {
+            "kind": 80,
+            "path": 1500,
+            "value": 1500,
+            "url": 1500,
+            "label": 240,
+            "artifactId": 240,
+            "artifact_id": 240,
+            "sha256": 128,
+            "ownerTaskId": 80,
+            "owner_task_id": 80,
+            "ownerWorkflowRunId": 160,
+            "owner_workflow_run_id": 160,
+            "availability": 80,
+            "verificationSource": 160,
+            "verification_source": 160,
+            "verifiedAt": 80,
+            "verified_at": 80,
+        }
+        allowed_scalar_fields = {
+            "bytes",
+            "ownerRunId",
+            "owner_run_id",
+            "is_artifact",
+            "isArtifact",
+        }
+
+        artifacts: list[Any] = []
+        for candidate in candidates[:20]:
+            if isinstance(candidate, str):
+                text = redact_sensitive_text(candidate, force=True).strip()[:2000]
+                if text:
+                    artifacts.append(text)
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            cleaned: Dict[str, Any] = {}
+            for key, limit in allowed_string_fields.items():
+                value = candidate.get(key)
+                if isinstance(value, str):
+                    safe_value = redact_sensitive_text(value, force=True).strip()[:limit]
+                    if safe_value:
+                        cleaned[key] = safe_value
+            for key in allowed_scalar_fields:
+                value = candidate.get(key)
+                if isinstance(value, bool) or (isinstance(value, int) and not isinstance(value, bool)):
+                    cleaned[key] = value
+            if cleaned:
+                artifacts.append(cleaned)
+
+        # Reviewer metadata commonly records a deliberate negative-path probe
+        # separately. Surface only the path; the PC client must re-check that
+        # it is absent and must not trust the metadata as an attestation.
+        for key in ("artifact_path", "artifactPath", "missing_artifact_path", "missingArtifactPath"):
+            value = metadata.get(key)
+            if not isinstance(value, str):
+                continue
+            safe_value = redact_sensitive_text(value, force=True).strip()[:1500]
+            if safe_value and safe_value not in artifacts and len(artifacts) < 20:
+                artifacts.append(safe_value)
+
+        return artifacts
+
+    @staticmethod
+    def _list_kanban_cards_sync(
+        board: str,
+        limit: int,
+        status_filter: Optional[str],
+        assignee_filter: Optional[str],
+        trim: bool,
+    ) -> Dict[str, Any]:
+        """Read tasks from the server-side Kanban DB and return redacted summaries."""
+        from hermes_cli import kanban_db as kb
+
+        tasks_out: list[Dict[str, Any]] = []
+        with kb.connect_closing(board=board) as conn:
+            kwargs: Dict[str, Any] = {"limit": limit, "include_archived": False}
+            if status_filter and status_filter in kb.VALID_STATUSES:
+                kwargs["status"] = status_filter
+            if assignee_filter:
+                kwargs["assignee"] = assignee_filter
+            tasks = kb.list_tasks(conn, **kwargs)
+
+            for task in tasks:
+                latest = kb.latest_run(conn, task.id)
+                parents = kb.parent_ids(conn, task.id)
+                children = kb.child_ids(conn, task.id)
+                artifacts = APIServerAdapter._kanban_cockpit_artifacts(latest)
+
+                # Redact body and result
+                body = redact_sensitive_text(task.body or "", force=True).strip()
+                result = redact_sensitive_text(task.result or "", force=True).strip()
+                run_summary = redact_sensitive_text(latest.summary if latest and latest.summary else "", force=True).strip()
+
+                # Trim for cockpit view
+                if trim:
+                    body = body[:300] if body else None
+                    result = result[:300] if result else None
+                    run_summary = run_summary[:300] if run_summary else None
+
+                task_summary: Dict[str, Any] = {
+                    "id": task.id,
+                    "title": redact_sensitive_text(task.title, force=True),
+                    "status": task.status,
+                    "assignee": task.assignee,
+                    "priority": task.priority,
+                    "created_at": task.created_at,
+                    "started_at": task.started_at,
+                    "completed_at": task.completed_at,
+                    "board": board,
+                }
+                if body:
+                    task_summary["body"] = body
+                if result:
+                    task_summary["result"] = result
+                if run_summary:
+                    task_summary["summary"] = run_summary
+                if latest:
+                    task_summary["runs"] = [{
+                        "id": latest.id,
+                        "status": latest.status,
+                        "outcome": latest.outcome,
+                        "profile": latest.profile,
+                        "started_at": latest.started_at,
+                        "ended_at": latest.ended_at,
+                        "summary": run_summary,
+                        "error": redact_sensitive_text(latest.error or "", force=True).strip() or None,
+                    }]
+                    # Surface a top-level reason from block_kind or error for cockpit
+                    reason = None
+                    if task.status == "blocked":
+                        reason = latest.error or "blocked"
+                    elif latest.outcome == "blocked":
+                        reason = latest.error or latest.summary or "blocked"
+                    if reason:
+                        task_summary["reason"] = redact_sensitive_text(reason, force=True).strip()
+                if artifacts:
+                    task_summary["artifacts"] = artifacts
+                if parents:
+                    task_summary["parents"] = parents
+                if children:
+                    task_summary["children"] = children
+                tasks_out.append(task_summary)
+
+        return {
+            "object": "list",
+            "board": board,
+            "view": "cockpit" if trim else "full",
+            "tasks": tasks_out,
+            "count": len(tasks_out),
+        }
+
+    async def _handle_kanban_cards(self, request: "web.Request") -> "web.Response":
+        """POST /v1/kanban/cards — server-mediated Kanban card creation.
+
+        Trusted UI clients (for example the Obsidian bridge) send bounded
+        source context over the normal API-server bearer channel; Main Hermes
+        creates the task using its local Kanban DB. The client never receives or
+        stores a separate privileged Kanban token. ``dryRun: true`` performs the
+        same validation and returns a reviewable artifact without writing.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        body, err_resp = await self._read_json_body(request)
+        if err_resp:
+            return err_resp
+
+        dry_run = _coerce_request_bool(body.get("dryRun", body.get("dry_run")), default=False)
+        try:
+            result = await asyncio.to_thread(self._create_kanban_card_sync, body, dry_run=dry_run)
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="kanban_card_invalid_request"),
+                status=400,
+            )
+        except Exception:
+            logger.exception("POST /v1/kanban/cards failed")
+            return web.json_response(
+                _openai_error(
+                    "Kanban card creation failed on the server.",
+                    err_type="server_error",
+                    code="kanban_card_create_failed",
+                ),
+                status=500,
+            )
+
+        return web.json_response(result, status=200 if dry_run else 201)
+
+    @staticmethod
+    def _kanban_card_string(value: Any, field: str, *, required: bool = False, max_chars: int = 4000, one_line: bool = False) -> str:
+        if value is None:
+            if required:
+                raise ValueError(f"{field} is required")
+            return ""
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        text = redact_sensitive_text(value.replace("\r\n", "\n"), force=True).strip()
+        if one_line:
+            text = re.sub(r"\s+", " ", text).strip()
+        if required and not text:
+            raise ValueError(f"{field} is required")
+        if len(text) > max_chars:
+            text = text[: max(0, max_chars - 35)].rstrip() + "\n[…truncated for safety]"
+        return text
+
+    @classmethod
+    def _kanban_card_json_safe(cls, value: Any, *, depth: int = 0) -> Any:
+        """Return a JSON-safe, bounded, redacted copy of sourceContext."""
+        if depth > 6:
+            return "[…truncated]"
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return cls._kanban_card_string(value, "sourceContext", max_chars=1200)
+        if isinstance(value, list):
+            return [cls._kanban_card_json_safe(v, depth=depth + 1) for v in value[:50]]
+        if isinstance(value, dict):
+            safe: Dict[str, Any] = {}
+            for raw_key, raw_value in list(value.items())[:80]:
+                key = cls._kanban_card_string(str(raw_key), "sourceContext key", max_chars=80, one_line=True)
+                if key:
+                    safe[key] = cls._kanban_card_json_safe(raw_value, depth=depth + 1)
+            return safe
+        return cls._kanban_card_string(str(value), "sourceContext", max_chars=1200)
+
+    @staticmethod
+    def _kanban_card_priority(value: Any) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(-100, min(100, parsed))
+
+    def _create_kanban_card_sync(self, payload: Dict[str, Any], *, dry_run: bool = False) -> Dict[str, Any]:
+        from hermes_cli import kanban_db as kb
+
+        title = self._kanban_card_string(payload.get("title"), "title", required=True, max_chars=200, one_line=True)
+        body = self._kanban_card_string(payload.get("body", ""), "body", max_chars=20000)
+        board = kb._normalize_board_slug(payload.get("board") or "default") or "default"
+        assignee = self._kanban_card_string(payload.get("assignee") or "default", "assignee", max_chars=80, one_line=True) or "default"
+        priority = self._kanban_card_priority(payload.get("priority"))
+        source = self._kanban_card_string(payload.get("source") or "api-server", "source", max_chars=80, one_line=True) or "api-server"
+        source_context_raw = payload.get("sourceContext", payload.get("source_context", {}))
+        if source_context_raw is None:
+            source_context_raw = {}
+        if not isinstance(source_context_raw, dict):
+            raise ValueError("sourceContext must be a JSON object")
+        source_context = self._kanban_card_json_safe(source_context_raw)
+
+        raw_parents = payload.get("parents") or []
+        if not isinstance(raw_parents, list):
+            raise ValueError("parents must be a list of task IDs")
+        parents: list[str] = []
+        for parent in raw_parents[:20]:
+            pid = self._kanban_card_string(parent, "parent task id", max_chars=40, one_line=True)
+            if not re.match(r"^t_[0-9a-f]+$", pid, flags=re.IGNORECASE):
+                raise ValueError(f"invalid parent task id: {pid}")
+            parents.append(pid)
+
+        initial_status_raw = self._kanban_card_string(
+            payload.get("initialStatus", payload.get("initial_status", "running")),
+            "initialStatus",
+            max_chars=20,
+            one_line=True,
+        ).lower()
+        initial_status = "blocked" if initial_status_raw == "blocked" else "running"
+
+        idempotency_key = self._kanban_card_string(
+            payload.get("idempotencyKey", payload.get("idempotency_key", "")),
+            "idempotencyKey",
+            max_chars=180,
+            one_line=True,
+        )
+        if not idempotency_key:
+            digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "version": payload.get("version"),
+                        "source": source,
+                        "title": title,
+                        "body": body,
+                        "sourceContext": source_context,
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            idempotency_key = f"api-server-kanban-card:{source}:{digest}"
+
+        response: Dict[str, Any] = {
+            "accepted": True,
+            "dryRun": bool(dry_run),
+            "object": "kanban.card.dry_run" if dry_run else "kanban.card",
+            "board": board,
+            "title": title,
+            "assignee": assignee,
+            "priority": priority,
+            "source": source,
+            "sourceContext": source_context,
+            "idempotencyKey": idempotency_key,
+        }
+        if dry_run:
+            response["detail"] = "Dry-run accepted; no Kanban task was created."
+            return response
+
+        with kb.connect_closing(board=board) as conn:
+            task_id = kb.create_task(
+                conn,
+                title=title,
+                body=body,
+                assignee=assignee,
+                created_by=f"api_server:{source}",
+                priority=priority,
+                parents=parents,
+                idempotency_key=idempotency_key,
+                initial_status=initial_status,
+                board=board,
+            )
+            task = kb.get_task(conn, task_id)
+
+        response.update({
+            "taskId": task_id,
+            "task_id": task_id,
+            "detail": f"Created Kanban task {task_id}.",
+            "task": {
+                "id": task_id,
+                "title": title,
+                "board": board,
+                "assignee": assignee,
+                "priority": priority,
+                "status": getattr(task, "status", None),
+                "sourceContext": source_context,
+            },
+        })
+        return response
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -7183,6 +8361,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
             # the profile-prefix middleware validates the prefix and scopes
             # config/credentials to that profile when multiplexing is on.
+            # The local automation/vault/Kanban routes are registered here too:
+            # they live in _http_route_table() so they inherit the /p/<profile>/
+            # mirror and route-registration seam rather than a separate block.
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
@@ -7314,6 +8495,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
                 )
+        if self._automation_service is not None:
+            try:
+                self._automation_service.close()
+            except Exception:
+                logger.debug("Failed to close automation service", exc_info=True)
         if self._site:
             await self._site.stop()
             self._site = None

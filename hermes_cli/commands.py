@@ -148,6 +148,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[all] [reason]", busy_policy="dispatch"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>", busy_policy="dispatch"),
+    CommandDef(
+        "spawn",
+        "Create an isolated Discord thread bound to an agent profile and model",
+        "Session",
+        gateway_only=True,
+        args_hint="[agent] [model] [title]",
+        busy_policy="dispatch",
+    ),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
@@ -311,6 +319,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]", busy_policy="dispatch",
                execute="gateway_commands"),
+    CommandDef("topics", "Show recent answered topics with direct Discord links", "Info",
+               gateway_only=True, args_hint="[count]", busy_policy="dispatch"),
+    CommandDef("favorites", "List your saved favorite responses with Discord links", "Info",
+               gateway_only=True, args_hint="[count]", busy_policy="dispatch"),
     CommandDef("help", "Show available commands", "Info", busy_policy="dispatch",
                execute="gateway_help"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
@@ -458,6 +470,13 @@ def is_gateway_known_command(name: str | None) -> bool:
 # bypass set (see should_bypass_active_session below).
 ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
     cmd.name for cmd in COMMAND_REGISTRY if cmd.busy_policy != "reject"
+)
+
+# Commands whose transport semantics require Discord-specific APIs. They stay
+# in the shared resolver so the gateway can dispatch them, but other platforms
+# must not advertise them in native command menus.
+_DISCORD_ONLY_GATEWAY_COMMANDS: frozenset[str] = frozenset(
+    {"topics", "favorites", "spawn"}
 )
 
 
@@ -618,6 +637,8 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
+            continue
+        if cmd.name in _DISCORD_ONLY_GATEWAY_COMMANDS:
             continue
         # Built-in arg-taking commands are included — their handlers show
         # usage text when invoked without arguments, and hiding them from
@@ -1327,6 +1348,8 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             return
         if slack_name in _SLACK_RESERVED_COMMANDS:
             return
+        if slack_name in _DISCORD_ONLY_GATEWAY_COMMANDS:
+            return
         if slack_name in _SLACK_VIA_HERMES_ONLY:
             # Intentionally Slack-via-/hermes only (see _SLACK_VIA_HERMES_ONLY).
             return
@@ -1413,6 +1436,8 @@ def slack_subcommand_map() -> dict[str, str]:
     mapping: dict[str, str] = {}
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
+            continue
+        if cmd.name in _DISCORD_ONLY_GATEWAY_COMMANDS:
             continue
         mapping[cmd.name] = f"/{cmd.name}"
         for alias in cmd.aliases:

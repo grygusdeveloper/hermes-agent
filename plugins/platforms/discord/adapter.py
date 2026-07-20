@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -74,7 +75,7 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
-
+_DISCORD_FINAL_RESPONSE_STATE_FILENAME = "discord_final_response_messages.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # Discord enforces a hard cap of 100 global application (slash) commands per
@@ -118,7 +119,17 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
+    re.compile(r"^\s*⚠️\s+Gateway\s+(?:restarting|shutting down)\b[\s\S]*$", re.IGNORECASE),
+    re.compile(r"^\s*⚠️\s+Iteration\s+budget\s+exhausted\b[\s\S]*$", re.IGNORECASE),
+    # Session lifecycle banners are gateway control output, even when sent by an
+    # older build that did not persist the non-conversational message ID.
+    re.compile(r"^\s*◐\s+Session automatically reset\b[\s\S]*$", re.IGNORECASE),
+    # /topics is an index/control response, not a conversational answer. Skip it
+    # on later scans so repeatedly invoking the command never creates fake topics.
+    re.compile(r"^\s*##\s+Recent answered topics\b[\s\S]*$", re.IGNORECASE),
 )
+_DISCORD_SPLIT_FIRST_CHUNK_RE = re.compile(r"\(\s*1\s*/\s*\d+\s*\)\s*$")
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -141,6 +152,7 @@ except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
 from gateway.config import Platform, PlatformConfig
+from gateway.topic_links import sanitize_discord_topic_label
 
 from gateway.platforms.helpers import (
     MessageDeduplicator,
@@ -340,6 +352,19 @@ class _DiscordNonConversationalMessageTracker:
         return str(message_id or "") in self._ids
 
 
+class _DiscordFinalResponseMessageTracker(_DiscordNonConversationalMessageTracker):
+    """Persistent bounded set of first-message IDs for completed responses."""
+
+    def _state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+
+        return (
+            get_hermes_home()
+            / _DISCORD_COMMAND_SYNC_STATE_SUBDIR
+            / _DISCORD_FINAL_RESPONSE_STATE_FILENAME
+        )
+
+
 def _metadata_marks_nonconversational(metadata: Optional[Dict[str, Any]]) -> bool:
     """Return True when an outbound send was explicitly marked as status-only."""
     if not isinstance(metadata, dict):
@@ -351,6 +376,267 @@ def _looks_like_nonconversational_history_message(content: str) -> bool:
     """Fallback recognizer for legacy status bumps missing persisted IDs."""
     text = content or ""
     return any(pattern.match(text) for pattern in _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS)
+
+
+# Environment variable names that may hold a Notion integration secret. The
+# canonical name is NOTION_API_KEY; the others are tolerated as common aliases.
+_NOTION_API_KEY_ENV_NAMES = (
+    "NOTION_API_KEY",
+    "NOTION_TOKEN",
+    "NOTION_PAT",
+    "NOTION_API_TOKEN",
+)
+
+
+def _resolve_notion_api_key() -> Optional[str]:
+    """Return the first configured Notion secret from the tolerated env names."""
+    for name in _NOTION_API_KEY_ENV_NAMES:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def parse_response_save_controls_config(raw: Any) -> Dict[str, Any]:
+    """Normalize ``platforms.discord.response_save_controls`` into a mapping.
+
+    Accepts a bool (enable/disable with defaults) or a mapping with optional
+    ``enabled``, ``notion_parent_page_id``, and ``database_path`` keys.  Any
+    other/missing value disables the feature.  Returns a dict with at least an
+    ``enabled`` bool.
+    """
+    result: Dict[str, Any] = {
+        "enabled": False,
+        "notion_parent_page_id": None,
+        "database_path": None,
+    }
+    if raw is True:
+        result["enabled"] = True
+        return result
+    if raw is False or raw is None:
+        return result
+    if isinstance(raw, dict):
+        result["enabled"] = bool(raw.get("enabled", True))
+        parent = raw.get("notion_parent_page_id")
+        result["notion_parent_page_id"] = str(parent).strip() if parent else None
+        db = raw.get("database_path")
+        result["database_path"] = str(db).strip() if db else None
+        return result
+    return result
+
+
+def _discord_topic_message_text(message: Any) -> str:
+    """Return a compact, single-line topic source for a Discord message."""
+    text = (
+        getattr(message, "clean_content", None)
+        or getattr(message, "content", None)
+        or ""
+    )
+    text = re.sub(r"^(?:<@!?\d+>\s*)+", "", str(text).strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text and getattr(message, "attachments", None):
+        return "Attachment request"
+    return text
+
+
+def _redact_discord_topic_text(text: str) -> str:
+    """Mask credentials before a user prompt is echoed into a topic index."""
+    original = str(text or "").strip()
+    if not original:
+        return original
+
+    # Credential-only messages are common during OAuth/manual login flows. The
+    # general redactor intentionally preserves token prefixes/suffixes for log
+    # debugging, but an index should not echo any portion of such a message.
+    compact_parts = original.split()
+    if (
+        len(compact_parts) <= 2
+        and len(original) >= 20
+        and re.fullmatch(r"[A-Za-z0-9_./+=-]+", original)
+        and re.search(r"[A-Za-z]", original)
+        and re.search(r"\d", original)
+    ):
+        return "Sensitive credential/authentication message"
+
+    redacted = original
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(original, force=True)
+    except Exception:
+        # Fail closed for known credential shapes if the shared redactor cannot
+        # be imported for any reason.
+        redacted = re.sub(
+            r"\b(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-|AIza)[A-Za-z0-9_.-]{8,}\b",
+            "[REDACTED]",
+            redacted,
+        )
+
+    # The shared log redactor retains a small head/tail fingerprint for
+    # diagnostics (for example abcdef...wxyz). Remove that fingerprint here.
+    redacted = re.sub(
+        r"(?<!\w)[A-Za-z0-9_./+=-]{1,14}\.\.\.[A-Za-z0-9_./+=-]{1,12}(?!\w)",
+        "[REDACTED]",
+        redacted,
+    )
+    return redacted
+
+
+def _discord_topic_snippet(message: Any, max_chars: int = 88) -> str:
+    """Derive a readable deterministic topic label from the triggering prompt."""
+    text = _redact_discord_topic_text(_discord_topic_message_text(message))
+    text = sanitize_discord_topic_label(text)
+    if not text:
+        return "Untitled request"
+    if len(text) <= max_chars:
+        return text
+    prefix = text[: max_chars - 1]
+    word_boundary = prefix.rfind(" ")
+    if word_boundary >= max_chars // 2:
+        prefix = prefix[:word_boundary]
+    return prefix.rstrip(" .,;:—-") + "…"
+
+
+def _discord_message_jump_url(message: Any) -> str:
+    """Return Discord's canonical jump URL, including the @me form for DMs."""
+    jump_url = str(getattr(message, "jump_url", "") or "").strip()
+    if jump_url:
+        return jump_url
+
+    channel = getattr(message, "channel", None)
+    channel_id = getattr(channel, "id", None)
+    message_id = getattr(message, "id", None)
+    if channel_id is None or message_id is None:
+        return ""
+    guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", None) if guild is not None else None
+    scope = str(guild_id) if guild_id is not None else "@me"
+    return f"https://discord.com/channels/{scope}/{channel_id}/{message_id}"
+
+
+def _collect_recent_response_topics(
+    messages_newest_first: List[Any],
+    *,
+    bot_user: Any,
+    limit: int,
+    is_nonconversational: Optional[Callable[[Any], bool]] = None,
+    is_final_response: Optional[Callable[[Any], bool]] = None,
+) -> List[Dict[str, str]]:
+    """Group Discord history into completed answered turns, newest first.
+
+    Hermes may send work notes between tool calls before it sends the final
+    answer. Non-conversational tool/status messages partition those bot messages
+    into runs. The jump target is the first non-empty message in the *last* run
+    for the turn — the final answer block — rather than the first work note.
+    Other bots are ignored, split final-answer chunks stay grouped, and slash
+    commands remain control traffic rather than answer topics.
+    """
+    records: List[Dict[str, str]] = []
+    pending_user_messages: List[Any] = []
+    current_run_first: Optional[Any] = None
+    previous_run_first: Optional[Any] = None
+    marked_final_first: Optional[Any] = None
+    split_final_first: Optional[Any] = None
+    bot_user_id = str(getattr(bot_user, "id", "") or "")
+
+    def _commit_pending_response() -> None:
+        nonlocal pending_user_messages, current_run_first, previous_run_first
+        nonlocal marked_final_first, split_final_first
+        response = (
+            marked_final_first
+            or split_final_first
+            or current_run_first
+            or previous_run_first
+        )
+        if pending_user_messages and response is not None:
+            prompt = pending_user_messages[0]
+            records.append(
+                {
+                    "title": _discord_topic_snippet(prompt),
+                    "jump_url": _discord_message_jump_url(response),
+                    "prompt_message_id": str(getattr(prompt, "id", "") or ""),
+                    "response_message_id": str(getattr(response, "id", "") or ""),
+                }
+            )
+        pending_user_messages = []
+        current_run_first = None
+        previous_run_first = None
+        marked_final_first = None
+        split_final_first = None
+
+    for message in reversed(messages_newest_first):
+        author = getattr(message, "author", None)
+        author_id = str(getattr(author, "id", "") or "")
+        is_self = author == bot_user or bool(
+            bot_user_id and author_id and author_id == bot_user_id
+        )
+
+        if is_self:
+            if is_nonconversational and is_nonconversational(message):
+                # A tool/status update ends the current prose run. Keep that run
+                # only as a fallback until a later (final) answer run appears.
+                if current_run_first is not None:
+                    previous_run_first = current_run_first
+                    current_run_first = None
+                continue
+            if not pending_user_messages:
+                # Unsolicited cron/status/control output has no user topic.
+                continue
+            message_text = _discord_topic_message_text(message)
+            if not message_text:
+                # Discord may leave an empty placeholder while a long streamed
+                # response is being assembled. It is never a useful jump target.
+                continue
+            if marked_final_first is None and is_final_response:
+                try:
+                    if is_final_response(message):
+                        marked_final_first = message
+                except Exception:
+                    pass
+            if (
+                split_final_first is None
+                and _DISCORD_SPLIT_FIRST_CHUNK_RE.search(message_text)
+            ):
+                # Upgrade bridge for answers sent before explicit final-message
+                # IDs were persisted. Discord's splitter labels the first chunk
+                # ``(1/N)``, giving old long answers an exact start marker.
+                split_final_first = message
+            if current_run_first is None:
+                current_run_first = message
+            # Otherwise this is a continuation chunk of the same answer run.
+            continue
+
+        if bool(getattr(author, "bot", False)):
+            # A different bot neither starts nor partitions Hermes responses.
+            continue
+
+        # A human message closes an answered turn. Multiple human messages before
+        # Hermes starts any response remain one prompt burst under the first one.
+        if any(
+            value is not None
+            for value in (
+                current_run_first,
+                previous_run_first,
+                marked_final_first,
+                split_final_first,
+            )
+        ):
+            _commit_pending_response()
+
+        text = _discord_topic_message_text(message)
+        if not text:
+            continue
+        if text.startswith("/"):
+            pending_user_messages = []
+            current_run_first = None
+            previous_run_first = None
+            marked_final_first = None
+            split_final_first = None
+            continue
+        pending_user_messages.append(message)
+
+    _commit_pending_response()
+    return list(reversed(records[-max(1, limit):]))
 
 
 def _clean_discord_id(entry: str) -> str:
@@ -1003,6 +1289,11 @@ class DiscordAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    # A normal streaming update can already contain the complete final text.
+    # The consumer otherwise skips an identical finalize edit, which would
+    # prevent us from attaching the final-only save controls and persisting the
+    # logical response. Opt into that one explicit lifecycle edit.
+    REQUIRES_EDIT_FINALIZE = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
@@ -1064,6 +1355,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # /spawn threads are conversational for their human owner even when
+        # thread_require_mention protects shared multi-bot threads. Persist
+        # composite ``thread_id:user_id`` bindings across gateway restarts.
+        self._spawn_owners = ThreadParticipationTracker("discord_spawn_owners")
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1126,6 +1421,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        # First message IDs of completed responses. This is the authoritative
+        # jump-target signal for /topics after the deployment that introduced it.
+        self._final_response_messages = _DiscordFinalResponseMessageTracker()
+        # Lazily-initialized durable store for the final-response save controls
+        # (⭐ Favorite / 📚 Notion buttons). None until first use.
+        self._response_save_store = None
 
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None
@@ -1158,6 +1459,185 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    # ── Final-response save controls (⭐ Favorite / 📚 Notion) ──────────────
+    def _response_save_controls_config(self) -> Dict[str, Any]:
+        """Parsed ``platforms.discord.response_save_controls`` config (cached)."""
+        raw = self.config.extra.get("response_save_controls")
+        return parse_response_save_controls_config(raw)
+
+    def _response_saves_enabled(self) -> bool:
+        return bool(self._response_save_controls_config().get("enabled"))
+
+    def _get_response_save_store(self):
+        """Return the durable save store, creating it on first use."""
+        if self._response_save_store is not None:
+            return self._response_save_store
+        cfg = self._response_save_controls_config()
+        db_path = cfg.get("database_path")
+        if not db_path:
+            from hermes_constants import get_hermes_home
+            db_path = str(get_hermes_home() / "discord_response_saves.sqlite3")
+        from plugins.platforms.discord.response_save_store import (
+            DiscordResponseSaveStore,
+        )
+        self._response_save_store = DiscordResponseSaveStore(db_path)
+        return self._response_save_store
+
+    def _make_response_save_view(self):
+        """Build a fresh persistent ResponseSaveView bound to this adapter."""
+        if not DISCORD_AVAILABLE or "ResponseSaveView" not in globals():
+            return None
+        try:
+            return ResponseSaveView(self)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to build ResponseSaveView", exc_info=True)
+            return None
+
+    def _register_persistent_response_save_view(self) -> None:
+        """Register a persistent ResponseSaveView so button clicks survive restart."""
+        if not self._client:
+            return
+        view = self._make_response_save_view()
+        if view is None:
+            return
+        try:
+            self._client.add_view(view)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to register persistent ResponseSaveView", exc_info=True)
+
+    def _persist_final_response_record(
+        self, message_id: str, metadata: Optional[Dict[str, Any]], msg: Any
+    ) -> None:
+        """Store the durable record for a final response's control message."""
+        if not message_id or not isinstance(metadata, dict):
+            return
+        content = metadata.get("save_response_content") or ""
+        if not content:
+            return
+        try:
+            store = self._get_response_save_store()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Response save store unavailable", exc_info=True)
+            return
+        guild_id = None
+        jump_url = None
+        try:
+            guild = getattr(msg, "guild", None)
+            guild_id = str(getattr(guild, "id", "")) or None
+            jump_url = getattr(msg, "jump_url", None)
+        except Exception:
+            pass
+        channel_id = metadata.get("thread_id") or None
+        try:
+            channel = getattr(msg, "channel", None)
+            if channel is not None:
+                channel_id = str(getattr(channel, "id", channel_id))
+        except Exception:
+            pass
+        try:
+            store.save_response(
+                message_id=str(message_id),
+                content=str(content),
+                prompt=metadata.get("save_prompt"),
+                channel_id=channel_id,
+                guild_id=guild_id,
+                jump_url=jump_url,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to persist final response record", exc_info=True)
+
+    def _should_attach_save_controls(self, metadata: Optional[Dict[str, Any]]) -> bool:
+        """True when a send/edit should carry the save-controls View.
+
+        Only normal assistant final responses qualify: the feature must be
+        enabled, the send must be marked final, and it must not be a
+        progress/interim/status message or a command/system reply.
+        """
+        if not isinstance(metadata, dict):
+            return False
+        if not metadata.get("final_response"):
+            return False
+        if metadata.get("save_controls_disabled"):
+            return False
+        if _metadata_marks_nonconversational(metadata):
+            return False
+        if not self._response_saves_enabled():
+            return False
+        return True
+
+    async def list_user_favorites(
+        self, user_id: str, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Return the newest favorites for *user_id* (adapter method for /favorites)."""
+        try:
+            store = self._get_response_save_store()
+        except Exception:
+            logger.debug("Favorites store unavailable", exc_info=True)
+            return []
+        try:
+            return await asyncio.to_thread(store.list_favorites, str(user_id), limit)
+        except Exception:
+            logger.warning("Favorites listing failed", exc_info=True)
+            return []
+
+    async def _notion_followup(self, interaction, message: str) -> None:
+        """Send an ephemeral follow-up after a deferred Notion interaction."""
+        try:
+            await interaction.followup.send(message, ephemeral=True)
+        except Exception:
+            logger.debug("Notion followup send failed", exc_info=True)
+
+    async def _handle_notion_save(self, interaction, message_id: str, record) -> None:
+        """Save *record* to Notion (idempotent) and reply ephemerally."""
+        # Idempotency: a prior successful save cached the page URL.
+        existing = (record or {}).get("notion_page_url")
+        if existing:
+            await self._notion_followup(
+                interaction, f"📚 Already saved to Notion: {existing}"
+            )
+            return
+
+        cfg = self._response_save_controls_config()
+        parent_page_id = cfg.get("notion_parent_page_id")
+        api_key = _resolve_notion_api_key()
+        if not api_key or not parent_page_id:
+            await self._notion_followup(
+                interaction,
+                "Notion isn't configured (set NOTION_API_KEY and a parent page ID).",
+            )
+            return
+
+        from plugins.platforms.discord.notion_saver import (
+            save_response_to_notion,
+            NotionSaveError,
+        )
+
+        try:
+            page_url = await save_response_to_notion(
+                api_key=api_key,
+                parent_page_id=parent_page_id,
+                prompt=record.get("prompt"),
+                response=record.get("content") or "",
+                source_url=record.get("jump_url"),
+            )
+        except NotionSaveError as e:
+            await self._notion_followup(interaction, f"📚 {e}")
+            return
+        except Exception:
+            logger.warning("Notion save failed", exc_info=True)
+            await self._notion_followup(interaction, "📚 Notion save failed.")
+            return
+
+        try:
+            store = self._get_response_save_store()
+            await asyncio.to_thread(store.set_notion_page, message_id, page_url)
+        except Exception:
+            logger.debug("Failed to cache Notion page URL", exc_info=True)
+
+        await self._notion_followup(
+            interaction, f"📚 Saved to Notion: {page_url}"
+        )
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits to the gateway supervisor.
@@ -1392,6 +1872,11 @@ class DiscordAdapter(BasePlatformAdapter):
             # Register slash commands
             if self._slash_commands:
                 self._register_slash_commands()
+
+            # Register the persistent save-controls View so ⭐/📚 button clicks
+            # keep working after a gateway restart (timeout=None + stable
+            # custom_ids). Safe to register even when the feature is disabled.
+            self._register_persistent_response_save_view()
 
             # Start the bot in background
             self._disconnecting = False
@@ -2313,9 +2798,12 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
             in_bot_thread = (
-                isinstance(message.channel, discord.Thread)
-                and str(message.channel.id) in self._threads
-                and not self._discord_thread_require_mention()
+                self._is_spawn_thread_owner(message)
+                or (
+                    isinstance(message.channel, discord.Thread)
+                    and str(message.channel.id) in self._threads
+                    and not self._discord_thread_require_mention()
+                )
             )
             if (
                 self._discord_require_mention()
@@ -2928,6 +3416,17 @@ class DiscordAdapter(BasePlatformAdapter):
             current_existing_payload = self._existing_command_to_payload(current)
             current_payload = self._canonicalize_app_command_payload(current_existing_payload)
             desired_payload = self._canonicalize_app_command_payload(desired)
+            # Discord expands omitted command-install metadata to the
+            # application's configured defaults on readback (for example,
+            # ``integration_types=[0, 1]`` for guild + user installs).  An
+            # omitted/None desired value means Hermes is not constraining that
+            # field, so the server-applied default is semantically equivalent.
+            # Keep detecting real drift whenever Hermes explicitly supplies a
+            # non-empty contexts/integration_types value.
+            for field in ("contexts", "integration_types"):
+                if desired_payload.get(field) is None:
+                    current_payload.pop(field, None)
+                    desired_payload.pop(field, None)
             if current_payload == desired_payload:
                 unchanged += 1
                 continue
@@ -3083,6 +3582,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
+            final_response = bool(
+                isinstance(metadata, dict) and metadata.get("final_response")
+            )
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
@@ -3119,16 +3621,29 @@ class DiscordAdapter(BasePlatformAdapter):
             # Build the reference from ids — no fetch_message round trip.
             reference = self._reply_reference_for_send(reply_to, channel)
 
+            # Save controls (⭐ Favorite / 📚 Notion) attach only to the FIRST
+            # chunk of a normal assistant final response. Discord renders the
+            # buttons below their message, so chunk 1 is intentional.
+            attach_controls = self._should_attach_save_controls(metadata)
+            first_msg = None
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                chunk_view = (
+                    self._make_response_save_view()
+                    if (attach_controls and i == 0)
+                    else None
+                )
+                _send_kwargs: Dict[str, Any] = {
+                    "content": chunk,
+                    "reference": chunk_reference,
+                }
+                if chunk_view is not None:
+                    _send_kwargs["view"] = chunk_view
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    msg = await channel.send(**_send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3147,12 +3662,14 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        _retry_kwargs: Dict[str, Any] = {"content": chunk, "reference": None}
+                        if chunk_view is not None:
+                            _retry_kwargs["view"] = chunk_view
+                        msg = await channel.send(**_retry_kwargs)
                     else:
                         raise
+                if i == 0:
+                    first_msg = msg
                 message_ids.append(str(msg.id))
 
             # Track the last message we sent in this channel for history
@@ -3163,6 +3680,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+                if final_response:
+                    self._final_response_messages.mark_many(message_ids[:1])
+
+            # Persist the durable save record keyed by the control (first)
+            # message so button callbacks can load the complete response.
+            if attach_controls and message_ids and first_msg is not None:
+                self._persist_final_response_record(
+                    message_ids[0], metadata, first_msg
+                )
 
             result = SendResult(
                 success=True,
@@ -3351,9 +3877,17 @@ class DiscordAdapter(BasePlatformAdapter):
         target to a continuation and the next accumulated-token tick would
         re-split, looping forever (the Telegram #48648 lesson).  The complete
         text is delivered when ``finalize=True`` via ``_edit_overflow_split``.
+
+        On the finalize edit of a normal assistant final response, the save
+        controls View (⭐/📚) is attached to the original message and the
+        durable record is persisted.
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        # Attach save controls only on the finalize edit of a normal final
+        # response. The View lives on the first/original message only.
+        attach_controls = finalize and self._should_attach_save_controls(metadata)
+        finalize_view = self._make_response_save_view() if attach_controls else None
         try:
             channel = self._client.get_channel(int(chat_id))
             if not channel:
@@ -3373,7 +3907,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 if finalize:
                     return await self._edit_overflow_split(
-                        channel, msg, message_id, content,
+                        channel, msg, message_id, content, metadata=metadata,
                     )
                 formatted = self.truncate_message(
                     formatted, self.MAX_MESSAGE_LENGTH,
@@ -3392,8 +3926,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 # mask a real edit later.
                 self._last_overflow_preview.pop(_preview_key, None)
 
+            _edit_kwargs: Dict[str, Any] = {"content": formatted}
+            if finalize_view is not None:
+                _edit_kwargs["view"] = finalize_view
             try:
-                await msg.edit(content=formatted)
+                # ``_edit_kwargs`` carries ``content=formatted`` plus the
+                # finalize save-controls View when one is attached. Mid-stream
+                # the View is always None, so this stays equivalent to a plain
+                # content edit while still recording saturation-preview state.
+                await msg.edit(**_edit_kwargs)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = formatted
             except Exception as edit_err:
@@ -3404,7 +3945,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if self._is_length_overflow_error(edit_err):
                     if finalize:
                         return await self._edit_overflow_split(
-                            channel, msg, message_id, content,
+                            channel, msg, message_id, content, metadata=metadata,
                         )
                     # Mid-stream: truncate and retry in place (no split).
                     truncated = self.truncate_message(
@@ -3426,6 +3967,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     content=content,
                     final=True,
                 )
+                self._final_response_messages.mark_many([str(message_id)])
+            if attach_controls:
+                self._persist_final_response_record(str(message_id), metadata, msg)
             return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
@@ -3451,6 +3995,8 @@ class DiscordAdapter(BasePlatformAdapter):
         msg: Any,
         message_id: str,
         content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Deliver an oversized final edit across message + continuations.
 
@@ -3469,23 +4015,43 @@ class DiscordAdapter(BasePlatformAdapter):
         saw would be the worse outcome.  Only a first-chunk edit failure
         returns ``success=False`` (a real adapter problem, not overflow).
         """
+        # The save controls View lives on the first/original message only —
+        # never on the continuation chunks below it.
+        attach_controls = self._should_attach_save_controls(metadata)
+        overflow_view = self._make_response_save_view() if attach_controls else None
+
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         if len(chunks) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
             # not, just edit normally.
-            await msg.edit(content=chunks[0] if chunks else formatted)
+            _degenerate_kwargs: Dict[str, Any] = {
+                "content": chunks[0] if chunks else formatted
+            }
+            if overflow_view is not None:
+                _degenerate_kwargs["view"] = overflow_view
+            await msg.edit(**_degenerate_kwargs)
+            self._final_response_messages.mark_many([str(message_id)])
+            if attach_controls:
+                self._persist_final_response_record(str(message_id), metadata, msg)
             return SendResult(success=True, message_id=message_id)
 
         # Step 1 — edit the existing message with the first chunk.
+        _first_kwargs: Dict[str, Any] = {"content": chunks[0]}
+        if overflow_view is not None:
+            _first_kwargs["view"] = overflow_view
         try:
-            await msg.edit(content=chunks[0])
+            await msg.edit(**_first_kwargs)
         except Exception as e:
             logger.error(
                 "[%s] Overflow split: first-chunk edit failed: %s",
                 self.name, e, exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+        self._final_response_messages.mark_many([str(message_id)])
+        if attach_controls:
+            self._persist_final_response_record(str(message_id), metadata, msg)
 
         # Step 2 — send each remaining chunk threaded as a reply to the prior.
         continuation_ids: list[str] = []
@@ -5496,6 +6062,16 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_status(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/status", "Status sent~")
 
+        @tree.command(name="topics", description="Link to recent answered topics in this chat")
+        @discord.app_commands.describe(count="Number of topics to show (1–25, default 10)")
+        async def slash_topics(interaction: discord.Interaction, count: int = 10):
+            await self._run_simple_slash(interaction, f"/topics {count}")
+
+        @tree.command(name="favorites", description="List your saved favorite responses")
+        @discord.app_commands.describe(count="Number of favorites to show (1–25, default 10)")
+        async def slash_favorites(interaction: discord.Interaction, count: int = 10):
+            await self._run_simple_slash(interaction, f"/favorites {count}")
+
         @tree.command(name="sethome", description="Set this chat as the home channel")
         async def slash_sethome(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/sethome")
@@ -5579,6 +6155,31 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(scope="Optional: 'all' to deny all pending commands")
         async def slash_deny(interaction: discord.Interaction, scope: str = ""):
             await self._run_simple_slash(interaction, f"/deny {scope}".strip())
+
+        @tree.command(name="spawn", description="Create an isolated thread with a selected Hermes agent/model")
+        @discord.app_commands.describe(
+            agent="Agent alias or installed Hermes profile (default: main)",
+            model="Model alias or model ID (default: profile model)",
+            title="Optional thread title",
+            prompt="Optional initial task to run immediately in the new thread",
+        )
+        async def slash_spawn(
+            interaction: discord.Interaction,
+            agent: str = "",
+            model: str = "",
+            title: str = "",
+            prompt: str = "",
+        ):
+            parts = ["/spawn"]
+            if agent.strip():
+                parts.extend(("--agent", shlex.quote(agent.strip())))
+            if model.strip():
+                parts.extend(("--model", shlex.quote(model.strip())))
+            if title.strip():
+                parts.extend(("--title", shlex.quote(title.strip())))
+            if prompt.strip():
+                parts.extend(("--prompt", shlex.quote(prompt.strip())))
+            await self._run_simple_slash(interaction, " ".join(parts))
 
         @tree.command(name="thread", description="Create a new thread and start a Hermes session in it")
         @discord.app_commands.describe(
@@ -6446,6 +7047,15 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _is_spawn_thread_owner(self, message: Any, thread_id: Optional[str] = None) -> bool:
+        """Return whether *message* is from the owner of a tracked /spawn thread."""
+        resolved_thread_id = thread_id or str(getattr(getattr(message, "channel", None), "id", "") or "")
+        owner_id = str(getattr(getattr(message, "author", None), "id", "") or "")
+        if not resolved_thread_id or not owner_id:
+            return False
+        tracker = getattr(self, "_spawn_owners", None)
+        return tracker is not None and f"{resolved_thread_id}:{owner_id}" in tracker
+
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
         configured = self.config.extra.get("history_backfill")
@@ -6474,6 +7084,73 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    async def get_recent_response_topics(
+        self,
+        channel_id: str,
+        *,
+        before_message_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, str]]:
+        """Return recent answered user topics linked to completed responses.
+
+        The scan is intentionally channel-local. Discord threads therefore get
+        thread-local indexes, while DMs and normal channels index their own
+        visible history. ``channel.history`` paginates internally as needed.
+        """
+        if not self._client:
+            raise RuntimeError("Discord is not connected")
+
+        safe_limit = max(1, min(int(limit), 25))
+        target_id = int(channel_id)
+        channel = self._client.get_channel(target_id)
+        if channel is None:
+            channel = await self._client.fetch_channel(target_id)
+        if channel is None:
+            raise RuntimeError(f"Discord channel {channel_id} was not found")
+
+        before = None
+        if before_message_id:
+            try:
+                before = _Snowflake(int(before_message_id))
+            except (TypeError, ValueError):
+                before = None
+
+        # A response can span many 2,000-character Discord chunks. Scan a
+        # generous bounded window so ten answered turns still resolve in chats
+        # with long technical answers, without turning /topics into a full-history
+        # crawl on every invocation.
+        scan_limit = min(750, max(100, safe_limit * 25))
+        messages = []
+        async for message in channel.history(
+            limit=scan_limit,
+            before=before,
+            oldest_first=False,
+        ):
+            messages.append(message)
+
+        def _is_nonconversational(message: Any) -> bool:
+            content = (
+                getattr(message, "clean_content", None)
+                or getattr(message, "content", None)
+                or ""
+            )
+            return (
+                str(getattr(message, "id", "")) in self._nonconversational_messages
+                or _looks_like_nonconversational_history_message(str(content))
+            )
+
+        def _is_final_response(message: Any) -> bool:
+            tracked = getattr(self, "_final_response_messages", ())
+            return str(getattr(message, "id", "")) in tracked
+
+        return _collect_recent_response_topics(
+            messages,
+            bot_user=self._client.user,
+            limit=safe_limit,
+            is_nonconversational=_is_nonconversational,
+            is_final_response=_is_final_response,
+        )
 
     async def _fetch_channel_context(
         self,
@@ -6939,6 +7616,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         parent_chat_id: str,
         name: str,
+        *,
+        reason: str = "Hermes session handoff",
+        seed_prefix: str = "\U0001f9f5 Hermes handoff",
     ) -> Optional[str]:
         """Create a Discord thread under a text channel for a handoff.
 
@@ -6976,7 +7656,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
         thread_name = (name or "handoff").strip()[:80] or "handoff"
-        reason = "Hermes session handoff"
+        reason = str(reason or "Hermes session handoff")[:512]
+        seed_prefix = str(seed_prefix or "\U0001f9f5 Hermes handoff")[:120]
 
         # First try: create a thread directly on the channel.
         try:
@@ -6999,7 +7680,7 @@ class DiscordAdapter(BasePlatformAdapter):
             send = getattr(parent, "send", None)
             if send is None:
                 return None
-            seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
+            seed_msg = await send(f"{seed_prefix}: **{thread_name}**")
             thread = await seed_msg.create_thread(
                 name=thread_name,
                 auto_archive_duration=1440,
@@ -7012,6 +7693,83 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+    async def create_spawn_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+        starter_content: str,
+        owner_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a human-facing /spawn thread and seed its instructions."""
+        thread_id = await self.create_handoff_thread(
+            parent_chat_id,
+            name,
+            reason="Hermes /spawn workspace",
+            seed_prefix="🧵 Hermes workspace",
+        )
+        if not thread_id:
+            return {
+                "success": False,
+                "error": f"could not create a thread under channel {parent_chat_id}",
+            }
+
+        try:
+            thread = self._client.get_channel(int(thread_id)) if self._client else None
+            if thread is None and self._client:
+                thread = await self._client.fetch_channel(int(thread_id))
+        except Exception as exc:
+            logger.warning(
+                "[%s] Spawn thread %s was created but could not be resolved: %s",
+                self.name,
+                thread_id,
+                exc,
+            )
+            thread = None
+
+        member_error = None
+        if thread is not None and owner_user_id:
+            try:
+                object_cls = getattr(discord, "Object", None)
+                if object_cls is None:
+                    raise RuntimeError("discord.Object is unavailable")
+                owner = object_cls(id=int(owner_user_id))
+                await thread.add_user(owner)
+            except Exception as exc:
+                member_error = str(exc)
+                logger.warning(
+                    "[%s] Spawn thread %s owner %s could not be added: %s",
+                    self.name,
+                    thread_id,
+                    owner_user_id,
+                    exc,
+                )
+
+        starter_error = None
+        if thread is not None and starter_content:
+            try:
+                await thread.send(str(starter_content)[: self.MAX_MESSAGE_LENGTH])
+            except Exception as exc:
+                starter_error = str(exc)
+                logger.warning(
+                    "[%s] Spawn thread %s starter send failed: %s",
+                    self.name,
+                    thread_id,
+                    exc,
+                )
+
+        self._threads.mark(thread_id)
+        if owner_user_id:
+            self._spawn_owners.mark(f"{thread_id}:{owner_user_id}")
+        guild = getattr(thread, "guild", None)
+        return {
+            "success": True,
+            "thread_id": thread_id,
+            "thread_name": str(getattr(thread, "name", None) or name),
+            "guild_id": str(getattr(guild, "id", "") or ""),
+            "member_error": member_error,
+            "starter_error": starter_error,
+        }
 
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
@@ -7747,9 +8505,13 @@ class DiscordAdapter(BasePlatformAdapter):
             # are gated the same as channels.  Useful when multiple bots share
             # a thread.
             in_bot_thread = (
-                is_thread
-                and thread_id in self._threads
-                and not self._discord_thread_require_mention()
+                self._is_spawn_thread_owner(message, thread_id)
+                or (
+                    is_thread
+                    and thread_id is not None
+                    and thread_id in self._threads
+                    and not self._discord_thread_require_mention()
+                )
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
@@ -8378,7 +9140,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, ResponseSaveView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -9409,6 +10171,113 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    class ResponseSaveView(discord.ui.View):
+        """Persistent save controls for normal assistant final responses.
+
+        Two buttons — ``⭐ Favorite`` and ``📚 Notion`` — attached to the first
+        Discord message/chunk of a final response.  ``timeout=None`` plus stable
+        ``custom_id`` values make the view persistent: after a gateway restart
+        the registered instance (``client.add_view``) re-binds clicks, and the
+        callback loads the durable response record from SQLite via
+        ``interaction.message.id`` (the control message key).
+
+        Authorization reuses ``_component_check_auth`` exactly, so the same
+        user/role allowlists and explicit allow-all semantics that gate other
+        component clicks apply here.  Unauthorized clicks get an ephemeral
+        rejection.
+        """
+
+        FAVORITE_CUSTOM_ID = "hermes:response_save:favorite"
+        NOTION_CUSTOM_ID = "hermes:response_save:notion"
+
+        def __init__(self, adapter):
+            super().__init__(timeout=None)  # persistent
+            self._adapter = adapter
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(
+                interaction,
+                getattr(self._adapter, "_allowed_user_ids", set()),
+                getattr(self._adapter, "_allowed_role_ids", set()),
+            )
+
+        def _load_record(self, interaction: discord.Interaction):
+            message = getattr(interaction, "message", None)
+            message_id = str(getattr(message, "id", "") or "")
+            if not message_id:
+                return None, None
+            try:
+                store = self._adapter._get_response_save_store()
+            except Exception:
+                return message_id, None
+            try:
+                return message_id, store.get_response(message_id)
+            except Exception:
+                return message_id, None
+
+        @discord.ui.button(
+            label="Favorite",
+            emoji="⭐",
+            style=discord.ButtonStyle.secondary,
+            custom_id=FAVORITE_CUSTOM_ID,
+        )
+        async def favorite(self, interaction: discord.Interaction, button):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to save this response.", ephemeral=True
+                )
+                return
+            message_id, record = self._load_record(interaction)
+            if not record:
+                await interaction.response.send_message(
+                    "I couldn't find the saved data for this response.", ephemeral=True
+                )
+                return
+            user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+            try:
+                store = self._adapter._get_response_save_store()
+                added = await asyncio.to_thread(
+                    store.add_favorite, message_id, user_id
+                )
+            except Exception:
+                logger.warning("Favorite save failed", exc_info=True)
+                await interaction.response.send_message(
+                    "Saving the favorite failed.", ephemeral=True
+                )
+                return
+            msg = (
+                "⭐ Saved to your favorites."
+                if added
+                else "⭐ Already in your favorites."
+            )
+            await interaction.response.send_message(msg, ephemeral=True)
+
+        @discord.ui.button(
+            label="Notion",
+            emoji="📚",
+            style=discord.ButtonStyle.secondary,
+            custom_id=NOTION_CUSTOM_ID,
+        )
+        async def notion(self, interaction: discord.Interaction, button):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to save this response.", ephemeral=True
+                )
+                return
+            # Defer before any network I/O so we can reply after the Notion call.
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
+            message_id, record = self._load_record(interaction)
+            if not record:
+                await self._adapter._notion_followup(
+                    interaction, "I couldn't find the saved data for this response."
+                )
+                return
+            await self._adapter._handle_notion_save(interaction, message_id, record)
+
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 
@@ -10068,6 +10937,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # WebSocket health knobs: REST 200 is deliberately not used as Gateway
     # health. Accept legacy liveness_* aliases for compatibility during the
     # migration; the websocket_* spelling is the public config surface.
+    # (This loop subsumes the old standalone liveness_interval_seconds /
+    # liveness_failure_threshold env bridging.)
     _websocket_liveness_keys = (
         (
             "websocket_liveness_interval_seconds",
@@ -10090,6 +10961,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key and not os.getenv(env_key):
                 os.environ[env_key] = str(value)
+    # Response-save controls contain structured data (including the Notion
+    # parent page) and belong in PlatformConfig.extra rather than process-wide
+    # environment variables. Merge into the seeded extra so the websocket
+    # liveness settings seeded above are preserved.
+    response_save_controls = discord_cfg.get("response_save_controls")
+    if response_save_controls is not None:
+        seeded_extra["response_save_controls"] = response_save_controls
     return seeded_extra or None
 
 

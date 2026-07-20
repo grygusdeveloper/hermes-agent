@@ -19,6 +19,33 @@ from tests.gateway.restart_test_helpers import (
 # ── restart marker helpers ───────────────────────────────────────────────
 
 
+def test_final_response_metadata_marks_only_discord():
+    original = {"thread_id": "topic-7"}
+
+    assert gateway_run._final_response_metadata(
+        original,
+        platform=Platform.DISCORD,
+    ) == {"thread_id": "topic-7", "final_response": True}
+    assert gateway_run._final_response_metadata(
+        original,
+        platform=Platform.TELEGRAM,
+    ) is original
+    assert original == {"thread_id": "topic-7"}
+
+
+def test_restart_notification_pending_false_without_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    assert gateway_run._restart_notification_pending() is False
+
+
+def test_restart_notification_pending_true_with_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text("{}")
+
+    assert gateway_run._restart_notification_pending() is True
+
+
 def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     marker = tmp_path / ".restart_pending.json"
@@ -376,6 +403,11 @@ async def test_send_restart_notification_logs_info_on_sendresult_success(
 async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_missing():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7")
+    source.platform = Platform.DISCORD
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config.platforms = {
+        Platform.DISCORD: runner.config.platforms[Platform.TELEGRAM]
+    }
     session_key = build_session_key(source)
 
     runner._running_agents[session_key] = object()
@@ -388,7 +420,7 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
     adapter.send.assert_awaited_once_with(
         "parent-42",
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
-        metadata={"thread_id": "topic-7"},
+        metadata={"thread_id": "topic-7", "non_conversational": True},
     )
 
 

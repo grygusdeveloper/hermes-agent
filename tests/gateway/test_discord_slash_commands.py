@@ -169,6 +169,56 @@ async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter)
     interaction.delete_original_response.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_registers_native_topics_slash_command_with_count(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "topics" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["topics"](interaction, count=7)
+
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/topics 7")
+
+
+@pytest.mark.asyncio
+async def test_registers_native_favorites_slash_command_with_count(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "favorites" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["favorites"](interaction, count=7)
+
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/favorites 7")
+
+
+@pytest.mark.asyncio
+async def test_registers_native_spawn_slash_command_with_named_options(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "spawn" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["spawn"](
+        interaction,
+        agent="heman",
+        model="kimi3",
+        title="Investigate build",
+        prompt="Inspect the failing CI job",
+    )
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/spawn --agent heman --model kimi3 --title 'Investigate build' "
+        "--prompt 'Inspect the failing CI job'",
+    )
+
+
+
 # ------------------------------------------------------------------
 # Auto-registration from COMMAND_REGISTRY
 # ------------------------------------------------------------------

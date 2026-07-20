@@ -2681,6 +2681,31 @@ DEFAULT_CONFIG = {
             # bounding CPU / memory / upstream-LLM-quota exhaustion from a
             # request flood. Set to 0 to disable the cap entirely.
             "max_concurrent_runs": 10,
+            # Scoped server-side Hermes Vault API for Obsidian Bridge.
+            # Exposes only configured roots under base_dir through /v1/vault/*;
+            # never an arbitrary filesystem. Updates are base-hash checked.
+            "remote_vault": {
+                # Off by default for fresh installs because this is a read/write
+                # server-side filesystem surface. Enable explicitly on trusted
+                # API-server deployments (for example Main Hermes + tailnet proxy).
+                "enabled": False,
+                "base_dir": "/root/workspace/hermes-vault",
+                "roots": [
+                    "Inbox",
+                    "Ideas",
+                    "Operations",
+                    "Projects",
+                    "Research",
+                    "System",
+                    "research",
+                    "inner-brain",
+                    "staging",
+                    "drafts",
+                ],
+                "max_file_bytes": 262144,
+                "allow_hidden": False,
+                "writable": True,
+            },
         },
     },
 

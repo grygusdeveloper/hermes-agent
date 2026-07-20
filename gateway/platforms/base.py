@@ -6329,6 +6329,18 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if self.platform == Platform.DISCORD:
+                    _final_thread_metadata = dict(_final_thread_metadata or {})
+                    _final_thread_metadata["final_response"] = True
+                    # Carry the complete logical response (pre-extraction) and
+                    # the originating prompt so the Discord save controls can
+                    # persist the full answer even when it's split into chunks.
+                    _final_thread_metadata["save_response_content"] = _response_pre_extract
+                    _final_thread_metadata["save_prompt"] = getattr(event, "text", None)
+                    # Command / system (ephemeral) replies are not normal
+                    # assistant answers — suppress the save controls on them.
+                    if is_ephemeral_response or event.is_command():
+                        _final_thread_metadata["save_controls_disabled"] = True
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -6509,6 +6521,28 @@ class BasePlatformAdapter(ABC):
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True
                             )
+
+                    if (
+                        getattr(result, "success", False)
+                        and getattr(result, "message_id", None)
+                        and not is_ephemeral_response
+                        and not event.is_command()
+                    ):
+                        from gateway.notification_events import emit_delivery_event
+
+                        _delivery_runner = (
+                            getattr(delivery_adapter, "gateway_runner", None)
+                            or getattr(self, "gateway_runner", None)
+                        )
+                        await emit_delivery_event(
+                            hooks=getattr(_delivery_runner, "hooks", None),
+                            event_type="message:sent",
+                            source=event.source,
+                            message_id=result.message_id,
+                            kind="final_response",
+                            preview=text_content,
+                            session_key=session_key,
+                        )
 
                     # Schedule auto-deletion on the adapter that owns the new
                     # message ID, which may be the reconnect replacement.

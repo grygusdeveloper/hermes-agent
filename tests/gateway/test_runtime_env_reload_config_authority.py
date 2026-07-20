@@ -67,3 +67,45 @@ def test_reload_runtime_env_preserves_config_terminal_backend(
     assert os.environ["TERMINAL_ENV"] == "local"
 
 
+def test_current_max_iterations_reloads_before_reading(monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "90")
+
+    def _fake_reload() -> None:
+        os.environ["HERMES_MAX_ITERATIONS"] = "200"
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_reload_runtime_env_preserving_config_authority",
+        _fake_reload,
+    )
+
+    assert gateway_run._current_max_iterations() == 200
+
+
+def test_profile_scoped_reload_does_not_mutate_process_credentials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A brokered /spawn turn must not leak worker secrets into Main."""
+    from agent.secret_scope import current_secret_scope, get_secret
+
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        yaml.safe_dump({"agent": {"max_turns": 321}}),
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "OPENROUTER_API_KEY=worker-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "main-secret")
+
+    with gateway_run._profile_runtime_scope(profile_home):
+        assert current_secret_scope() is not None
+        assert get_secret("OPENROUTER_API_KEY") == "worker-secret"
+        gateway_run._reload_runtime_env_preserving_config_authority()
+        assert os.environ["OPENROUTER_API_KEY"] == "main-secret"
+        assert get_secret("OPENROUTER_API_KEY") == "worker-secret"
+
+    assert current_secret_scope() is None
+    assert os.environ["OPENROUTER_API_KEY"] == "main-secret"
