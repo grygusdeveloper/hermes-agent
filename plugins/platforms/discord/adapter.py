@@ -153,6 +153,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.topic_links import sanitize_discord_topic_label
+from hermes_constants import resolve_reasoning_config
 
 from gateway.platforms.helpers import (
     MessageDeduplicator,
@@ -220,6 +221,96 @@ async def _read_url_image_with_redirect_guard(
 def _truncate_discord_component_text(text: str, limit: int) -> str:
     """Return text within Discord's UTF-16 component field budget."""
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
+
+
+def _spawn_autocomplete_sections(raw_config: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return normalized agent and spawn sections for autocomplete."""
+    raw_config = raw_config if isinstance(raw_config, dict) else {}
+    gateway_cfg = raw_config.get("gateway")
+    gateway_cfg = gateway_cfg if isinstance(gateway_cfg, dict) else {}
+    spawn_cfg = gateway_cfg.get("spawn")
+    spawn_cfg = spawn_cfg if isinstance(spawn_cfg, dict) else {}
+    agents_cfg = spawn_cfg.get("agents")
+    agents_cfg = agents_cfg if isinstance(agents_cfg, dict) else {}
+    return spawn_cfg, agents_cfg
+
+
+def _spawn_agent_choice_specs(raw_config: Any, current: str = "") -> list[tuple[str, str]]:
+    """Build Discord-safe agent labels from the configured spawn allowlist."""
+    _, agents_cfg = _spawn_autocomplete_sections(raw_config)
+    needle = str(current or "").strip().casefold()
+    choices: list[tuple[str, str]] = []
+    for raw_alias, raw_spec in sorted(agents_cfg.items(), key=lambda item: str(item[0])):
+        alias = str(raw_alias).strip()
+        if not alias or len(alias) > 100:
+            continue
+        if isinstance(raw_spec, str):
+            profile = raw_spec.strip() or alias
+        elif isinstance(raw_spec, dict):
+            profile = str(raw_spec.get("profile") or alias).strip()
+        else:
+            profile = alias
+        label = f"{alias} — profile {profile}"
+        if needle and needle not in alias.casefold() and needle not in label.casefold():
+            continue
+        choices.append((_truncate_discord_component_text(label, 100), alias))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def _spawn_model_choice_specs(
+    raw_config: Any,
+    selected_agent: str = "",
+    current: str = "",
+) -> list[tuple[str, str]]:
+    """Build model labels from aliases valid for the selected spawn agent."""
+    spawn_cfg, agents_cfg = _spawn_autocomplete_sections(raw_config)
+    agent_alias = str(
+        selected_agent or spawn_cfg.get("default_agent") or "main"
+    ).strip().lower()
+    agent_spec = agents_cfg.get(agent_alias)
+    models: dict[str, Any] = {}
+    global_models = spawn_cfg.get("models")
+    if isinstance(global_models, dict):
+        models.update(global_models)
+    if isinstance(agent_spec, dict):
+        agent_models = agent_spec.get("models")
+        if isinstance(agent_models, dict):
+            models.update(agent_models)
+
+    needle = str(current or "").strip().casefold()
+    choices: list[tuple[str, str]] = []
+    for raw_alias, raw_spec in sorted(models.items(), key=lambda item: str(item[0])):
+        alias = str(raw_alias).strip()
+        if not alias or len(alias) > 100:
+            continue
+        provider = ""
+        if isinstance(raw_spec, str):
+            model = raw_spec.strip()
+        elif isinstance(raw_spec, dict):
+            model = str(raw_spec.get("model") or "").strip()
+            provider = str(raw_spec.get("provider") or "").strip()
+        else:
+            continue
+        if not model:
+            continue
+        route = model
+        if provider and not model.casefold().startswith(f"{provider}/".casefold()):
+            route = f"{provider}/{model}"
+        label = f"{alias} — {route}"
+        reasoning = resolve_reasoning_config(raw_config, model)
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                label += " · none"
+            elif reasoning.get("effort"):
+                label += f" · {reasoning['effort']}"
+        if needle and needle not in alias.casefold() and needle not in label.casefold():
+            continue
+        choices.append((_truncate_discord_component_text(label, 100), alias))
+        if len(choices) >= 25:
+            break
+    return choices
 
 
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
@@ -6180,6 +6271,56 @@ class DiscordAdapter(BasePlatformAdapter):
             if prompt.strip():
                 parts.extend(("--prompt", shlex.quote(prompt.strip())))
             await self._run_simple_slash(interaction, " ".join(parts))
+
+        async def slash_spawn_agent_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            try:
+                from gateway.run import _load_gateway_config
+
+                raw_config = _load_gateway_config() or {}
+                specs = _spawn_agent_choice_specs(raw_config, current)
+                return [
+                    discord.app_commands.Choice(name=name, value=value)
+                    for name, value in specs
+                ]
+            except Exception:
+                logger.debug("Discord /spawn agent autocomplete failed", exc_info=True)
+                return []
+
+        async def slash_spawn_model_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            try:
+                from gateway.run import _load_gateway_config
+
+                raw_config = _load_gateway_config() or {}
+                namespace = getattr(interaction, "namespace", None)
+                selected_agent = str(getattr(namespace, "agent", "") or "")
+                specs = _spawn_model_choice_specs(
+                    raw_config,
+                    selected_agent=selected_agent,
+                    current=current,
+                )
+                return [
+                    discord.app_commands.Choice(name=name, value=value)
+                    for name, value in specs
+                ]
+            except Exception:
+                logger.debug("Discord /spawn model autocomplete failed", exc_info=True)
+                return []
+
+        register_spawn_autocomplete = getattr(slash_spawn, "autocomplete", None)
+        if callable(register_spawn_autocomplete):
+            for option_name, callback in (
+                ("agent", slash_spawn_agent_autocomplete),
+                ("model", slash_spawn_model_autocomplete),
+            ):
+                option_decorator = register_spawn_autocomplete(option_name)
+                if callable(option_decorator):
+                    option_decorator(callback)
 
         @tree.command(name="thread", description="Create a new thread and start a Hermes session in it")
         @discord.app_commands.describe(
