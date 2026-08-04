@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+from pathlib import Path
 from types import SimpleNamespace
 import threading
 import time
@@ -107,6 +108,261 @@ def test_utf8_prompt_limit_rejects_without_truncation():
     with pytest.raises(RuntimeError, match="no context was sent or truncated"):
         _validate_prompt_size(text)
     assert _validate_prompt_size("small") == "small"
+
+
+def _spool_stream(path: str, size: int, *, tool_name: str = "view_file") -> str:
+    conversation_id = "12345678-1234-1234-1234-123456789abc"
+    events = [
+        {
+            "event": "init",
+            "conversation_id": conversation_id,
+            "init": {
+                "agent": "hermes-antigravity-acp-spool",
+                "model": "gemini-3.6-flash-high",
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "DONE",
+                "tool_name": tool_name,
+                "tool_info": {
+                    "name": tool_name,
+                    "parameters": {"AbsolutePath": path},
+                    "output": f"17 lines, {size} bytes",
+                },
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "SPOOL_OK",
+                "conversation_id": conversation_id,
+            },
+        },
+    ]
+    return "\n".join(json.dumps(event) for event in events)
+
+
+def test_oversized_prompt_uses_private_spool_and_cleans_up(monkeypatch):
+    conversation = AntigravityConversation()
+    prompt = "HEAD\n" + ("schema-data\n" * 12_000) + "TAIL"
+    observed: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):
+        path = Path(str(kwargs["cwd"])) / "canonical-prompt.txt"
+        observed.update(
+            command=list(command),
+            path=path,
+            directory=path.parent,
+            file_bytes=path.read_bytes(),
+            file_mode=path.stat().st_mode & 0o777,
+            directory_mode=path.parent.stat().st_mode & 0o777,
+            env=dict(kwargs["env"]),
+        )
+        return SimpleNamespace(
+            pid=12345,
+            returncode=0,
+            communicate=Mock(
+                return_value=(_spool_stream(str(path), len(prompt.encode("utf-8"))), "")
+            ),
+        )
+
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", fake_popen)
+    result = conversation._execute(
+        prompt,
+        conversation_id=None,
+        model="gemini-3.6-flash-high",
+        effort="high",
+        timeout_seconds=2,
+        cwd="/untrusted/project",
+        env={"HOME": "/root"},
+    )
+
+    command = observed["command"]
+    assert isinstance(command, list)
+    assert command[command.index("--agent") + 1] == "hermes-antigravity-acp-spool"
+    assert command[command.index("--output-format") + 1] == "stream-json"
+    bootstrap = command[command.index("--print") + 1]
+    assert prompt not in bootstrap
+    assert len(bootstrap.encode("utf-8")) <= 120_000
+    assert observed["file_bytes"] == prompt.encode("utf-8")
+    assert observed["file_mode"] == 0o600
+    assert observed["directory_mode"] == 0o700
+    observed_env = observed["env"]
+    assert isinstance(observed_env, dict)
+    assert observed_env["TMPDIR"] == str(observed["directory"])
+    assert observed_env["TMP"] == str(observed["directory"])
+    assert observed_env["TEMP"] == str(observed["directory"])
+    assert result == ("SPOOL_OK", "", "12345678-1234-1234-1234-123456789abc")
+    assert not Path(str(observed["path"])).exists()
+    assert not Path(str(observed["directory"])).exists()
+
+
+def test_spool_trace_rejects_unexpected_tool_and_still_cleans_up(monkeypatch):
+    conversation = AntigravityConversation()
+    prompt = "x" * 130_000
+    observed: dict[str, Path] = {}
+
+    def fake_popen(command, **kwargs):
+        path = Path(str(kwargs["cwd"])) / "canonical-prompt.txt"
+        observed["path"] = path
+        observed["directory"] = path.parent
+        return SimpleNamespace(
+            pid=12345,
+            returncode=0,
+            communicate=Mock(
+                return_value=(
+                    _spool_stream(str(path), len(prompt), tool_name="run_command"),
+                    "",
+                )
+            ),
+        )
+
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", fake_popen)
+    with pytest.raises(RuntimeError, match="forbidden tool"):
+        conversation._execute(
+            prompt,
+            conversation_id=None,
+            model="gemini-3.6-flash-high",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )
+    assert not observed["path"].exists()
+    assert not observed["directory"].exists()
+
+
+def test_spool_trace_rejects_unexpected_path(monkeypatch):
+    conversation = AntigravityConversation()
+    prompt = "x" * 130_000
+
+    def fake_popen(command, **kwargs):
+        return SimpleNamespace(
+            pid=12345,
+            returncode=0,
+            communicate=Mock(
+                return_value=(
+                    _spool_stream("/tmp/not-the-spool", len(prompt)),
+                    "",
+                )
+            ),
+        )
+
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", fake_popen)
+    with pytest.raises(RuntimeError, match="unexpected path"):
+        conversation._execute(
+            prompt,
+            conversation_id=None,
+            model="gemini-3.6-flash-high",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )
+
+
+def test_spool_limit_fails_closed_before_launch(monkeypatch):
+    conversation = AntigravityConversation()
+    popen = Mock(side_effect=AssertionError("must not launch"))
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", popen)
+
+    with pytest.raises(RuntimeError, match="spool transport limit exceeded"):
+        conversation._execute(
+            "x" * 1_000_001,
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )
+    popen.assert_not_called()
+
+
+def test_spool_cleanup_when_process_launch_fails(monkeypatch):
+    conversation = AntigravityConversation()
+    observed: dict[str, Path] = {}
+
+    def fail_popen(command, **kwargs):
+        path = Path(str(kwargs["cwd"])) / "canonical-prompt.txt"
+        observed["path"] = path
+        observed["directory"] = path.parent
+        assert path.exists()
+        raise FileNotFoundError("agy")
+
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", fail_popen)
+    with pytest.raises(RuntimeError, match="AGY executable not found"):
+        conversation._execute(
+            "x" * 130_000,
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )
+    assert not observed["path"].exists()
+    assert not observed["directory"].exists()
+
+
+def test_oversized_incremental_turn_uses_spool_without_replaying_prefix(monkeypatch):
+    conversation = AntigravityConversation()
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_execute(prompt_text, **kwargs):
+        calls.append((prompt_text, kwargs["conversation_id"]))
+        return "OK", "", "12345678-1234-1234-1234-123456789abc"
+
+    monkeypatch.setattr(conversation, "_execute", fake_execute)
+    first = _messages(("system", "rules"), ("user", "first"))
+    conversation.run("FULL FIRST", messages=first, model="gemini")
+    huge = "SECOND_HEAD" + ("x" * 130_000) + "SECOND_TAIL"
+    second = first + _messages(("assistant", "OK"), ("user", huge))
+    conversation.run("FULL SECOND", messages=second, model="gemini")
+
+    assert calls[1][1] == "12345678-1234-1234-1234-123456789abc"
+    assert calls[1][0].startswith("User:\nSECOND_HEAD")
+    assert calls[1][0].endswith("SECOND_TAIL")
+    assert "FULL FIRST" not in calls[1][0]
+
+
+def test_inline_prompt_keeps_zero_tool_json_transport(monkeypatch):
+    conversation = AntigravityConversation()
+    payload = json.dumps(
+        {
+            "status": "SUCCESS",
+            "response": "INLINE_OK",
+            "conversation_id": "12345678-1234-1234-1234-123456789abc",
+        }
+    )
+    commands: list[list[str]] = []
+
+    def fake_popen(command, **kwargs):
+        commands.append(list(command))
+        return SimpleNamespace(
+            pid=12345,
+            returncode=0,
+            communicate=Mock(return_value=(payload, "")),
+        )
+
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", fake_popen)
+    conversation._execute(
+        "small prompt",
+        conversation_id=None,
+        model="gemini",
+        effort="high",
+        timeout_seconds=2,
+        cwd=None,
+        env=None,
+    )
+    command = commands[0]
+    assert command[command.index("--agent") + 1] == "hermes-antigravity-acp"
+    assert command[command.index("--output-format") + 1] == "json"
+    assert command[command.index("--print") + 1] == "small prompt"
 
 
 def test_resume_propagates_unrelated_failure_without_fresh_replay(monkeypatch):

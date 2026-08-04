@@ -10,17 +10,23 @@ sends only new non-assistant messages after the first request.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import signal
 import subprocess
+import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 # Linux limits each execve argument to MAX_ARG_STRLEN (normally 128 KiB).
 # Leave headroom for encoding and platform variation.
 INLINE_PROMPT_LIMIT_BYTES = 120_000
+SPOOL_PROMPT_LIMIT_BYTES = 1_000_000
+_DEFAULT_AGENT = "hermes-antigravity-acp"
+_SPOOL_AGENT = "hermes-antigravity-acp-spool"
 _CONVERSATION_ID_RE = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
@@ -70,6 +76,114 @@ def _validate_prompt_size(text: str, limit: int = INLINE_PROMPT_LIMIT_BYTES) -> 
     return text
 
 
+@contextmanager
+def _private_prompt_spool(text: str):
+    """Yield a private, exact-byte prompt file and remove it deterministically."""
+
+    payload = text.encode("utf-8")
+    if len(payload) > SPOOL_PROMPT_LIMIT_BYTES:
+        raise RuntimeError(
+            "AGY spool transport limit exceeded: "
+            f"{len(payload)} UTF-8 bytes > {SPOOL_PROMPT_LIMIT_BYTES}; "
+            "no context was sent or truncated"
+        )
+    with tempfile.TemporaryDirectory(prefix="hermes-antigravity-spool-") as directory:
+        os.chmod(directory, 0o700)
+        path = Path(directory) / "canonical-prompt.txt"
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        actual = path.read_bytes()
+        if actual != payload:
+            raise RuntimeError("AGY spool prompt failed exact-byte verification")
+        yield path, len(payload), hashlib.sha256(payload).hexdigest()
+
+
+def _parse_spool_stream(
+    stdout: str,
+    *,
+    expected_path: Path,
+    expected_bytes: int,
+    expected_model: str,
+) -> dict[str, Any]:
+    """Validate AGY's spool-loader trace and return its terminal result."""
+
+    result: dict[str, Any] | None = None
+    conversation_id: str | None = None
+    completed_reads = 0
+    tool_events = 0
+    initialized = False
+    for raw_line in stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("AGY returned malformed stream JSON") from exc
+        if not isinstance(event, dict):
+            raise RuntimeError("AGY returned a non-object stream event")
+        if event.get("event") == "init":
+            if initialized:
+                raise RuntimeError("AGY spool stream repeated its init event")
+            initialized = True
+            raw_id = event.get("conversation_id")
+            if isinstance(raw_id, str):
+                conversation_id = raw_id.strip()
+            init = event.get("init") or {}
+            if not isinstance(init, dict) or init.get("agent") != _SPOOL_AGENT:
+                raise RuntimeError("AGY spool trace initialized the wrong agent")
+            if init.get("model") != expected_model:
+                raise RuntimeError("AGY spool trace initialized the wrong model")
+        update = event.get("step_update") or {}
+        if isinstance(update, dict) and update.get("step_type") == "tool":
+            tool_events += 1
+            if tool_events > 32:
+                raise RuntimeError("AGY spool loader exceeded the tool-event limit")
+            info = update.get("tool_info") or {}
+            if not isinstance(info, dict):
+                raise RuntimeError("AGY spool trace omitted tool metadata")
+            name = str(update.get("tool_name") or info.get("name") or "")
+            parameters = info.get("parameters") or {}
+            if name != "view_file" or not isinstance(parameters, dict):
+                raise RuntimeError(f"AGY spool loader used forbidden tool {name!r}")
+            if parameters.get("AbsolutePath") != str(expected_path):
+                raise RuntimeError("AGY spool loader accessed an unexpected path")
+            if str(update.get("state") or "") == "DONE":
+                if info.get("error"):
+                    raise RuntimeError("AGY spool view_file returned an error")
+                output = str(info.get("output") or "")
+                if f"{expected_bytes} bytes" not in output:
+                    raise RuntimeError("AGY spool view_file did not attest the exact byte count")
+                completed_reads += 1
+        if event.get("event") == "result":
+            candidate = event.get("result")
+            if not isinstance(candidate, dict):
+                raise RuntimeError("AGY spool stream omitted its result object")
+            result = dict(candidate)
+    if not initialized:
+        raise RuntimeError("AGY spool stream had no init event")
+    if completed_reads < 1:
+        raise RuntimeError("AGY spool loader did not complete an exact-path read")
+    if result is None:
+        raise RuntimeError("AGY spool stream had no terminal result")
+    if conversation_id and not result.get("conversation_id"):
+        result["conversation_id"] = conversation_id
+    return result
+
+
 def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> str:
     parts: list[str] = []
     for message in messages[previous_count:]:
@@ -88,7 +202,7 @@ def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> 
             "tool": "Tool Result",
         }.get(role, role.title() or "Context")
         parts.append(f"{label}:\n{rendered}")
-    return _validate_prompt_size("\n\n".join(parts))
+    return "\n\n".join(parts)
 
 
 class AntigravityConversationExpired(RuntimeError):
@@ -186,7 +300,7 @@ class AntigravityConversation:
                         return response, reasoning
 
             response, reasoning, conversation_id = self._execute(
-                _validate_prompt_size(prompt_text),
+                prompt_text,
                 conversation_id=None,
                 model=model,
                 effort=effort,
@@ -256,12 +370,36 @@ class AntigravityConversation:
         timeout_seconds: float,
         cwd: str | None,
         env: dict[str, str] | None,
+        _spool_path: Path | None = None,
+        _spool_bytes: int | None = None,
     ) -> tuple[str, str, str]:
+        prompt_size = len(prompt_text.encode("utf-8"))
+        if prompt_size > INLINE_PROMPT_LIMIT_BYTES and _spool_path is None:
+            with _private_prompt_spool(prompt_text) as (spool_path, spool_bytes, digest):
+                bootstrap = (
+                    "Load the complete canonical Hermes request from absolute path "
+                    f"{spool_path}. Expected UTF-8 bytes: {spool_bytes}. "
+                    f"Expected SHA-256: {digest}. Process it now."
+                )
+                _validate_prompt_size(bootstrap)
+                return self._execute_active(
+                    bootstrap,
+                    conversation_id=conversation_id,
+                    model=model,
+                    effort=effort,
+                    timeout_seconds=timeout_seconds,
+                    cwd=cwd,
+                    env=env,
+                    _spool_path=spool_path,
+                    _spool_bytes=spool_bytes,
+                )
+        _validate_prompt_size(prompt_text)
+        use_spool = _spool_path is not None
         agy = os.environ.get("AGY_PATH", str(Path.home() / ".local" / "bin" / "agy"))
         command = [
             agy,
             "--agent",
-            "hermes-antigravity-acp",
+            _SPOOL_AGENT if use_spool else _DEFAULT_AGENT,
             "--model",
             model,
             "--effort",
@@ -269,7 +407,7 @@ class AntigravityConversation:
             "--sandbox",
             "--disable-slash-commands",
             "--output-format",
-            "json",
+            "stream-json" if use_spool else "json",
             "--print-timeout",
             f"{max(1, int(timeout_seconds))}s",
         ]
@@ -280,6 +418,13 @@ class AntigravityConversation:
         process_env = dict(env or os.environ)
         process_env.setdefault("HOME", str(Path.home()))
         process_env.setdefault("LANG", "C.UTF-8")
+        process_cwd = cwd or str(Path.home())
+        if use_spool:
+            assert _spool_path is not None
+            process_cwd = str(_spool_path.parent)
+            process_env["TMPDIR"] = process_cwd
+            process_env["TMP"] = process_cwd
+            process_env["TEMP"] = process_cwd
         with self._process_lock:
             if self._abort_requested:
                 raise RuntimeError("AGY request aborted before launch")
@@ -290,7 +435,7 @@ class AntigravityConversation:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    cwd=cwd or str(Path.home()),
+                    cwd=process_cwd,
                     env=process_env,
                     start_new_session=True,
                 )
@@ -314,10 +459,19 @@ class AntigravityConversation:
             if conversation_id and _is_expired_conversation_error(detail):
                 raise AntigravityConversationExpired(f"AGY failed: {detail}")
             raise RuntimeError(f"AGY failed: {detail}")
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("AGY returned malformed JSON") from exc
+        if use_spool:
+            assert _spool_path is not None and _spool_bytes is not None
+            payload = _parse_spool_stream(
+                stdout,
+                expected_path=_spool_path,
+                expected_bytes=_spool_bytes,
+                expected_model=model,
+            )
+        else:
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("AGY returned malformed JSON") from exc
         if not isinstance(payload, dict):
             raise RuntimeError("AGY returned non-object JSON")
         if str(payload.get("status") or "") != "SUCCESS":
