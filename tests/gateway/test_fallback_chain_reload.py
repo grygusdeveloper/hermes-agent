@@ -12,6 +12,7 @@ full Feishu session path.
 from __future__ import annotations
 
 import time
+import threading
 from types import SimpleNamespace
 
 
@@ -143,6 +144,108 @@ def test_refresh_fallback_model_keeps_last_known_good_on_read_failure(
     cfg.write_text("fallback_providers:\n  - provider: [unclosed\n")
     assert bound() == good
     assert runner._fallback_model == good
+
+
+def test_transient_profile_failure_never_borrows_main_last_known_good(
+    tmp_path, monkeypatch,
+):
+    """A profile cache miss fails closed even when Main populated the
+    compatibility mirror with a non-empty fallback chain."""
+    from gateway.run import GatewayRunner
+
+    main_home = tmp_path / "main"
+    profile_home = tmp_path / "profiles" / "gemini"
+    main_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    (main_home / "config.yaml").write_text(
+        "fallback_providers:\n"
+        "  - provider: zai\n"
+        "    model: glm-5.2\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "fallback_providers:\n  - provider: [unclosed\n",
+        encoding="utf-8",
+    )
+    active_home = {"value": main_home}
+    monkeypatch.setattr(
+        "gateway.run.get_hermes_home_override",
+        lambda: active_home["value"],
+    )
+    runner = SimpleNamespace(
+        _fallback_model=None,
+        _fallback_models_by_config_home={},
+    )
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+
+    main_chain = bound()
+    assert main_chain == [{"provider": "zai", "model": "glm-5.2"}]
+    assert runner._fallback_model == main_chain
+
+    active_home["value"] = profile_home
+    assert bound() is None
+    assert runner._fallback_model is None
+    assert runner._fallback_models_by_config_home[
+        str((main_home / "config.yaml").resolve())
+    ] == main_chain
+
+
+def test_concurrent_profile_refreshes_keep_last_known_good_isolated(
+    tmp_path, monkeypatch,
+):
+    """Concurrent transient failures return each profile's own cached chain."""
+    from gateway.run import GatewayRunner
+
+    homes = {
+        "main": tmp_path / "main",
+        "gemini": tmp_path / "profiles" / "gemini",
+    }
+    chains = {
+        "main": [{"provider": "zai", "model": "glm-5.2"}],
+        "gemini": [{"provider": "openrouter", "model": "safe-profile-model"}],
+    }
+    for name, home in homes.items():
+        home.mkdir(parents=True)
+        entry = chains[name][0]
+        (home / "config.yaml").write_text(
+            "fallback_providers:\n"
+            f"  - provider: {entry['provider']}\n"
+            f"    model: {entry['model']}\n",
+            encoding="utf-8",
+        )
+
+    local = threading.local()
+    monkeypatch.setattr(
+        "gateway.run.get_hermes_home_override",
+        lambda: local.home,
+    )
+    runner = SimpleNamespace(
+        _fallback_model=None,
+        _fallback_models_by_config_home={},
+    )
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+    ready = threading.Barrier(2)
+    outcomes: dict[str, list] = {}
+
+    def worker(name: str) -> None:
+        local.home = homes[name]
+        assert bound() == chains[name]
+        (homes[name] / "config.yaml").write_text(
+            "fallback_providers:\n  - provider: [unclosed\n",
+            encoding="utf-8",
+        )
+        ready.wait(timeout=2)
+        outcomes[name] = [bound() for _ in range(20)]
+
+    threads = [threading.Thread(target=worker, args=(name,)) for name in homes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes["main"] == [chains["main"]] * 20
+    assert outcomes["gemini"] == [chains["gemini"]] * 20
 
 
 def test_apply_fallback_chain_updates_primary_agent():

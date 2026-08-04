@@ -6084,7 +6084,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._provider_routing = self._load_provider_routing()
+        # Last-known-good fallback chains are profile-scoped. A multiplexed
+        # gateway may serve Main and execution profiles concurrently; a torn
+        # config read in one profile must never inherit another profile's chain.
+        self._fallback_models_by_config_home: Dict[str, list | None] = {}
         self._fallback_model = self._load_fallback_model()
+        self._fallback_models_by_config_home[
+            str((_gateway_config_home() / "config.yaml").resolve(strict=False))
+        ] = self._fallback_model
 
         # Wire process registry into session store for reset protection.
         # A background process older than the configured threshold (default 24h,
@@ -8701,10 +8708,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cached agent's working fallback for that turn.  Only a successful read
         that genuinely lacks the key clears the chain.
         """
+        cfg_path = _gateway_config_home() / "config.yaml"
+        cache_key = str(cfg_path.resolve(strict=False))
+        cache = getattr(self, "_fallback_models_by_config_home", None)
+        if cache is None:
+            cache = {}
+            self._fallback_models_by_config_home = cache
         try:
             from hermes_cli.config import read_user_config_raw
-            cfg_path = _gateway_config_home() / "config.yaml"
             if not cfg_path.exists():
+                cache[cache_key] = None
                 self._fallback_model = None
                 return self._fallback_model
             # Raw primitive (raises on parse failure) is required here: the
@@ -8725,14 +8738,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
         except Exception:
-            # Transient failure — keep last known-good chain.
+            # Transient failure — keep only this profile's last known-good
+            # chain. A cache miss fails closed instead of borrowing the
+            # compatibility mirror from another execution profile.
+            chain = cache.get(cache_key)
+            self._fallback_model = chain
             logger.debug(
                 "fallback_providers refresh: config.yaml read failed; "
-                "keeping last known-good chain", exc_info=True,
+                "keeping profile-scoped last known-good chain", exc_info=True,
             )
-            return self._fallback_model
-        self._fallback_model = get_fallback_chain(cfg) or None
-        return self._fallback_model
+            return chain
+        chain = get_fallback_chain(cfg) or None
+        cache[cache_key] = chain
+        # Compatibility mirror for diagnostics/tests only. All consumers use
+        # this method's profile-local return value.
+        self._fallback_model = chain
+        return chain
 
     @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:
