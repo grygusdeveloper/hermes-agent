@@ -5153,6 +5153,7 @@ class AIAgent:
             client._antigravity_conversation = (
                 primary_client._antigravity_conversation
             )
+            client._owns_antigravity_conversation = False
         with self._openai_client_lock():
             cache = self._request_client_cache_ref()
             if cache["client"] is None:

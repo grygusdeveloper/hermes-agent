@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -20,6 +21,10 @@ from typing import Any
 # Linux limits each execve argument to MAX_ARG_STRLEN (normally 128 KiB).
 # Leave headroom for encoding and platform variation.
 INLINE_PROMPT_LIMIT_BYTES = 120_000
+_CONVERSATION_ID_RE = re.compile(
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+)
 
 
 def _render_content(content: Any) -> str:
@@ -113,6 +118,7 @@ class AntigravityConversation:
         self._lock = threading.RLock()
         self._process_lock = threading.Lock()
         self._active_process: subprocess.Popen[str] | None = None
+        self._abort_requested = False
 
     def reset(self) -> None:
         with self._lock:
@@ -123,6 +129,7 @@ class AntigravityConversation:
         """Terminate the in-flight AGY process without waiting on state locks."""
 
         with self._process_lock:
+            self._abort_requested = True
             process = self._active_process
         if process is None or process.poll() is not None:
             return
@@ -226,21 +233,23 @@ class AntigravityConversation:
         process_env = dict(env or os.environ)
         process_env.setdefault("HOME", str(Path.home()))
         process_env.setdefault("LANG", "C.UTF-8")
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=cwd or str(Path.home()),
-                env=process_env,
-                start_new_session=True,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"AGY executable not found at {agy}") from exc
-
         with self._process_lock:
+            if self._abort_requested:
+                self._abort_requested = False
+                raise RuntimeError("AGY request aborted before launch")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=cwd or str(Path.home()),
+                    env=process_env,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(f"AGY executable not found at {agy}") from exc
             self._active_process = process
 
         try:
@@ -258,6 +267,7 @@ class AntigravityConversation:
             with self._process_lock:
                 if self._active_process is process:
                     self._active_process = None
+                    self._abort_requested = False
 
         if process.returncode != 0:
             detail = stderr.strip()[-1000:] if stderr else f"exit {process.returncode}"
@@ -286,5 +296,10 @@ class AntigravityConversation:
         reasoning = str(
             payload.get("reasoning") or payload.get("thinking") or ""
         ).strip()
-        conversation_id = str(payload.get("conversation_id") or "").strip()
+        raw_conversation_id = payload.get("conversation_id")
+        if not isinstance(raw_conversation_id, str):
+            raise RuntimeError("AGY returned a non-string conversation_id")
+        conversation_id = raw_conversation_id.strip()
+        if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
+            raise RuntimeError("AGY returned a malformed conversation_id")
         return response, reasoning, conversation_id

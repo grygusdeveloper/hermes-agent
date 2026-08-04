@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 from types import SimpleNamespace
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -269,3 +272,118 @@ def test_agent_abort_delegates_to_antigravity_conversation():
     agent._abort_request_openai_client(client, reason="interrupt")
 
     client._antigravity_conversation.abort.assert_called_once_with()
+
+
+def test_shared_request_close_does_not_abort_primary_conversation():
+    primary = CopilotACPClient(base_url="acp://antigravity")
+    request = CopilotACPClient(base_url="acp://antigravity")
+    agent = object.__new__(AIAgent)
+    agent.provider = "copilot-acp"
+    agent._client_kwargs = {"base_url": "acp://antigravity"}
+    agent._ensure_primary_openai_client = Mock(return_value=primary)
+    agent._openai_client_lock = Mock(return_value=nullcontext())
+    agent._create_openai_client = Mock(return_value=request)
+    bound = agent._create_request_openai_client(reason="test", api_kwargs={})
+    primary._antigravity_conversation.abort = Mock()
+
+    bound.close()
+
+    primary._antigravity_conversation.abort.assert_not_called()
+    assert bound._owns_antigravity_conversation is False
+
+
+def test_abort_during_spawn_publication_is_not_lost(monkeypatch):
+    conversation = AntigravityConversation()
+    popen_entered = threading.Event()
+    allow_popen_return = threading.Event()
+    killed = threading.Event()
+
+    class Process:
+        pid = 424242
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            assert killed.wait(timeout=2)
+            self.returncode = -15
+            return "", "terminated"
+
+    process = Process()
+
+    def fake_popen(*args, **kwargs):
+        popen_entered.set()
+        assert allow_popen_return.wait(timeout=2)
+        return process
+
+    def fake_killpg(pid, sig):
+        assert pid == process.pid
+        killed.set()
+
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("agent.antigravity_session.os.killpg", fake_killpg)
+    outcome: list[BaseException] = []
+
+    def execute():
+        try:
+            conversation._execute(
+                "hello",
+                conversation_id=None,
+                model="gemini",
+                effort="high",
+                timeout_seconds=2,
+                cwd=None,
+                env=None,
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    assert popen_entered.wait(timeout=2)
+    aborter = threading.Thread(target=conversation.abort)
+    aborter.start()
+    time.sleep(0.05)
+    assert aborter.is_alive(), "abort must wait until the child is published"
+    allow_popen_return.set()
+    worker.join(timeout=3)
+    aborter.join(timeout=3)
+
+    assert killed.is_set()
+    assert not worker.is_alive()
+    assert not aborter.is_alive()
+    assert outcome and "AGY failed" in str(outcome[0])
+
+
+@pytest.mark.parametrize(
+    "bad_id, error",
+    [
+        ({"bad": "shape"}, "non-string conversation_id"),
+        ("not-a-uuid", "malformed conversation_id"),
+    ],
+)
+def test_execute_rejects_malformed_conversation_id(monkeypatch, bad_id, error):
+    conversation = AntigravityConversation()
+    payload = json.dumps(
+        {"status": "SUCCESS", "response": "ok", "conversation_id": bad_id}
+    )
+    process = SimpleNamespace(
+        pid=12345,
+        returncode=0,
+        communicate=Mock(return_value=(payload, "")),
+    )
+    monkeypatch.setattr(
+        "agent.antigravity_session.subprocess.Popen", Mock(return_value=process)
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        conversation._execute(
+            "hello",
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )

@@ -425,12 +425,14 @@ class CopilotACPClient:
         # AGY conversation here prevents cross-thread collisions even when two
         # spawned workspaces begin with identical prompts.
         self._antigravity_conversation = AntigravityConversation()
+        self._owns_antigravity_conversation = True
 
     def _is_antigravity(self) -> bool:
         return str(self.base_url or "").rstrip("/") == ANTIGRAVITY_MARKER_BASE_URL
 
     def close(self) -> None:
-        self._antigravity_conversation.abort()
+        if self._owns_antigravity_conversation:
+            self._antigravity_conversation.abort()
         proc: subprocess.Popen[str] | None
         with self._active_process_lock:
             proc = self._active_process
