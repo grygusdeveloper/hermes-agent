@@ -430,6 +430,7 @@ class CopilotACPClient:
         return str(self.base_url or "").rstrip("/") == ANTIGRAVITY_MARKER_BASE_URL
 
     def close(self) -> None:
+        self._antigravity_conversation.abort()
         proc: subprocess.Popen[str] | None
         with self._active_process_lock:
             proc = self._active_process

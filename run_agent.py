@@ -5139,6 +5139,20 @@ class AIAgent:
             # with an in-flight request on another thread).
             self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
         client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        # CopilotACPClient is request-local for normal chat-completions calls.
+        # Antigravity's AGY conversation must instead live with the cached
+        # primary agent client so incremental context survives between turns.
+        from agent.copilot_acp_client import CopilotACPClient
+
+        if (
+            isinstance(primary_client, CopilotACPClient)
+            and isinstance(client, CopilotACPClient)
+            and primary_client._is_antigravity()
+            and client._is_antigravity()
+        ):
+            client._antigravity_conversation = (
+                primary_client._antigravity_conversation
+            )
         with self._openai_client_lock():
             cache = self._request_client_cache_ref()
             if cache["client"] is None:
@@ -5222,6 +5236,19 @@ class AIAgent:
             cache = self._request_client_cache_ref()
             if cache["client"] is client:
                 cache["poisoned"] = True
+        try:
+            from agent.copilot_acp_client import CopilotACPClient
+
+            if isinstance(client, CopilotACPClient) and client._is_antigravity():
+                client._antigravity_conversation.abort()
+                logger.info(
+                    "Antigravity request aborted (%s, shared=False) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+                return
+        except Exception:
+            logger.debug("Antigravity request abort failed", exc_info=True)
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
             # tcp_force_closed=0 means the stranger-thread abort found no

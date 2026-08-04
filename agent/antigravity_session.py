@@ -96,11 +96,25 @@ class AntigravityConversation:
         self._conversation_id: str | None = None
         self._previous_messages: tuple[tuple[str, str], ...] = ()
         self._lock = threading.RLock()
+        self._process_lock = threading.Lock()
+        self._active_process: subprocess.Popen[str] | None = None
 
     def reset(self) -> None:
         with self._lock:
             self._conversation_id = None
             self._previous_messages = ()
+
+    def abort(self) -> None:
+        """Terminate the in-flight AGY process without waiting on state locks."""
+
+        with self._process_lock:
+            process = self._active_process
+        if process is None or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
 
     def run(
         self,
@@ -155,12 +169,16 @@ class AntigravityConversation:
                 cwd=cwd,
                 env=env,
             )
-            self._conversation_id = conversation_id or None
+            if not conversation_id:
+                raise RuntimeError(
+                    "AGY did not return a conversation_id; incremental context cannot be established"
+                )
+            self._conversation_id = conversation_id
             self._previous_messages = current
             return response, reasoning
 
-    @staticmethod
     def _execute(
+        self,
         prompt_text: str,
         *,
         conversation_id: str | None,
@@ -207,27 +225,34 @@ class AntigravityConversation:
         except FileNotFoundError as exc:
             raise RuntimeError(f"AGY executable not found at {agy}") from exc
 
+        with self._process_lock:
+            self._active_process = process
+
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds + 30)
-        except subprocess.TimeoutExpired as exc:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=5)
-            except Exception:
-                process.kill()
-                process.wait()
-            raise RuntimeError("AGY prompt timed out") from exc
+                stdout, stderr = process.communicate(timeout=timeout_seconds + 30)
+            except subprocess.TimeoutExpired as exc:
+                self.abort()
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    process.kill()
+                    process.wait()
+                raise RuntimeError("AGY prompt timed out") from exc
+        finally:
+            with self._process_lock:
+                if self._active_process is process:
+                    self._active_process = None
 
         if process.returncode != 0:
             detail = stderr.strip()[-1000:] if stderr else f"exit {process.returncode}"
             raise RuntimeError(f"AGY failed: {detail}")
         try:
             payload = json.loads(stdout)
-        except json.JSONDecodeError:
-            response = stdout.strip()
-            if not response:
-                raise RuntimeError("AGY returned no response")
-            return response, "", ""
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("AGY returned malformed JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("AGY returned non-object JSON")
         if str(payload.get("status") or "") != "SUCCESS":
             detail = str(payload.get("response") or "")[:300]
             raise RuntimeError(
