@@ -7,9 +7,9 @@ from unittest.mock import Mock
 import pytest
 
 from agent.antigravity_session import (
-    INLINE_PROMPT_LIMIT_BYTES,
     AntigravityConversation,
-    _truncate_utf8,
+    AntigravityConversationExpired,
+    _validate_prompt_size,
 )
 from agent.copilot_acp_client import CopilotACPClient
 from agent.model_metadata import get_model_context_length
@@ -99,13 +99,55 @@ def test_conversation_state_is_instance_local(monkeypatch):
     assert right_calls == [None]
 
 
-def test_utf8_prompt_bound_preserves_head_and_tail():
+def test_utf8_prompt_limit_rejects_without_truncation():
     text = "HEAD:" + ("🙂" * 100_000) + ":TAIL"
-    bounded = _truncate_utf8(text)
-    assert len(bounded.encode("utf-8")) <= INLINE_PROMPT_LIMIT_BYTES
-    assert bounded.startswith("HEAD:")
-    assert bounded.endswith(":TAIL")
-    assert "middle context omitted" in bounded
+    with pytest.raises(RuntimeError, match="no context was sent or truncated"):
+        _validate_prompt_size(text)
+    assert _validate_prompt_size("small") == "small"
+
+
+def test_resume_propagates_unrelated_failure_without_fresh_replay(monkeypatch):
+    conversation = AntigravityConversation()
+    execute = Mock(side_effect=[("FIRST", "", "cid-1"), RuntimeError("quota")])
+    monkeypatch.setattr(conversation, "_execute", execute)
+    first = _messages(("user", "first"))
+    conversation.run("FULL FIRST", messages=first, model="gemini")
+
+    with pytest.raises(RuntimeError, match="quota"):
+        conversation.run(
+            "FULL SECOND",
+            messages=first + _messages(("assistant", "FIRST"), ("user", "second")),
+            model="gemini",
+        )
+
+    assert execute.call_count == 2
+    assert conversation._conversation_id == "cid-1"
+
+
+def test_expired_conversation_retries_once_as_fresh(monkeypatch):
+    conversation = AntigravityConversation()
+    execute = Mock(
+        side_effect=[
+            ("FIRST", "", "cid-1"),
+            AntigravityConversationExpired("conversation not found"),
+            ("FRESH", "", "cid-2"),
+        ]
+    )
+    monkeypatch.setattr(conversation, "_execute", execute)
+    first = _messages(("user", "first"))
+    conversation.run("FULL FIRST", messages=first, model="gemini")
+    second = first + _messages(("assistant", "FIRST"), ("user", "second"))
+
+    response, _ = conversation.run("FULL SECOND", messages=second, model="gemini")
+
+    assert response == "FRESH"
+    assert [call.kwargs["conversation_id"] for call in execute.call_args_list] == [
+        None,
+        "cid-1",
+        None,
+    ]
+    assert execute.call_args_list[2].args[0] == "FULL SECOND"
+    assert conversation._conversation_id == "cid-2"
 
 
 def test_client_routes_only_antigravity_marker_to_session_mode(monkeypatch):

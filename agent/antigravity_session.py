@@ -53,19 +53,16 @@ def _message_fingerprint(messages: list[dict[str, Any]]) -> tuple[tuple[str, str
     )
 
 
-def _truncate_utf8(text: str, limit: int = INLINE_PROMPT_LIMIT_BYTES) -> str:
-    """Byte-bound text while retaining both instructions and latest request."""
+def _validate_prompt_size(text: str, limit: int = INLINE_PROMPT_LIMIT_BYTES) -> str:
+    """Reject an oversized exec argument instead of silently losing context."""
 
-    payload = text.encode("utf-8")
-    if len(payload) <= limit:
-        return text
-    marker = b"\n\n[... middle context omitted by Antigravity transport ...]\n\n"
-    available = max(0, limit - len(marker))
-    head_size = int(available * 0.60)
-    tail_size = available - head_size
-    head = payload[:head_size].decode("utf-8", errors="ignore")
-    tail = payload[-tail_size:].decode("utf-8", errors="ignore") if tail_size else ""
-    return head + marker.decode("ascii") + tail
+    size = len(text.encode("utf-8"))
+    if size > limit:
+        raise RuntimeError(
+            "AGY prompt transport limit exceeded: "
+            f"{size} UTF-8 bytes > {limit}; no context was sent or truncated"
+        )
+    return text
 
 
 def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> str:
@@ -86,7 +83,25 @@ def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> 
             "tool": "Tool Result",
         }.get(role, role.title() or "Context")
         parts.append(f"{label}:\n{rendered}")
-    return _truncate_utf8("\n\n".join(parts))
+    return _validate_prompt_size("\n\n".join(parts))
+
+
+class AntigravityConversationExpired(RuntimeError):
+    """AGY positively identified a missing, invalid, or expired conversation."""
+
+
+def _is_expired_conversation_error(detail: str) -> bool:
+    normalized = detail.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "conversation not found",
+            "invalid conversation",
+            "conversation has expired",
+            "conversation expired",
+            "unknown conversation",
+        )
+    )
 
 
 class AntigravityConversation:
@@ -150,9 +165,9 @@ class AntigravityConversation:
                             cwd=cwd,
                             env=env,
                         )
-                    except Exception:
+                    except AntigravityConversationExpired:
                         # Expired/invalid server conversation: retry once as a
-                        # fresh AGY conversation with the bounded full prompt.
+                        # fresh AGY conversation with the complete full prompt.
                         self._conversation_id = None
                         self._previous_messages = ()
                     else:
@@ -161,7 +176,7 @@ class AntigravityConversation:
                         return response, reasoning
 
             response, reasoning, conversation_id = self._execute(
-                _truncate_utf8(prompt_text),
+                _validate_prompt_size(prompt_text),
                 conversation_id=None,
                 model=model,
                 effort=effort,
@@ -246,6 +261,8 @@ class AntigravityConversation:
 
         if process.returncode != 0:
             detail = stderr.strip()[-1000:] if stderr else f"exit {process.returncode}"
+            if conversation_id and _is_expired_conversation_error(detail):
+                raise AntigravityConversationExpired(f"AGY failed: {detail}")
             raise RuntimeError(f"AGY failed: {detail}")
         try:
             payload = json.loads(stdout)
@@ -255,6 +272,10 @@ class AntigravityConversation:
             raise RuntimeError("AGY returned non-object JSON")
         if str(payload.get("status") or "") != "SUCCESS":
             detail = str(payload.get("response") or "")[:300]
+            if conversation_id and _is_expired_conversation_error(detail):
+                raise AntigravityConversationExpired(
+                    f"AGY returned status {payload.get('status')!r}: {detail}"
+                )
             raise RuntimeError(
                 f"AGY returned status {payload.get('status')!r}: {detail}"
             )
