@@ -3559,6 +3559,20 @@ class GatewaySlashCommandsMixin:
                     for key in ("model", "provider", "base_url")
                     if mapped_model.get(key) not in (None, "")
                 }
+                mapped_profile = mapped_model.get("profile")
+                if mapped_profile not in (None, ""):
+                    try:
+                        profile_name = normalize_profile_name(str(mapped_profile))
+                        validate_profile_name(profile_name)
+                    except ValueError as exc:
+                        return (
+                            f"❌ Model alias `{requested_model}` has invalid profile: {exc}"
+                        )
+                    if not profile_exists(profile_name):
+                        return (
+                            f"❌ Model alias `{requested_model}` maps to profile "
+                            f"`{profile_name}`, but that profile is not installed."
+                        )
             if not model_override or not model_override.get("model"):
                 return f"❌ Model alias `{requested_model}` has no model configured."
 

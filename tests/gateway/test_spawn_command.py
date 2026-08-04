@@ -176,6 +176,100 @@ async def test_spawn_creates_thread_and_persists_profile_and_model_alias():
 
 
 @pytest.mark.asyncio
+async def test_global_model_alias_can_bind_dedicated_execution_profile():
+    adapter = SimpleNamespace(
+        create_spawn_thread=AsyncMock(
+            return_value={
+                "success": True,
+                "thread_id": "thread-gemini",
+                "thread_name": "Gemini task",
+                "guild_id": "guild-1",
+            }
+        )
+    )
+    spawned_entry = SimpleNamespace(session_key="agent:main:discord:thread:gemini")
+    store = SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=spawned_entry),
+        set_execution_profile=AsyncMock(),
+        set_model_override=AsyncMock(),
+    )
+    runner = SpawnHarness(adapter, store)
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "parent-1",
+                "default_agent": "main",
+                "agents": {"main": {"profile": "default"}},
+                "models": {
+                    "gemini": {
+                        "profile": "gemini",
+                        "model": "gemini-3.6-flash-high",
+                        "provider": "copilot-acp",
+                        "base_url": "acp://antigravity",
+                    }
+                },
+            }
+        }
+    }
+
+    with (
+        patch("gateway.run._load_gateway_config", return_value=config),
+        patch("hermes_cli.profiles.profile_exists", return_value=True),
+    ):
+        result = await runner._handle_spawn_command(
+            _discord_dm_event('/spawn --model gemini --title "Gemini task"')
+        )
+
+    assert result.startswith("✅ Spawned <#thread-gemini>")
+    store.set_execution_profile.assert_awaited_once_with(
+        spawned_entry.session_key, "gemini"
+    )
+    store.set_model_override.assert_awaited_once_with(
+        spawned_entry.session_key,
+        {
+            "model": "gemini-3.6-flash-high",
+            "provider": "copilot-acp",
+            "base_url": "acp://antigravity",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_alias_missing_profile_fails_before_thread_creation():
+    adapter = SimpleNamespace(create_spawn_thread=AsyncMock())
+    store = SimpleNamespace()
+    runner = SpawnHarness(adapter, store)
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "parent-1",
+                "models": {
+                    "gemini": {
+                        "profile": "missing-gemini",
+                        "model": "gemini-3.6-flash-high",
+                    }
+                },
+            }
+        }
+    }
+
+    with (
+        patch("gateway.run._load_gateway_config", return_value=config),
+        patch(
+            "hermes_cli.profiles.profile_exists",
+            side_effect=lambda name: name == "default",
+        ),
+    ):
+        result = await runner._handle_spawn_command(
+            _discord_dm_event("/spawn --model gemini")
+        )
+
+    assert "profile `missing-gemini`" in result
+    assert "not installed" in result
+    adapter.create_spawn_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_spawn_with_prompt_posts_and_dispatches_initial_task():
     adapter = SimpleNamespace(
         create_spawn_thread=AsyncMock(
