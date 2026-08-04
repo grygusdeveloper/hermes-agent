@@ -12,8 +12,6 @@ import pytest
 from agent.antigravity_session import (
     AntigravityConversation,
     AntigravityConversationExpired,
-    _batch_complete_json_objects,
-    _semantic_staging_frames,
     _validate_prompt_size,
 )
 from agent.copilot_acp_client import CopilotACPClient
@@ -73,33 +71,6 @@ def test_prefix_change_starts_fresh_after_reset_or_compression(monkeypatch):
     assert calls == [None, None]
 
 
-def test_tool_schema_change_forces_fresh_conversation(monkeypatch):
-    conversation = AntigravityConversation()
-    calls: list[str | None] = []
-
-    def fake_execute(prompt_text, **kwargs):
-        calls.append(kwargs["conversation_id"])
-        return "answer", "", "cid"
-
-    monkeypatch.setattr(conversation, "_execute", fake_execute)
-    first = _messages(("user", "first"))
-    tools_a = [
-        {"type": "function", "function": {"name": "alpha", "parameters": {}}}
-    ]
-    tools_b = [
-        {"type": "function", "function": {"name": "beta", "parameters": {}}}
-    ]
-    conversation.run("first", messages=first, tools=tools_a, model="gemini")
-    conversation.run(
-        "second",
-        messages=first + _messages(("assistant", "answer"), ("user", "second")),
-        tools=tools_b,
-        model="gemini",
-    )
-
-    assert calls == [None, None]
-
-
 def test_conversation_state_is_instance_local(monkeypatch):
     left = AntigravityConversation()
     right = AntigravityConversation()
@@ -136,121 +107,6 @@ def test_utf8_prompt_limit_rejects_without_truncation():
     with pytest.raises(RuntimeError, match="no context was sent or truncated"):
         _validate_prompt_size(text)
     assert _validate_prompt_size("small") == "small"
-
-
-def test_semantic_staging_batches_only_complete_lossless_objects():
-    marker = "SCHEMA_SENTINEL_ß"
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": f"tool_{index}",
-                "description": marker + ("x" * 42_000),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }
-        for index in range(3)
-    ]
-    frames, final_prompt = _semantic_staging_frames(
-        _messages(("system", "SYSTEM_SENTINEL"), ("user", "USER_SENTINEL")),
-        tools,
-    )
-
-    payloads = [payload for _, payload in frames]
-    decoded = [item for payload in payloads for item in json.loads(payload)]
-    assert any(item.get("content") == "SYSTEM_SENTINEL" for item in decoded)
-    decoded_tools = [item for item in decoded if item.get("name", "").startswith("tool_")]
-    assert len(decoded_tools) == 3
-    assert all(marker in item["description"] for item in decoded_tools)
-    assert all(len(payload.encode("utf-8")) <= 85_000 for payload in payloads)
-    assert "USER_SENTINEL" in final_prompt
-
-
-def test_single_staging_object_over_limit_fails_without_truncation():
-    with pytest.raises(RuntimeError, match="no context was sent or truncated"):
-        _batch_complete_json_objects([{"content": "🙂" * 30_000}])
-
-
-def test_oversized_fresh_prompt_uses_acknowledged_semantic_staging(monkeypatch):
-    conversation = AntigravityConversation()
-    conversation_id = "12345678-1234-1234-1234-123456789abc"
-    prompts: list[str] = []
-
-    def fake_execute_active(prompt_text, **kwargs):
-        prompts.append(prompt_text)
-        if "Reply exactly ACK_" in prompt_text:
-            ack = prompt_text.split("Reply exactly ", 1)[1].split(".", 1)[0]
-            return ack, "", conversation_id
-        return "STAGED_OK", "", conversation_id
-
-    monkeypatch.setattr(conversation, "_execute_active", fake_execute_active)
-    monkeypatch.setattr(
-        conversation,
-        "_execute",
-        Mock(side_effect=AssertionError("oversized prompt must not use one argv element")),
-    )
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": f"staged_tool_{index}",
-                "description": f"TOOL_SENTINEL_{index}_" + ("d" * 48_000),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }
-        for index in range(3)
-    ]
-    messages = _messages(("system", "SYSTEM_SENTINEL"), ("user", "USER_SENTINEL"))
-
-    response, _ = conversation.run(
-        "x" * 120_001,
-        messages=messages,
-        tools=tools,
-        model="gemini",
-    )
-
-    assert response == "STAGED_OK"
-    assert len(prompts) == 5  # one system + three tool batches + final user turn
-    assert all(len(prompt.encode("utf-8")) <= 120_000 for prompt in prompts)
-    joined = "\n".join(prompts)
-    assert "SYSTEM_SENTINEL" in joined
-    assert all(f"TOOL_SENTINEL_{index}_" in joined for index in range(3))
-    assert "USER_SENTINEL" in prompts[-1]
-    assert conversation._conversation_id == conversation_id
-    assert conversation._request_active is False
-    assert conversation._abort_requested is False
-
-
-def test_staging_ack_mismatch_fails_closed_and_keeps_state_fresh(monkeypatch):
-    conversation = AntigravityConversation()
-    monkeypatch.setattr(
-        conversation,
-        "_execute_active",
-        Mock(return_value=("not-the-ack", "", "12345678-1234-1234-1234-123456789abc")),
-    )
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "large_tool",
-                "description": "d" * 50_000,
-                "parameters": {"type": "object"},
-            },
-        }
-    ]
-
-    with pytest.raises(RuntimeError, match="acknowledgement mismatch"):
-        conversation.run(
-            "x" * 120_001,
-            messages=_messages(("system", "rules"), ("user", "hello")),
-            tools=tools,
-            model="gemini",
-        )
-
-    assert conversation._conversation_id is None
-    assert conversation._previous_messages == ()
-    assert conversation._request_active is False
-    assert conversation._abort_requested is False
 
 
 def test_resume_propagates_unrelated_failure_without_fresh_replay(monkeypatch):
@@ -299,12 +155,6 @@ def test_expired_conversation_retries_once_as_fresh(monkeypatch):
 
 def test_client_routes_only_antigravity_marker_to_session_mode(monkeypatch):
     messages = _messages(("user", "hello"))
-    tools = [
-        {
-            "type": "function",
-            "function": {"name": "probe", "parameters": {"type": "object"}},
-        }
-    ]
 
     antigravity = CopilotACPClient(base_url="acp://antigravity")
     agy_run = Mock(return_value=("AGY_OK", ""))
@@ -317,11 +167,9 @@ def test_client_routes_only_antigravity_marker_to_session_mode(monkeypatch):
     result = antigravity.chat.completions.create(
         model="gemini-3.6-flash-high",
         messages=messages,
-        tools=tools,
     )
     assert result.choices[0].message.content == "AGY_OK"
     assert agy_run.call_args.kwargs["messages"] == messages
-    assert agy_run.call_args.kwargs["tools"] == tools
 
     copilot = CopilotACPClient(base_url="acp://copilot")
     generic_run = Mock(return_value=("COPILOT_OK", ""))

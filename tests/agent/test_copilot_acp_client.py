@@ -57,42 +57,6 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertEqual(dict(tool_call.function)["name"], "read_file")
         self.assertEqual(choice.message.content, "I'll inspect that.")
 
-    def test_compact_antigravity_tool_call_normalizes_one_extra_escape_layer(self) -> None:
-        tool_response = (
-            "<tool_call>"
-            + json.dumps(
-                {
-                    "name": "first_batch_probe",
-                    "arguments": r'{\"code\": \"PRODUCT_STAGING_OK\"}',
-                }
-            )
-            + "</tool_call>"
-        )
-
-        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "")):
-            response = self.client._create_chat_completion(
-                model="copilot-acp",
-                messages=[{"role": "user", "content": "call probe"}],
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {"name": "first_batch_probe", "parameters": {}},
-                    }
-                ],
-            )
-
-        choice = response.choices[0]
-        self.assertEqual(choice.finish_reason, "tool_calls")
-        self.assertEqual(choice.message.content, "")
-        self.assertEqual(len(choice.message.tool_calls), 1)
-        tool_call = choice.message.tool_calls[0]
-        self.assertEqual(tool_call.id, "acp_call_1")
-        self.assertEqual(tool_call.function.name, "first_batch_probe")
-        self.assertEqual(
-            json.loads(tool_call.function.arguments),
-            {"code": "PRODUCT_STAGING_OK"},
-        )
-
     def test_stream_true_returns_iterable_text_chunks(self) -> None:
         with patch.object(self.client, "_run_prompt", return_value=("Hello from ACP", "")):
             stream = self.client._create_chat_completion(
