@@ -254,6 +254,7 @@ def test_two_request_clients_resume_one_primary_antigravity_conversation():
 def test_antigravity_abort_terminates_active_process_group(monkeypatch):
     conversation = AntigravityConversation()
     process = SimpleNamespace(pid=4321, poll=Mock(return_value=None))
+    conversation._request_active = True
     conversation._active_process = process
     killpg = Mock()
     monkeypatch.setattr("agent.antigravity_session.os.killpg", killpg)
@@ -387,3 +388,78 @@ def test_execute_rejects_malformed_conversation_id(monkeypatch, bad_id, error):
             cwd=None,
             env=None,
         )
+
+
+def test_late_abort_fails_current_request_without_poisoning_next(monkeypatch):
+    conversation = AntigravityConversation()
+    valid_id = "12345678-1234-1234-1234-123456789abc"
+    payload = json.dumps(
+        {"status": "SUCCESS", "response": "ok", "conversation_id": valid_id}
+    )
+
+    def make_process(*args, **kwargs):
+        return SimpleNamespace(
+            pid=12345,
+            returncode=0,
+            poll=Mock(return_value=0),
+            communicate=Mock(return_value=(payload, "")),
+        )
+
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", make_process)
+    real_loads = json.loads
+    parse_count = 0
+
+    def abort_during_first_parse(value):
+        nonlocal parse_count
+        parse_count += 1
+        if parse_count == 1:
+            conversation.abort()
+        return real_loads(value)
+
+    monkeypatch.setattr("agent.antigravity_session.json.loads", abort_during_first_parse)
+
+    with pytest.raises(RuntimeError, match="AGY request aborted"):
+        conversation._execute(
+            "first",
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )
+
+    result = conversation._execute(
+        "second",
+        conversation_id=None,
+        model="gemini",
+        effort="high",
+        timeout_seconds=2,
+        cwd=None,
+        env=None,
+    )
+    assert result == ("ok", "", valid_id)
+    assert conversation._abort_requested is False
+    assert conversation._request_active is False
+
+
+def test_idle_abort_does_not_poison_next_request(monkeypatch):
+    conversation = AntigravityConversation()
+    conversation.abort()
+    execute_active = Mock(
+        return_value=("ok", "", "12345678-1234-1234-1234-123456789abc")
+    )
+    monkeypatch.setattr(conversation, "_execute_active", execute_active)
+
+    result = conversation._execute(
+        "next",
+        conversation_id=None,
+        model="gemini",
+        effort="high",
+        timeout_seconds=2,
+        cwd=None,
+        env=None,
+    )
+
+    assert result[0] == "ok"
+    execute_active.assert_called_once()

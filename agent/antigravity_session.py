@@ -119,6 +119,7 @@ class AntigravityConversation:
         self._process_lock = threading.Lock()
         self._active_process: subprocess.Popen[str] | None = None
         self._abort_requested = False
+        self._request_active = False
 
     def reset(self) -> None:
         with self._lock:
@@ -129,6 +130,8 @@ class AntigravityConversation:
         """Terminate the in-flight AGY process without waiting on state locks."""
 
         with self._process_lock:
+            if not self._request_active:
+                return
             self._abort_requested = True
             process = self._active_process
         if process is None or process.poll() is not None:
@@ -210,6 +213,45 @@ class AntigravityConversation:
         cwd: str | None,
         env: dict[str, str] | None,
     ) -> tuple[str, str, str]:
+        """Run one request with an abort latch scoped to this exact call."""
+
+        with self._process_lock:
+            if self._request_active:
+                raise RuntimeError("Concurrent AGY request on one conversation")
+            self._request_active = True
+            self._abort_requested = False
+        try:
+            result = self._execute_active(
+                prompt_text,
+                conversation_id=conversation_id,
+                model=model,
+                effort=effort,
+                timeout_seconds=timeout_seconds,
+                cwd=cwd,
+                env=env,
+            )
+            with self._process_lock:
+                aborted = self._abort_requested
+            if aborted:
+                raise RuntimeError("AGY request aborted")
+            return result
+        finally:
+            with self._process_lock:
+                self._active_process = None
+                self._abort_requested = False
+                self._request_active = False
+
+    def _execute_active(
+        self,
+        prompt_text: str,
+        *,
+        conversation_id: str | None,
+        model: str,
+        effort: str,
+        timeout_seconds: float,
+        cwd: str | None,
+        env: dict[str, str] | None,
+    ) -> tuple[str, str, str]:
         agy = os.environ.get("AGY_PATH", str(Path.home() / ".local" / "bin" / "agy"))
         command = [
             agy,
@@ -235,7 +277,6 @@ class AntigravityConversation:
         process_env.setdefault("LANG", "C.UTF-8")
         with self._process_lock:
             if self._abort_requested:
-                self._abort_requested = False
                 raise RuntimeError("AGY request aborted before launch")
             try:
                 process = subprocess.Popen(
@@ -253,21 +294,15 @@ class AntigravityConversation:
             self._active_process = process
 
         try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds + 30)
+        except subprocess.TimeoutExpired as exc:
+            self.abort()
             try:
-                stdout, stderr = process.communicate(timeout=timeout_seconds + 30)
-            except subprocess.TimeoutExpired as exc:
-                self.abort()
-                try:
-                    process.wait(timeout=5)
-                except Exception:
-                    process.kill()
-                    process.wait()
-                raise RuntimeError("AGY prompt timed out") from exc
-        finally:
-            with self._process_lock:
-                if self._active_process is process:
-                    self._active_process = None
-                    self._abort_requested = False
+                process.wait(timeout=5)
+            except Exception:
+                process.kill()
+                process.wait()
+            raise RuntimeError("AGY prompt timed out") from exc
 
         if process.returncode != 0:
             detail = stderr.strip()[-1000:] if stderr else f"exit {process.returncode}"
