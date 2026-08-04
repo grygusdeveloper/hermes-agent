@@ -24861,7 +24861,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # that owns the save controls, so favorites and Notion get a useful
             # title even when delivery happened through streaming edits.
             _thread_metadata = dict(_thread_metadata or {})
-            _thread_metadata["save_prompt"] = getattr(event, "text", None)
+            _thread_metadata["save_prompt"] = message
 
         if _streaming_enabled:
             try:
@@ -25757,7 +25757,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # routing metadata shared by the other callbacks.
             turn_ctx._stream_thread_metadata = {
                 **(_status_thread_metadata or {}),
-                "save_prompt": getattr(event, "text", None),
+                "save_prompt": message,
             }
 
         # ---- Streaming TTS consumer setup (#60671) ----

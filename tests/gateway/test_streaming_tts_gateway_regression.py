@@ -92,6 +92,15 @@ def _make_voice_source() -> SessionSource:
     )
 
 
+def _make_discord_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="67890",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+
 def _setup_monkeypatches(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     (tmp_path / "config.yaml").write_text("agent:\n  model: test-model\n", encoding="utf-8")
@@ -155,3 +164,26 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
+def test_run_agent_discord_turn_preserves_prompt_without_name_error(monkeypatch, tmp_path):
+    """A normal Discord text turn must not reference an out-of-scope event."""
+    _setup_monkeypatches(monkeypatch, tmp_path)
+    runner = _make_runner()
+
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_adapter_for_source",
+        lambda self, source: None,
+    )
+
+    async def _run():
+        return await runner._run_agent(
+            message="Discord prompt",
+            context_prompt="",
+            history=[],
+            source=_make_discord_source(),
+            session_id="session-2",
+            session_key="agent:main:discord:dm:67890",
+        )
+
+    result = asyncio.new_event_loop().run_until_complete(_run())
+    assert result["final_response"] == "Hello from the agent."
