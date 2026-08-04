@@ -44,8 +44,8 @@ _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 OOB_USER_MESSAGE_KEY = "_hermes_oob_user_message"
-_PERSISTED_PATH_RE = re.compile(r"^Full output saved to:\s*(.+?)\s*$", re.MULTILINE)
-_PERSISTED_SIZE_RE = re.compile(r"^This tool result was too large \(.+?\)\.\s*$", re.MULTILINE)
+PERSISTED_OUTPUT_METADATA_KEY = "_hermes_persisted_output"
+POST_PERSIST_SUFFIXES_KEY = "_hermes_post_persist_suffixes"
 
 
 def _resolve_storage_dir(env) -> str:
@@ -144,19 +144,36 @@ def _build_persisted_message(
     return msg
 
 
-def _compact_persisted_message(content: str) -> str:
-    """Drop an existing persisted preview while retaining its durable handle."""
+def _trusted_persistence_metadata(message: dict) -> dict | None:
+    """Return framework-authenticated persistence metadata, if complete."""
 
-    path_match = _PERSISTED_PATH_RE.search(content)
-    if not path_match:
-        return content
-    size_match = _PERSISTED_SIZE_RE.search(content)
+    metadata = message.get(PERSISTED_OUTPUT_METADATA_KEY)
+    if not isinstance(metadata, dict):
+        return None
+    path = metadata.get("path")
+    original_size = metadata.get("original_size")
+    if not isinstance(path, str) or not path.startswith("/"):
+        return None
+    if not isinstance(original_size, int) or original_size < 0:
+        return None
+    return {"path": path, "original_size": original_size}
+
+
+def _compact_persisted_message(content: str, metadata: dict) -> str:
+    """Drop a persisted preview using only authenticated durable metadata."""
+
+    original_size = metadata["original_size"]
+    size_kb = original_size / 1024
+    size_str = (
+        f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
+    )
     lines = [PERSISTED_OUTPUT_TAG]
-    if size_match:
-        lines.append(size_match.group(0))
+    lines.append(
+        f"This tool result was too large ({original_size:,} characters, {size_str})."
+    )
     lines.extend(
         (
-            f"Full output saved to: {path_match.group(1)}",
+            f"Full output saved to: {metadata['path']}",
             "Use read_file with offset and limit to inspect the full output.",
             PERSISTED_OUTPUT_CLOSING_TAG,
         )
@@ -164,8 +181,8 @@ def _compact_persisted_message(content: str) -> str:
     return "\n".join(lines)
 
 
-def _split_trusted_oob_suffix(message: dict, content: str) -> tuple[str, str]:
-    """Separate authenticated mid-turn steering from spillable tool output.
+def _split_trusted_suffixes(message: dict, content: str) -> tuple[str, str]:
+    """Separate authenticated framework suffixes from spillable tool output.
 
     The marker text alone is not trusted because a tool can emit a lookalike.
     ``agent_runtime_helpers`` sets the private metadata key only when Hermes
@@ -173,8 +190,17 @@ def _split_trusted_oob_suffix(message: dict, content: str) -> tuple[str, str]:
     previews ensures aggregate compaction can never hide the user's message.
     """
 
-    trusted = message.get(OOB_USER_MESSAGE_KEY)
-    if isinstance(trusted, str) and trusted and content.endswith(trusted):
+    suffixes = message.get(POST_PERSIST_SUFFIXES_KEY)
+    trusted_parts = (
+        [item for item in suffixes if isinstance(item, str) and item]
+        if isinstance(suffixes, list)
+        else []
+    )
+    oob = message.get(OOB_USER_MESSAGE_KEY)
+    if isinstance(oob, str) and oob:
+        trusted_parts.append(oob)
+    trusted = "".join(trusted_parts)
+    if trusted and content.endswith(trusted):
         return content[: -len(trusted)], trusted
     return content, ""
 
@@ -186,6 +212,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    metadata_out: dict | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -219,6 +246,11 @@ def maybe_persist_tool_result(
     if env is not None:
         try:
             if _write_to_sandbox(content, remote_path, env):
+                if metadata_out is not None:
+                    metadata_out.clear()
+                    metadata_out.update(
+                        {"path": remote_path, "original_size": len(content)}
+                    )
                 logger.info(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
@@ -257,7 +289,7 @@ def enforce_turn_budget(
         content = msg.get("content", "")
         size = len(content)
         total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
+        if _trusted_persistence_metadata(msg) is None:
             candidates.append((i, size))
 
     if total_size <= config.turn_budget:
@@ -270,9 +302,10 @@ def enforce_turn_budget(
             break
         msg = tool_messages[idx]
         content = msg["content"]
-        spillable_content, trusted_oob = _split_trusted_oob_suffix(msg, content)
+        spillable_content, trusted_suffix = _split_trusted_suffixes(msg, content)
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
+        persisted_metadata: dict = {}
         replacement = maybe_persist_tool_result(
             content=spillable_content,
             tool_name=_BUDGET_TOOL_NAME,
@@ -280,13 +313,16 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
+            metadata_out=persisted_metadata,
         )
-        if trusted_oob:
-            replacement += trusted_oob
+        if trusted_suffix:
+            replacement += trusted_suffix
         if replacement != content:
             total_size -= size
             total_size += len(replacement)
             tool_messages[idx]["content"] = replacement
+            if persisted_metadata:
+                tool_messages[idx][PERSISTED_OUTPUT_METADATA_KEY] = persisted_metadata
             logger.info(
                 "Budget enforcement: persisted tool result %s (%d chars)",
                 tool_use_id, size,
@@ -300,7 +336,7 @@ def enforce_turn_budget(
             (
                 (i, len(str(msg.get("content", ""))))
                 for i, msg in enumerate(tool_messages)
-                if PERSISTED_OUTPUT_TAG in str(msg.get("content", ""))
+                if _trusted_persistence_metadata(msg) is not None
             ),
             key=lambda item: item[1],
             reverse=True,
@@ -309,12 +345,17 @@ def enforce_turn_budget(
             if total_size <= config.turn_budget:
                 break
             content = str(tool_messages[idx].get("content", ""))
-            compactable_content, trusted_oob = _split_trusted_oob_suffix(
+            compactable_content, trusted_suffix = _split_trusted_suffixes(
                 tool_messages[idx], content
             )
-            replacement = _compact_persisted_message(compactable_content)
-            if trusted_oob:
-                replacement += trusted_oob
+            metadata = _trusted_persistence_metadata(tool_messages[idx])
+            if metadata is None:
+                continue
+            replacement = _compact_persisted_message(
+                compactable_content, metadata
+            )
+            if trusted_suffix:
+                replacement += trusted_suffix
             if replacement == content:
                 continue
             tool_messages[idx]["content"] = replacement

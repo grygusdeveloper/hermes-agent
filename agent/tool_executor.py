@@ -45,6 +45,8 @@ from tools.terminal_tool import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
+    POST_PERSIST_SUFFIXES_KEY,
+    PERSISTED_OUTPUT_METADATA_KEY,
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
@@ -1484,13 +1486,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=name,
-            tool_use_id=tc.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
+        persisted_output_metadata: dict = {}
+        if not _is_multimodal_tool_result(function_result):
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+                metadata_out=persisted_output_metadata,
+            )
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if subdir_hints:
@@ -1516,6 +1521,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tc.id,
             effect_disposition=effect_disposition,
         )
+        if persisted_output_metadata:
+            tool_message[PERSISTED_OUTPUT_METADATA_KEY] = persisted_output_metadata
+            if subdir_hints:
+                tool_message[POST_PERSIST_SUFFIXES_KEY] = [subdir_hints]
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2261,13 +2270,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=function_name,
-            tool_use_id=tool_call.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
+        persisted_output_metadata: dict = {}
+        if not _is_multimodal_tool_result(function_result):
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+                metadata_out=persisted_output_metadata,
+            )
 
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
@@ -2281,6 +2293,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        if persisted_output_metadata:
+            tool_message[PERSISTED_OUTPUT_METADATA_KEY] = persisted_output_metadata
+            if subdir_hints:
+                tool_message[POST_PERSIST_SUFFIXES_KEY] = [subdir_hints]
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(

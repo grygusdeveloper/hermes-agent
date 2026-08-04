@@ -9,6 +9,8 @@ sends only new non-assistant messages after the first request.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -130,6 +132,29 @@ def _state_dir() -> Path:
 def _state_path(state_key: str) -> Path:
     digest = hashlib.sha256(state_key.encode("utf-8")).hexdigest()
     return _state_dir() / f"{digest}.json"
+
+
+@contextmanager
+def _durable_transition_lock(state_key: str | None):
+    """Serialize one conversation's load → dispatch → publication transition."""
+
+    if not state_key:
+        yield
+        return
+    directory = _state_dir()
+    digest = hashlib.sha256(state_key.encode("utf-8")).hexdigest()
+    lock_path = directory / f"{digest}.lock"
+    with _STATE_LOCK:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.chmod(lock_path, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _load_durable_state(
@@ -312,7 +337,7 @@ class AntigravityConversation:
         """Return ``(response, reasoning)`` using incremental AGY context."""
 
         current = _message_fingerprint(messages)
-        with self._lock:
+        with self._lock, _durable_transition_lock(state_key):
             if state_key != self._state_key:
                 self._conversation_id = None
                 self._previous_messages = ()

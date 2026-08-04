@@ -12,6 +12,7 @@ import pytest
 from agent.antigravity_session import (
     AntigravityConversation,
     AntigravityConversationExpired,
+    _durable_transition_lock,
     _incremental_prompt,
     _message_fingerprint,
     _validate_prompt_size,
@@ -131,6 +132,37 @@ def test_durable_state_uses_context_scoped_hermes_home(monkeypatch, tmp_path):
     state_dir = profile_home / "state" / "antigravity-conversations"
     assert len(list(state_dir.glob("*.json"))) == 1
     assert not (process_home / "state" / "antigravity-conversations").exists()
+
+
+def test_durable_transition_lock_serializes_distinct_owners(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+    second_acquired = threading.Event()
+
+    def first_owner():
+        with _durable_transition_lock("same-conversation"):
+            entered.set()
+            assert release.wait(timeout=3)
+
+    def second_owner():
+        assert entered.wait(timeout=3)
+        with _durable_transition_lock("same-conversation"):
+            second_acquired.set()
+
+    first = threading.Thread(target=first_owner)
+    second = threading.Thread(target=second_owner)
+    first.start()
+    assert entered.wait(timeout=3)
+    second.start()
+    time.sleep(0.1)
+    assert not second_acquired.is_set()
+    release.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert second_acquired.is_set()
 
 
 def test_message_fingerprint_includes_tool_structure_without_storing_text():
