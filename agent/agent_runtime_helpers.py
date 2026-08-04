@@ -3981,6 +3981,13 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
     marker = format_steer_marker(steer_text)
+    # Authenticate the suffix out-of-band from its text. Tool output can contain
+    # a lookalike marker, so aggregate persistence must not infer trust by
+    # parsing content. The private field is ignored by provider serializers but
+    # lets tool_result_storage preserve genuine steering during compaction.
+    from tools.tool_result_storage import OOB_USER_MESSAGE_KEY
+
+    messages[target_idx][OOB_USER_MESSAGE_KEY] = marker
     existing_content = messages[target_idx].get("content", "")
     if not isinstance(existing_content, str):
         # Anthropic multimodal content blocks — preserve them and append

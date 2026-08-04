@@ -13,6 +13,7 @@ import pytest
 
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
 from run_agent import AIAgent
+from tools.tool_result_storage import OOB_USER_MESSAGE_KEY
 
 
 def _bare_agent() -> AIAgent:
@@ -378,6 +379,9 @@ class TestSteerInjection:
         assert "ls output B" in messages[3]["content"]
         assert STEER_MARKER_OPEN in messages[3]["content"]
         assert "please also check auth.log" in messages[3]["content"]
+        assert messages[3][OOB_USER_MESSAGE_KEY] == format_steer_marker(
+            "please also check auth.log"
+        )
         # And pending_steer is consumed.
         assert agent._pending_steer is None
 

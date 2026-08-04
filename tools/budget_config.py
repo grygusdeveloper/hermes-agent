@@ -18,6 +18,16 @@ DEFAULT_RESULT_SIZE_CHARS: int = 100_000
 DEFAULT_TURN_BUDGET_CHARS: int = 200_000
 DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
 
+# AGY currently accepts prompts only as one argv value. Linux MAX_ARG_STRLEN is
+# normally 128 KiB, so cap tool-result text by CHARACTER count at a value that
+# remains below the 120,000-byte adapter ceiling even when every character is a
+# four-byte Unicode code point. Full results are persisted by the existing
+# tool-result storage layer and remain available through read_file.
+ANTIGRAVITY_RESULT_SIZE_CHARS: int = 24_000
+ANTIGRAVITY_TURN_BUDGET_CHARS: int = 24_000
+ANTIGRAVITY_PREVIEW_SIZE_CHARS: int = 512
+_ANTIGRAVITY_BASE_URL = "acp://antigravity"
+
 
 @dataclass(frozen=True)
 class BudgetConfig:
@@ -111,4 +121,46 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
         default_result_size=per_result,
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
+    )
+
+
+def budget_for_transport(
+    config: BudgetConfig,
+    *,
+    provider: str | None,
+    base_url: str | None,
+) -> BudgetConfig:
+    """Clamp a context-derived budget to a stricter provider transport.
+
+    Context capacity and ingress capacity are independent. Antigravity exposes
+    a million-token conversation but AGY 1.1.10 still carries each request in
+    one exec argument. Keep other providers byte-for-byte unchanged.
+    """
+
+    normalized_base = str(base_url or "").strip().rstrip("/").lower()
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_base != _ANTIGRAVITY_BASE_URL or normalized_provider not in {
+        "",
+        "copilot-acp",
+    }:
+        return config
+
+    overrides = {
+        name: min(int(value), ANTIGRAVITY_RESULT_SIZE_CHARS)
+        for name, value in config.tool_overrides.items()
+    }
+    return BudgetConfig(
+        default_result_size=min(
+            config.default_result_size,
+            ANTIGRAVITY_RESULT_SIZE_CHARS,
+        ),
+        turn_budget=min(
+            config.turn_budget,
+            ANTIGRAVITY_TURN_BUDGET_CHARS,
+        ),
+        preview_size=min(
+            config.preview_size,
+            ANTIGRAVITY_PREVIEW_SIZE_CHARS,
+        ),
+        tool_overrides=overrides,
     )

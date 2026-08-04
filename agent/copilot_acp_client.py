@@ -28,6 +28,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.antigravity_session import AntigravityConversation
 from agent.file_safety import get_read_block_error, get_write_denied_error
+from agent.portal_tags import get_conversation_context
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
@@ -483,6 +484,10 @@ class CopilotACPClient:
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
         if self._is_antigravity():
+            # Only the main tool-enabled agent owns durable AGY continuity.
+            # Auxiliary title/compression calls have no tool schema and must not
+            # overwrite the main session's conversation mapping.
+            state_key = get_conversation_context() if tools else None
             response_text, reasoning_text = self._antigravity_conversation.run(
                 prompt_text,
                 messages=messages or [],
@@ -491,6 +496,7 @@ class CopilotACPClient:
                 timeout_seconds=_effective_timeout,
                 cwd=self._acp_cwd,
                 env=_build_subprocess_env(),
+                state_key=state_key,
             )
         else:
             response_text, reasoning_text = self._run_prompt(

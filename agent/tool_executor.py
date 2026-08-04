@@ -48,7 +48,12 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
-from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.budget_config import (
+    BudgetConfig,
+    DEFAULT_BUDGET,
+    budget_for_context_window,
+    budget_for_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +91,19 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        config = budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        client = getattr(agent, "client", None)
+        return budget_for_transport(
+            config,
+            provider=(
+                getattr(agent, "provider", None)
+                or getattr(client, "provider", None)
+            ),
+            base_url=(
+                getattr(agent, "base_url", None)
+                or getattr(client, "base_url", None)
+            ),
+        )
     except Exception:
         return DEFAULT_BUDGET
 

@@ -9,6 +9,7 @@ sends only new non-assistant messages after the first request.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,9 @@ _CONVERSATION_ID_RE = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
+_MESSAGE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_STATE_VERSION = 1
+_STATE_LOCK = threading.Lock()
 
 
 def _render_content(content: Any) -> str:
@@ -45,17 +49,165 @@ def _render_content(content: Any) -> str:
     return str(content or "")
 
 
-def _message_fingerprint(messages: list[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
-    """Return a deterministic, non-secret in-memory prefix identity."""
+def _normalize_for_digest(value: Any) -> Any:
+    """Convert structured message fields to stable JSON-safe values."""
 
-    return tuple(
-        (
-            str(message.get("role") or "").lower(),
-            _render_content(message.get("content")),
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_for_digest(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if not str(key).startswith("_")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_digest(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _normalize_for_digest(model_dump())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _message_fingerprint(messages: list[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
+    """Return exact structural prefix identity without retaining prompt text."""
+
+    fingerprints: list[tuple[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").lower()
+        durable_content = _render_content(message.get("content"))
+        trusted_oob = message.get("_hermes_oob_user_message")
+        if (
+            isinstance(trusted_oob, str)
+            and trusted_oob
+            and durable_content.endswith(trusted_oob)
+        ):
+            # Tool rows are crash-flushed before /steer is appended. AGY has
+            # consumed the authenticated steer server-side, but a DB rebuild
+            # replays the original durable tool row. Hash that durable prefix
+            # so restart continuity is not broken by an intentionally
+            # non-rewritten append-only row.
+            durable_content = durable_content[: -len(trusted_oob)]
+        identity = {
+            "role": role,
+            "content": durable_content,
+            "name": message.get("name"),
+            "tool_call_id": message.get("tool_call_id"),
+            "tool_calls": _normalize_for_digest(message.get("tool_calls")),
+        }
+        canonical = json.dumps(
+            identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
         )
-        for message in messages
-        if isinstance(message, dict)
-    )
+        fingerprints.append(
+            (role, hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+        )
+    return tuple(fingerprints)
+
+
+def _state_dir() -> Path:
+    # Execution profiles are scoped through a contextvar rather than by
+    # mutating process-global HERMES_HOME. Resolve through the canonical
+    # helper so spawned Gemini sessions cannot spill continuity state into
+    # Main's profile directory.
+    try:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = Path(get_hermes_home())
+    except Exception:
+        hermes_home = Path(
+            os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+        )
+    return hermes_home / "state" / "antigravity-conversations"
+
+
+def _state_path(state_key: str) -> Path:
+    digest = hashlib.sha256(state_key.encode("utf-8")).hexdigest()
+    return _state_dir() / f"{digest}.json"
+
+
+def _load_durable_state(
+    state_key: str,
+) -> tuple[str, tuple[tuple[str, str], ...]] | None:
+    path = _state_path(state_key)
+    try:
+        with _STATE_LOCK:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != _STATE_VERSION:
+        return None
+    expected_key_hash = hashlib.sha256(state_key.encode("utf-8")).hexdigest()
+    if payload.get("state_key_hash") != expected_key_hash:
+        return None
+    conversation_id = payload.get("conversation_id")
+    raw_fingerprints = payload.get("message_fingerprints")
+    if not isinstance(conversation_id, str) or not _CONVERSATION_ID_RE.fullmatch(
+        conversation_id
+    ):
+        return None
+    if not isinstance(raw_fingerprints, list):
+        return None
+    fingerprints: list[tuple[str, str]] = []
+    for item in raw_fingerprints:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        role, digest = item
+        if not isinstance(role, str) or not isinstance(digest, str):
+            return None
+        if not _MESSAGE_DIGEST_RE.fullmatch(digest):
+            return None
+        fingerprints.append((role, digest))
+    return conversation_id, tuple(fingerprints)
+
+
+def _save_durable_state(
+    state_key: str,
+    conversation_id: str,
+    fingerprints: tuple[tuple[str, str], ...],
+) -> None:
+    directory = _state_dir()
+    path = _state_path(state_key)
+    payload = {
+        "version": _STATE_VERSION,
+        "state_key_hash": hashlib.sha256(state_key.encode("utf-8")).hexdigest(),
+        "conversation_id": conversation_id,
+        "message_fingerprints": [list(item) for item in fingerprints],
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    with _STATE_LOCK:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        temp = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+            os.chmod(path, 0o600)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _delete_durable_state(state_key: str) -> None:
+    with _STATE_LOCK:
+        try:
+            _state_path(state_key).unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _validate_prompt_size(text: str, limit: int = INLINE_PROMPT_LIMIT_BYTES) -> str:
@@ -115,6 +267,7 @@ class AntigravityConversation:
     def __init__(self) -> None:
         self._conversation_id: str | None = None
         self._previous_messages: tuple[tuple[str, str], ...] = ()
+        self._state_key: str | None = None
         self._lock = threading.RLock()
         self._process_lock = threading.Lock()
         self._active_process: subprocess.Popen[str] | None = None
@@ -123,8 +276,11 @@ class AntigravityConversation:
 
     def reset(self) -> None:
         with self._lock:
+            if self._state_key:
+                _delete_durable_state(self._state_key)
             self._conversation_id = None
             self._previous_messages = ()
+            self._state_key = None
 
     def abort(self) -> None:
         """Terminate the in-flight AGY process without waiting on state locks."""
@@ -151,11 +307,20 @@ class AntigravityConversation:
         timeout_seconds: float = 270.0,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        state_key: str | None = None,
     ) -> tuple[str, str]:
         """Return ``(response, reasoning)`` using incremental AGY context."""
 
         current = _message_fingerprint(messages)
         with self._lock:
+            if state_key != self._state_key:
+                self._conversation_id = None
+                self._previous_messages = ()
+                self._state_key = state_key
+                if state_key:
+                    durable = _load_durable_state(state_key)
+                    if durable:
+                        self._conversation_id, self._previous_messages = durable
             previous_count = len(self._previous_messages)
             can_resume = bool(
                 self._conversation_id
@@ -180,9 +345,24 @@ class AntigravityConversation:
                         # fresh AGY conversation with the complete full prompt.
                         self._conversation_id = None
                         self._previous_messages = ()
+                        if state_key:
+                            _delete_durable_state(state_key)
                     else:
-                        self._conversation_id = conversation_id or self._conversation_id
+                        resolved_conversation_id = (
+                            conversation_id or self._conversation_id
+                        )
+                        if not resolved_conversation_id:
+                            raise RuntimeError(
+                                "AGY resume did not preserve a conversation_id"
+                            )
+                        self._conversation_id = resolved_conversation_id
                         self._previous_messages = current
+                        if state_key:
+                            _save_durable_state(
+                                state_key,
+                                resolved_conversation_id,
+                                self._previous_messages,
+                            )
                         return response, reasoning
 
             response, reasoning, conversation_id = self._execute(
@@ -200,6 +380,12 @@ class AntigravityConversation:
                 )
             self._conversation_id = conversation_id
             self._previous_messages = current
+            if state_key:
+                _save_durable_state(
+                    state_key,
+                    self._conversation_id,
+                    self._previous_messages,
+                )
             return response, reasoning
 
     def _execute(
