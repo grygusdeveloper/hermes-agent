@@ -8703,7 +8703,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from hermes_cli.config import read_user_config_raw
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = _gateway_config_home() / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
                 return self._fallback_model

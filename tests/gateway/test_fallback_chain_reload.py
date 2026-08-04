@@ -48,6 +48,121 @@ def test_refresh_fallback_model_rereads_config(tmp_path, monkeypatch):
     assert runner._fallback_model == updated
 
 
+def test_refresh_fallback_model_clears_when_config_removed(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "fallback_providers:\n"
+        "  - provider: deepseek\n"
+        "    model: deepseek-v4-flash\n"
+    )
+
+    runner = SimpleNamespace(
+        _fallback_model=[{"provider": "stale", "model": "x"}],
+    )
+    runner._load_fallback_model = GatewayRunner._load_fallback_model
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+    assert bound() is not None
+
+    cfg.write_text("model:\n  provider: nvidia\n")
+    assert bound() is None
+    assert runner._fallback_model is None
+
+
+def test_profile_scope_empty_fallback_chain_overrides_main_chain(tmp_path, monkeypatch):
+    """A spawned execution profile with ``fallback_providers: []`` must not
+    inherit Main's fallback chain on either fresh creation or cached-agent reuse.
+    """
+    from gateway.run import GatewayRunner
+
+    main_home = tmp_path / "main"
+    profile_home = tmp_path / "profiles" / "gemini"
+    main_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    (main_home / "config.yaml").write_text(
+        "fallback_providers:\n"
+        "  - provider: zai\n"
+        "    model: glm-5.2\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "fallback_providers: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gateway.run._hermes_home", main_home)
+    monkeypatch.setattr(
+        "gateway.run.get_hermes_home_override", lambda: profile_home
+    )
+
+    assert GatewayRunner._load_fallback_model() is None
+    runner = SimpleNamespace(
+        _fallback_model=[{"provider": "zai", "model": "glm-5.2"}],
+    )
+    refreshed = GatewayRunner._refresh_fallback_model.__get__(runner)()
+    assert refreshed is None
+    assert runner._fallback_model is None
+
+    cached_agent = SimpleNamespace(
+        _fallback_chain=[{"provider": "zai", "model": "glm-5.2"}],
+        _fallback_model={"provider": "zai", "model": "glm-5.2"},
+        _fallback_index=0,
+        _fallback_activated=False,
+        _rate_limited_until=0,
+        _unavailable_fallback_keys=set(),
+    )
+    GatewayRunner._apply_fallback_chain_to_agent(cached_agent, refreshed)
+    assert cached_agent._fallback_chain == []
+    assert cached_agent._fallback_model is None
+
+
+def test_refresh_fallback_model_keeps_last_known_good_on_read_failure(
+    tmp_path, monkeypatch,
+):
+    """A transient config.yaml read/parse failure (user mid-edit, non-atomic
+    write) must NOT wipe the last known-good chain — only a successful read
+    that genuinely lacks the key clears it."""
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "fallback_providers:\n"
+        "  - provider: deepseek\n"
+        "    model: deepseek-v4-flash\n"
+    )
+
+    runner = SimpleNamespace(_fallback_model=None)
+    runner._load_fallback_model = GatewayRunner._load_fallback_model
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+    good = bound()
+    assert good == [{"provider": "deepseek", "model": "deepseek-v4-flash"}]
+
+    # Simulate a mid-edit torn write: invalid YAML.
+    cfg.write_text("fallback_providers:\n  - provider: [unclosed\n")
+    assert bound() == good
+    assert runner._fallback_model == good
+
+
+def test_apply_fallback_chain_updates_primary_agent():
+    from gateway.run import GatewayRunner
+
+    agent = SimpleNamespace(
+        _fallback_chain=[],
+        _fallback_model=None,
+        _fallback_index=0,
+        _fallback_activated=False,
+        _rate_limited_until=0,
+    )
+    chain = [{"provider": "deepseek", "model": "deepseek-v4-flash"}]
+    GatewayRunner._apply_fallback_chain_to_agent(agent, chain)
+
+    assert agent._fallback_chain == chain
+    assert agent._fallback_model == chain[0]
+    assert agent._fallback_index == 0
+
+
 def test_apply_fallback_chain_skips_while_cooldown_holds_fallback():
     """Do not clobber a live fallback activation during its cooldown window."""
     from gateway.run import GatewayRunner
