@@ -26,11 +26,13 @@ from openai.types.chat.chat_completion_message_tool_call import (
     Function,
 )
 
+from agent.antigravity_session import AntigravityConversation
 from agent.file_safety import get_read_block_error, get_write_denied_error
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
+ANTIGRAVITY_MARKER_BASE_URL = "acp://antigravity"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -419,6 +421,13 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        # A client belongs to one cached Hermes session/agent, so keeping the
+        # AGY conversation here prevents cross-thread collisions even when two
+        # spawned workspaces begin with identical prompts.
+        self._antigravity_conversation = AntigravityConversation()
+
+    def _is_antigravity(self) -> bool:
+        return str(self.base_url or "").rstrip("/") == ANTIGRAVITY_MARKER_BASE_URL
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -470,10 +479,21 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
-            prompt_text,
-            timeout_seconds=_effective_timeout,
-        )
+        if self._is_antigravity():
+            response_text, reasoning_text = self._antigravity_conversation.run(
+                prompt_text,
+                messages=messages or [],
+                model=model or "gemini-3.6-flash-high",
+                effort="high",
+                timeout_seconds=_effective_timeout,
+                cwd=self._acp_cwd,
+                env=_build_subprocess_env(),
+            )
+        else:
+            response_text, reasoning_text = self._run_prompt(
+                prompt_text,
+                timeout_seconds=_effective_timeout,
+            )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
