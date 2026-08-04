@@ -231,9 +231,14 @@ class AntigravityConversation:
                 env=env,
             )
             with self._process_lock:
-                aborted = self._abort_requested
-            if aborted:
-                raise RuntimeError("AGY request aborted")
+                if self._abort_requested:
+                    raise RuntimeError("AGY request aborted")
+                # Success acceptance and request deactivation are one atomic
+                # transition.  An abort before this lock fails this request;
+                # an abort after it observes an idle conversation and is ignored.
+                self._active_process = None
+                self._abort_requested = False
+                self._request_active = False
             return result
         finally:
             with self._process_lock:

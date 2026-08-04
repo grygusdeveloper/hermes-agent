@@ -463,3 +463,69 @@ def test_idle_abort_does_not_poison_next_request(monkeypatch):
 
     assert result[0] == "ok"
     execute_active.assert_called_once()
+
+
+def test_abort_before_atomic_success_transition_cannot_be_lost(monkeypatch):
+    conversation = AntigravityConversation()
+    before_success_lock = threading.Event()
+    allow_success_lock = threading.Event()
+
+    class GateLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.worker_id = None
+            self.worker_acquires = 0
+
+        def __enter__(self):
+            if threading.get_ident() == self.worker_id:
+                self.worker_acquires += 1
+                # _execute's first acquisition marks the request active; its
+                # second is the atomic success/deactivation transition.
+                if self.worker_acquires == 2:
+                    before_success_lock.set()
+                    assert allow_success_lock.wait(timeout=2)
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._lock.release()
+
+    gate = GateLock()
+    conversation._process_lock = gate
+    monkeypatch.setattr(
+        conversation,
+        "_execute_active",
+        Mock(return_value=("ok", "", "12345678-1234-1234-1234-123456789abc")),
+    )
+    outcome: list[object] = []
+
+    def execute():
+        gate.worker_id = threading.get_ident()
+        try:
+            outcome.append(
+                conversation._execute(
+                    "hello",
+                    conversation_id=None,
+                    model="gemini",
+                    effort="high",
+                    timeout_seconds=2,
+                    cwd=None,
+                    env=None,
+                )
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    assert before_success_lock.wait(timeout=2)
+    conversation.abort()
+    allow_success_lock.set()
+    worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], RuntimeError)
+    assert "AGY request aborted" in str(outcome[0])
+    assert conversation._request_active is False
+    assert conversation._abort_requested is False
