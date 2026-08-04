@@ -159,11 +159,13 @@ class TestRunAgentProxyDispatch:
             session_id="test-session-123",
             session_key="test-key",
             run_generation=7,
+            save_prompt="raw hi",
         )
 
         assert result["final_response"] == "Hello from remote!"
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+        assert runner._run_agent_via_proxy.call_args.kwargs["save_prompt"] == "raw hi"
 
 
 class TestRunAgentViaProxy:
@@ -221,6 +223,42 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_discord_proxy_metadata_uses_raw_prompt(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        runner.config.streaming = StreamingConfig(enabled=False)
+        source = _make_source(Platform.DISCORD)
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        runner._adapter_for_source = lambda source: adapter
+
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"Done"}}]}\n\n'
+                "data: [DONE]\n\n"
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="[Discord context]\nRaw proxy prompt",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session-discord",
+                        save_prompt="Raw proxy prompt",
+                    )
+
+        assert result["final_response"] == "Done"
+        metadata = adapter.send_typing.await_args.kwargs["metadata"]
+        assert metadata["save_prompt"] == "Raw proxy prompt"
 
 
     @pytest.mark.asyncio

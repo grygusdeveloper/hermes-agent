@@ -164,8 +164,8 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
-def test_run_agent_discord_turn_preserves_prompt_without_name_error(monkeypatch, tmp_path):
-    """A normal Discord text turn must not reference an out-of-scope event."""
+def test_run_agent_discord_turn_preserves_raw_prompt_without_name_error(monkeypatch, tmp_path):
+    """Discord streaming metadata keeps the raw prompt, not enriched model input."""
     _setup_monkeypatches(monkeypatch, tmp_path)
     runner = _make_runner()
 
@@ -174,16 +174,26 @@ def test_run_agent_discord_turn_preserves_prompt_without_name_error(monkeypatch,
         "_adapter_for_source",
         lambda self, source: None,
     )
+    captured_metadata = {}
+    original_run_sync = gateway_run.TurnRunner.run_sync
+
+    def _capture_run_sync(turn_runner):
+        captured_metadata.update(turn_runner._ctx._stream_thread_metadata or {})
+        return original_run_sync(turn_runner)
+
+    monkeypatch.setattr(gateway_run.TurnRunner, "run_sync", _capture_run_sync)
 
     async def _run():
         return await runner._run_agent(
-            message="Discord prompt",
+            message="[Discord context and internal instructions]\nRaw Discord prompt",
             context_prompt="",
             history=[],
             source=_make_discord_source(),
             session_id="session-2",
             session_key="agent:main:discord:dm:67890",
+            save_prompt="Raw Discord prompt",
         )
 
     result = asyncio.new_event_loop().run_until_complete(_run())
     assert result["final_response"] == "Hello from the agent."
+    assert captured_metadata["save_prompt"] == "Raw Discord prompt"

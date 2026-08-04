@@ -18167,6 +18167,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
+                save_prompt=getattr(event, "text", None),
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
@@ -24749,6 +24750,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        save_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -24861,7 +24863,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # that owns the save controls, so favorites and Notion get a useful
             # title even when delivery happened through streaming edits.
             _thread_metadata = dict(_thread_metadata or {})
-            _thread_metadata["save_prompt"] = message
+            _thread_metadata["save_prompt"] = save_prompt
 
         if _streaming_enabled:
             try:
@@ -25046,6 +25048,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        save_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25096,6 +25099,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=channel_prompt, moa_config=moa_config,
                     persist_user_message=persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
+                    save_prompt=save_prompt,
                 )
 
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
@@ -25107,6 +25111,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                save_prompt=save_prompt,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -25119,6 +25124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                save_prompt=save_prompt,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -25241,6 +25247,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        save_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25265,6 +25272,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                save_prompt=save_prompt,
             )
 
         from run_agent import AIAgent
@@ -25757,7 +25765,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # routing metadata shared by the other callbacks.
             turn_ctx._stream_thread_metadata = {
                 **(_status_thread_metadata or {}),
-                "save_prompt": message,
+                "save_prompt": save_prompt,
             }
 
         # ---- Streaming TTS consumer setup (#60671) ----
@@ -26662,6 +26670,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_save_prompt = pending if isinstance(pending, str) else None
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
@@ -26698,6 +26707,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    next_save_prompt = getattr(pending_event, "text", None)
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -26753,6 +26763,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    save_prompt=next_save_prompt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
