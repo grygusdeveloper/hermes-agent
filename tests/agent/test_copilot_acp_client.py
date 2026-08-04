@@ -23,6 +23,92 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.client = CopilotACPClient(acp_cwd="/tmp")
 
 
+    def test_extracted_tool_calls_match_openai_sdk_shape(self) -> None:
+        tool_response = (
+            "I'll inspect that.\n"
+            "<tool_call>"
+            '{"id":"call_read","type":"function",'
+            '"function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}'
+            "</tool_call>"
+        )
+
+        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "")):
+            response = self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "read README.md"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {"name": "read_file", "parameters": {}},
+                    }
+                ],
+            )
+
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.id, "call_read")
+        self.assertEqual(tool_call.function.name, "read_file")
+        self.assertEqual(
+            json.loads(tool_call.function.arguments),
+            {"path": "README.md"},
+        )
+        self.assertEqual(dict(tool_call)["id"], "call_read")
+        self.assertEqual(dict(tool_call.function)["name"], "read_file")
+        self.assertEqual(choice.message.content, "I'll inspect that.")
+
+    def test_compact_antigravity_tool_call_normalizes_one_extra_escape_layer(self) -> None:
+        tool_response = (
+            "<tool_call>"
+            + json.dumps(
+                {
+                    "name": "first_batch_probe",
+                    "arguments": r'{\"code\": \"PRODUCT_STAGING_OK\"}',
+                }
+            )
+            + "</tool_call>"
+        )
+
+        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "")):
+            response = self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "call probe"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {"name": "first_batch_probe", "parameters": {}},
+                    }
+                ],
+            )
+
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.content, "")
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.id, "acp_call_1")
+        self.assertEqual(tool_call.function.name, "first_batch_probe")
+        self.assertEqual(
+            json.loads(tool_call.function.arguments),
+            {"code": "PRODUCT_STAGING_OK"},
+        )
+
+    def test_stream_true_returns_iterable_text_chunks(self) -> None:
+        with patch.object(self.client, "_run_prompt", return_value=("Hello from ACP", "")):
+            stream = self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+            )
+
+        chunks = list(stream)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0].choices[0].delta.content, "Hello from ACP")
+        self.assertIsNone(chunks[0].choices[0].delta.tool_calls)
+        self.assertEqual(chunks[0].choices[0].finish_reason, "stop")
+        self.assertEqual(chunks[1].choices, [])
+        self.assertEqual(chunks[1].usage.total_tokens, 0)
+
 
     def test_stream_true_preserves_tool_call_deltas(self) -> None:
         tool_response = (

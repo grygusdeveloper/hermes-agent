@@ -313,13 +313,33 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
             return
         fn = obj.get("function")
         if not isinstance(fn, dict):
-            return
+            # Antigravity sometimes emits the equivalent compact XML payload:
+            # {"name": "tool", "arguments": "{...}"}.  Keep this fallback
+            # scoped to an already-delimited <tool_call> block.
+            if isinstance(obj.get("name"), str):
+                fn = {"name": obj.get("name"), "arguments": obj.get("arguments", "{}")}
+            else:
+                return
         fn_name = fn.get("name")
         if not isinstance(fn_name, str) or not fn_name.strip():
             return
         fn_args = fn.get("arguments", "{}")
         if not isinstance(fn_args, str):
             fn_args = json.dumps(fn_args, ensure_ascii=False)
+        else:
+            # Some AGY responses redundantly escape the JSON string once more
+            # (e.g. {\"code\":\"ok\"}). Remove exactly one layer only when
+            # both the wrapper and resulting tool arguments parse as JSON.
+            try:
+                json.loads(fn_args)
+            except json.JSONDecodeError:
+                try:
+                    decoded_args = json.loads(f'"{fn_args}"')
+                    json.loads(decoded_args)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                else:
+                    fn_args = decoded_args
         call_id = obj.get("id")
         if not isinstance(call_id, str) or not call_id.strip():
             call_id = f"acp_call_{len(extracted)+1}"
@@ -486,6 +506,7 @@ class CopilotACPClient:
             response_text, reasoning_text = self._antigravity_conversation.run(
                 prompt_text,
                 messages=messages or [],
+                tools=tools,
                 model=model or "gemini-3.6-flash-high",
                 effort="high",
                 timeout_seconds=_effective_timeout,
