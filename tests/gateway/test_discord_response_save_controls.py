@@ -213,7 +213,11 @@ async def test_finalize_edit_attaches_view(tmp_path):
         guild=SimpleNamespace(id=7),
         channel=SimpleNamespace(id=555),
     )
-    channel = SimpleNamespace(id=555, fetch_message=AsyncMock(return_value=msg))
+    channel = SimpleNamespace(
+        id=555,
+        get_partial_message=lambda message_id: msg,
+        fetch_message=AsyncMock(return_value=msg),
+    )
     adapter._client = SimpleNamespace(
         get_channel=lambda cid: channel, fetch_channel=AsyncMock(return_value=channel)
     )
@@ -240,7 +244,11 @@ async def test_mid_stream_edit_no_view(tmp_path):
         guild=None,
         channel=SimpleNamespace(id=555),
     )
-    channel = SimpleNamespace(id=555, fetch_message=AsyncMock(return_value=msg))
+    channel = SimpleNamespace(
+        id=555,
+        get_partial_message=lambda message_id: msg,
+        fetch_message=AsyncMock(return_value=msg),
+    )
     adapter._client = SimpleNamespace(
         get_channel=lambda cid: channel, fetch_channel=AsyncMock(return_value=channel)
     )
@@ -271,6 +279,7 @@ async def test_overflow_split_view_only_on_first(tmp_path):
 
     channel = SimpleNamespace(
         id=555,
+        get_partial_message=lambda message_id: orig_msg,
         fetch_message=AsyncMock(return_value=orig_msg),
         send=AsyncMock(side_effect=fake_send),
     )
