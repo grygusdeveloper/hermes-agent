@@ -313,6 +313,50 @@ def _spawn_model_choice_specs(
     return choices
 
 
+def _model_command_choice_specs(
+    raw_config: Any,
+    current: str = "",
+) -> list[tuple[str, str]]:
+    """Build Discord `/model` autocomplete choices from direct aliases.
+
+    Direct aliases are safe dropdown values because the gateway's existing
+    model-switch resolver binds each alias to its configured provider, model,
+    and base URL. Free-text input remains available for every other model.
+    """
+    raw_config = raw_config if isinstance(raw_config, dict) else {}
+    aliases = raw_config.get("model_aliases")
+    aliases = aliases if isinstance(aliases, dict) else {}
+    needle = str(current or "").strip().casefold()
+    choices: list[tuple[str, str]] = []
+    for raw_alias, raw_spec in sorted(aliases.items(), key=lambda item: str(item[0])):
+        alias = str(raw_alias).strip()
+        if not alias or len(alias) > 100 or not isinstance(raw_spec, dict):
+            continue
+        model = str(raw_spec.get("model") or "").strip()
+        provider = str(raw_spec.get("provider") or "").strip()
+        if not model:
+            continue
+        route = model
+        if provider and not model.casefold().startswith(f"{provider}/".casefold()):
+            route = f"{provider}/{model}"
+        label = str(raw_spec.get("label") or f"{alias} — {route}").strip()
+        reasoning = resolve_reasoning_config(raw_config, model)
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                label += " · none"
+            elif reasoning.get("effort"):
+                label += f" · {reasoning['effort']}"
+        if needle and all(
+            needle not in candidate.casefold()
+            for candidate in (alias, label, model, provider)
+        ):
+            continue
+        choices.append((_truncate_discord_component_text(label, 100), alias))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
     """Abort the active aiohttp transport after a bounded close times out."""
     socket = getattr(websocket, "socket", None)
@@ -6108,9 +6152,31 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/reset", "Session reset~")
 
         @tree.command(name="model", description="Show or change the model")
-        @discord.app_commands.describe(name="Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current.")
+        @discord.app_commands.describe(name="Choose a configured model alias, or type any model ID. Leave empty for the full picker.")
         async def slash_model(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/model {name}".strip())
+
+        async def slash_model_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            try:
+                from gateway.run import _load_gateway_config
+
+                raw_config = _load_gateway_config() or {}
+                return [
+                    discord.app_commands.Choice(name=label, value=value)
+                    for label, value in _model_command_choice_specs(raw_config, current)
+                ]
+            except Exception:
+                logger.debug("Discord /model autocomplete failed", exc_info=True)
+                return []
+
+        register_model_autocomplete = getattr(slash_model, "autocomplete", None)
+        if callable(register_model_autocomplete):
+            option_decorator = register_model_autocomplete("name")
+            if callable(option_decorator):
+                option_decorator(slash_model_autocomplete)
 
         @tree.command(name="reasoning", description="Show/change reasoning effort, or toggle showing it")
         @discord.app_commands.describe(effort="Pick a level, reset the override, or show/hide reasoning. Leave empty to see current.")

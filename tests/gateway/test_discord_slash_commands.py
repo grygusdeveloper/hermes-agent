@@ -75,7 +75,10 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    _model_command_choice_specs,
+)
 
 
 class FakeTree:
@@ -128,6 +131,62 @@ def adapter():
 # ------------------------------------------------------------------
 # /thread slash command registration
 # ------------------------------------------------------------------
+
+
+def test_model_command_choice_specs_use_direct_aliases_and_reasoning():
+    config = {
+        "agent": {
+            "reasoning_overrides": {
+                "gpt-5.6-luna": "high",
+                "gpt-5.6-terra": "high",
+            }
+        },
+        "model_aliases": {
+            "terra": {
+                "label": "Terra",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-terra",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            },
+            "luna": {
+                "label": "Luna",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-luna",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            },
+        },
+    }
+
+    assert _model_command_choice_specs(config) == [
+        ("Luna · high", "luna"),
+        ("Terra · high", "terra"),
+    ]
+    assert _model_command_choice_specs(config, "terr") == [
+        ("Terra · high", "terra"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_slash_autocomplete_lists_configured_aliases(adapter):
+    adapter._register_slash_commands()
+    command = adapter._client.tree.commands["model"]
+    callback = command.autocomplete_callbacks["name"]
+    config = {
+        "agent": {"reasoning_overrides": {"gpt-5.6-terra": "high"}},
+        "model_aliases": {
+            "terra": {
+                "label": "Terra",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-terra",
+            }
+        },
+    }
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        choices = await callback(SimpleNamespace(), "ter")
+
+    assert [(choice.name, choice.value) for choice in choices] == [
+        ("Terra · high", "terra"),
+    ]
 
 
 @pytest.mark.asyncio
