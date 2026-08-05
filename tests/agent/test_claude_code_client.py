@@ -1293,6 +1293,61 @@ class TestClaudeCodeSoftLimitRetry:
                 max_attempts=3,
             )
 
+    def test_rate_limit_hard_error_converts_to_retryable(self, monkeypatch):
+        from agent.claude_code_session import (
+            ClaudeCodeSoftLimitNotice,
+            ClaudeCodeSession,
+            _is_soft_limit_detail,
+        )
+
+        # The exact detail observed in production logs: exit 1 with
+        # is_error:true, api_error_status 429, rate_limit error type.
+        prod_detail = (
+            'ntext_management":null},\"parent_tool_use_id\":null,'
+            '\"session_id\":\"bdf08d43-436e-4adc-b007-27c262c82345\",'
+            '\"uuid\":\"f1ef0270\",\"error\":\"rate_limit\",'
+            '\"request_id\":\"req_011CdjwSmcCSaTKuEN5h3tYs\"}'
+        )
+        assert _is_soft_limit_detail(prod_detail)
+        assert _is_soft_limit_detail(
+            '{"type":"result","subtype":"success","is_error":true,'
+            '"api_error_status":429,"result":"spend limit"}'
+        )
+        assert not _is_soft_limit_detail("some unrelated error message")
+
+        banner = (
+            "You've hit your monthly spend limit · "
+            "raise it at claude.ai/settings/usage"
+        )
+
+        class FakeProcess:
+            returncode = 1
+
+        session = ClaudeCodeSession()
+        calls = {"n": 0}
+
+        def fake_execute(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ClaudeCodeSoftLimitNotice(prod_detail)
+            return "Full real answer here.", "", "12345678-1234-1234-1234-123456789abc"
+
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
+        response, _, _ = session._execute_with_soft_limit_retry(
+            "prompt",
+            session_id=None,
+            model="claude-opus-5",
+            effort="high",
+            timeout_seconds=30,
+            cwd="/tmp",
+            env={},
+            max_attempts=3,
+            had_tools=True,
+        )
+        assert calls["n"] == 2
+        assert response == "Full real answer here."
+
     def test_incomplete_preamble_retries_when_tools_available(self, monkeypatch):
         from agent.claude_code_session import _is_incomplete_preamble_response
 

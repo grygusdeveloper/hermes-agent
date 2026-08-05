@@ -401,6 +401,28 @@ _SOFT_LIMIT_MARKERS = (
 )
 
 
+def _is_soft_limit_detail(detail: str) -> bool:
+    """Return True when a Claude Code error detail indicates a soft/rate limit.
+
+    Claude Code returns rate-limit / spend-limit conditions as exit 1 with
+    ``is_error:true`` and either an explicit ``rate_limit`` error type or an
+    ``api_error_status`` of 429, often accompanied by the "monthly spend limit"
+    banner.  These are transient and should be retried, not surfaced as a hard
+    failure.
+    """
+
+    if not detail:
+        return False
+    lower = detail.lower()
+    # Direct protocol signals from the stream-json result event.
+    if '"error":"rate_limit"' in lower or '"error": "rate_limit"' in lower:
+        return True
+    if 'api_error_status":429' in lower or 'api_error_status": 429' in lower:
+        return True
+    # Known soft-limit banner text embedded in the result.
+    return any(marker in lower for marker in _SOFT_LIMIT_MARKERS)
+
+
 def _is_expired_session_error(detail: str) -> bool:
     normalized = detail.lower()
     return any(marker in normalized for marker in _EXPIRED_SESSION_MARKERS)
@@ -1163,6 +1185,12 @@ class ClaudeCodeSession:
             detail = "\n".join(detail_parts) if detail_parts else f"exit {process.returncode}"
             if session_id and _is_expired_session_error(detail):
                 raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
+            # Rate-limit / spend-limit notices arrive as exit 1 with
+            # is_error:true and a 429 / rate_limit signal.  These are
+            # transient — convert to a retryable exception so the soft-limit
+            # retry handler can re-attempt instead of killing the turn.
+            if _is_soft_limit_detail(detail):
+                raise ClaudeCodeSoftLimitNotice(detail)
             raise RuntimeError(
                 f"Claude Code failed (exit {process.returncode}): {detail}"
             )
@@ -1262,6 +1290,14 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
                 ):
                     raise ClaudeCodeSessionExpired(
                         f"Claude Code result error: {detail}"
+                    )
+                # Rate-limit / spend-limit arrives as is_error:true — make it
+                # retryable instead of a hard failure.
+                if _is_soft_limit_detail(detail) or _is_soft_limit_detail(
+                    json.dumps(event)
+                ):
+                    raise ClaudeCodeSoftLimitNotice(
+                        f"Claude Code rate-limit result: {detail}"
                     )
                 raise RuntimeError(
                     f"Claude Code result rejected (is_error={is_error!r}, "
