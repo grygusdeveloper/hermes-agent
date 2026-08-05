@@ -247,3 +247,66 @@ def test_command_line_never_contains_prompt_body(tmp_path, monkeypatch):
     assert secret in captured["stdin"]
     assert "--tools" in captured["command"]
     assert captured["command"][captured["command"].index("--tools") + 1] == ""
+
+def test_tools_flag_disables_all_native_tools_live():
+    """Prove --tools "" yields empty tools[] on Claude Code 2.1.x system/init."""
+    import json
+    import subprocess
+
+    msg = json.dumps(
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "Reply exactly: NATIVE_TOOLS_OFF"},
+        }
+    ) + "\n"
+    cmd = [
+        CLAUDE,
+        "-p",
+        "--model",
+        "sonnet",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "",
+        "--effort",
+        "low",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = proc.communicate(input=msg, timeout=120)
+    assert proc.returncode == 0, stderr[-300:]
+    tools = None
+    result = None
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        ev = json.loads(line)
+        if ev.get("type") == "system":
+            tools = ev.get("tools")
+        if ev.get("type") == "result":
+            result = ev.get("result")
+    assert tools == [], f"expected empty tools, got {tools!r}"
+    assert "NATIVE_TOOLS_OFF" in (result or "")
+
+
+def test_subprocess_env_strips_provider_api_keys(monkeypatch):
+    from agent.claude_code_client import _build_subprocess_env as client_env
+    from agent.claude_code_session import _build_subprocess_env as session_env
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-leak-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-leak-test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-leak-test")
+    cenv = client_env()
+    senv = session_env(None)
+    for env in (cenv, senv):
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "OPENROUTER_API_KEY" not in env

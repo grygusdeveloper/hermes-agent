@@ -299,18 +299,31 @@ def _resolve_effort() -> str | None:
 def _build_subprocess_env() -> dict[str, str]:
     """Build the child-process environment.
 
-    Authentication is delegated to the already-authenticated Claude Code CLI.
-    Route through the central helper so Tier-1 secrets are stripped while LLM
-    provider credentials the CLI may need are preserved.
+    Authentication is delegated to the already-authenticated Claude Code CLI
+    (OAuth/keychain under the CLI's own home).  Do **not** inherit Hermes
+    provider API keys — that would leak credentials into the child and can
+    make Claude Code prefer ANTHROPIC_API_key billing over the user's
+    subscription OAuth.
     """
 
     from tools.environments.local import hermes_subprocess_env
 
-    env = hermes_subprocess_env(inherit_credentials=True)
+    env = hermes_subprocess_env(inherit_credentials=False)
     home = os.environ.get("HOME", "").strip()
     if home:
         env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
 
     apply_subprocess_home_env(env)
+    # Defense in depth: never pass Anthropic/OpenAI provider secrets even if
+    # a future scrubber change re-admits them.
+    for key in list(env):
+        upper = key.upper()
+        if upper.startswith("ANTHROPIC_") or upper in {
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_API_KEY",
+        }:
+            env.pop(key, None)
     return env

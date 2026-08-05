@@ -379,20 +379,29 @@ def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, s
     """Build a child-process environment.
 
     Authentication is delegated to the already-authenticated Claude Code CLI
-    (it reads its own OAuth/keychain state).  We never inject credentials here.
-    Default path uses the Hermes scrubber so Tier-1 secrets (gateway tokens,
-    etc.) are stripped when callers omit an explicit env.  There is no
-    fail-open raw ``os.environ`` path — if the scrubber is unavailable, raise.
+    (it reads its own OAuth/keychain state).  We never inject provider API
+    keys.  Default path uses the Hermes scrubber with credentials stripped.
+    There is no fail-open raw ``os.environ`` path — if the scrubber is
+    unavailable, raise.
     """
 
     if base_env is None:
         from tools.environments.local import hermes_subprocess_env
 
-        env = hermes_subprocess_env(inherit_credentials=True)
+        env = hermes_subprocess_env(inherit_credentials=False)
     else:
         env = dict(base_env)
     env.setdefault("HOME", str(Path.home()))
     env.setdefault("LANG", "C.UTF-8")
+    for key in list(env):
+        upper = key.upper()
+        if upper.startswith("ANTHROPIC_") or upper in {
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_API_KEY",
+        }:
+            env.pop(key, None)
     return env
 
 
@@ -473,7 +482,11 @@ class ClaudeCodeSession:
             self._bound_tools_digest = ""
 
     def abort(self) -> None:
-        """Terminate the in-flight Claude Code process group without waiting."""
+        """Terminate the in-flight Claude Code process group without waiting.
+
+        Sends SIGTERM immediately, then escalates to SIGKILL after a short
+        grace so cancellation is not weaker than the timeout path.
+        """
 
         with self._process_lock:
             if not self._request_active:
@@ -486,6 +499,28 @@ class ClaudeCodeSession:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             return
+        # Escalate: do not leave children that ignore SIGTERM until communicate
+        # times out.  Best-effort non-blocking grace then SIGKILL.
+        def _escalate() -> None:
+            try:
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_escalate, name="claude-code-abort-escalate", daemon=True).start()
 
     def run(
         self,
