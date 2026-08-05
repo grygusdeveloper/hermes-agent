@@ -302,11 +302,16 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "copilot-acp",
     ],
     "claude-code": [
-        "sonnet",
+        # Latest generation (Claude Code 2.1.183 accepts these exact IDs).
+        "claude-opus-5",
+        "claude-sonnet-5",
+        # Short CLI aliases (currently resolve to latest 4.x family).
         "opus",
+        "sonnet",
         "haiku",
-        "claude-sonnet-4-6",
+        # Explicit 4.x IDs still accepted by the CLI.
         "claude-opus-4-8",
+        "claude-sonnet-4-6",
         "claude-haiku-4-5-20251001",
     ],
     "copilot": [
