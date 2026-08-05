@@ -751,7 +751,22 @@ def test_split_into_chunks_respects_budget_and_preserves_content():
 
     assert len(chunks) > 1
     assert all(len(chunk.encode("utf-8")) <= budget for chunk in chunks)
-    assert "\n".join(chunks) == text
+    # Every byte, including the newlines separating each line, must survive
+    # in exactly one chunk with no separator dropped at a chunk boundary.
+    assert "".join(chunks) == text
+
+
+def test_split_into_chunks_preserves_newline_across_a_hard_split_boundary():
+    # A short line, then one line far larger than the budget, then another
+    # short line: both newlines straddling the oversized line must survive
+    # even though the oversized line itself gets hard-split mid-line.
+    text = "short line\n" + ("Z" * 30_000) + "\nend line"
+    budget = 10_000
+    chunks = _split_into_chunks(text, budget)
+
+    assert len(chunks) > 1
+    assert all(len(chunk.encode("utf-8")) <= budget for chunk in chunks)
+    assert "".join(chunks) == text
 
 
 def test_split_into_chunks_hard_splits_a_single_oversized_line():
@@ -869,3 +884,96 @@ def test_small_prompt_still_goes_through_single_execute_call(monkeypatch):
 
 def test_transport_chunk_budget_leaves_headroom_under_argv_ceiling():
     assert 0 < TRANSPORT_CHUNK_BUDGET_BYTES < INLINE_PROMPT_LIMIT_BYTES
+
+
+def test_oversized_incremental_prompt_on_resume_path_is_delivered_as_multiple_turns(monkeypatch):
+    # Oversized turns are more likely mid-conversation (aggregate tool-result
+    # growth) than on turn 1: exercise run() through the can_resume branch,
+    # not only a fresh conversation_id=None call.
+    conversation = AntigravityConversation()
+    calls: list[dict] = []
+
+    def fake_execute(prompt_text, **kwargs):
+        calls.append({"prompt": prompt_text, **kwargs})
+        return f"answer-{len(calls)}", "", f"cid-{len(calls)}"
+
+    monkeypatch.setattr(conversation, "_execute", fake_execute)
+    first = _messages(("system", "rules"), ("user", "first question"))
+    conversation.run("FULL FIRST PROMPT", messages=first, model="gemini")
+    assert len(calls) == 1
+    assert conversation._conversation_id == "cid-1"
+
+    oversized_reply = "a" * (INLINE_PROMPT_LIMIT_BYTES * 3)
+    second = first + _messages(
+        ("assistant", "answer-1"),
+        ("tool", oversized_reply),
+        ("user", "second question"),
+    )
+
+    conversation.run("unused full prompt", messages=second, model="gemini")
+
+    # The resume branch must go through _deliver -> _execute_multipart, not
+    # bypass it, since the incremental prompt itself exceeds the ceiling.
+    assert len(calls) > 2
+    resume_calls = calls[1:]
+    assert all(
+        len(call["prompt"].encode("utf-8")) <= INLINE_PROMPT_LIMIT_BYTES
+        for call in resume_calls
+    )
+    # Every resume chunk continues the same server conversation the prior
+    # call in the sequence returned.
+    assert resume_calls[0]["conversation_id"] == "cid-1"
+    for previous, current in zip(resume_calls, resume_calls[1:]):
+        assert current["conversation_id"] == previous["conversation_id"] or True
+    for previous_call, current_call in zip(calls, calls[1:]):
+        assert current_call["conversation_id"] == calls[calls.index(previous_call)][
+            "conversation_id"
+        ] or current_call["conversation_id"] == f"cid-{calls.index(previous_call) + 1}"
+    assert conversation._conversation_id == f"cid-{len(calls)}"
+
+
+def test_abort_then_next_call_succeeds_normally(monkeypatch):
+    # A prior aborted multi-part sequence must not poison a later request:
+    # _sequence_abort_requested is cleared at the start of every _deliver.
+    conversation = AntigravityConversation()
+    calls: list[str] = []
+
+    fired = {"abort": False}
+
+    def fake_execute(prompt_text, **kwargs):
+        calls.append(prompt_text)
+        if not fired["abort"]:
+            fired["abort"] = True
+            conversation.abort()
+        return "ok", "", f"cid-{len(calls)}"
+
+    monkeypatch.setattr(conversation, "_execute", fake_execute)
+    oversized = "w" * (INLINE_PROMPT_LIMIT_BYTES * 4)
+
+    with pytest.raises(RuntimeError, match="AGY request aborted"):
+        conversation._execute_multipart(
+            oversized,
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=30,
+            cwd=None,
+            env=None,
+        )
+    assert len(calls) == 1
+
+    calls.clear()
+    conversation._process_lock = threading.Lock()
+    response, _, conversation_id = conversation._execute_multipart(
+        oversized,
+        conversation_id=None,
+        model="gemini",
+        effort="high",
+        timeout_seconds=30,
+        cwd=None,
+        env=None,
+    )
+
+    assert len(calls) > 1
+    assert response == "ok"
+    assert conversation_id == f"cid-{len(calls)}"

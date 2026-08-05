@@ -282,49 +282,36 @@ def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> 
 def _split_into_chunks(text: str, budget_bytes: int) -> list[str]:
     """Split text into UTF-8-safe pieces no larger than budget_bytes.
 
-    Prefers splitting on line boundaries; a single line larger than the
-    budget is hard-split on a UTF-8 character boundary so no content is
-    lost or corrupted.
+    Slices the exact UTF-8 byte payload into consecutive, non-overlapping
+    windows, backing each window off to the nearest valid UTF-8 character
+    boundary. Every byte of the input lands in exactly one chunk, in order,
+    including separator bytes such as newlines: concatenating the returned
+    chunks always reproduces the original text exactly.
     """
 
-    if len(text.encode("utf-8")) <= budget_bytes:
+    payload = text.encode("utf-8")
+    if len(payload) <= budget_bytes:
         return [text]
     chunks: list[str] = []
-    current: list[str] = []
-    current_bytes = 0
-    for line in text.split("\n"):
-        line_bytes = len(line.encode("utf-8")) + 1
-        if current and current_bytes + line_bytes > budget_bytes:
-            chunks.append("\n".join(current))
-            current = []
-            current_bytes = 0
-        if line_bytes > budget_bytes:
-            if current:
-                chunks.append("\n".join(current))
-                current = []
-                current_bytes = 0
-            remaining = line
-            while remaining:
-                piece_bytes = remaining.encode("utf-8")[:budget_bytes]
-                while piece_bytes:
-                    try:
-                        piece = piece_bytes.decode("utf-8")
-                        break
-                    except UnicodeDecodeError:
-                        piece_bytes = piece_bytes[:-1]
-                else:
-                    piece = ""
-                if not piece:
-                    raise RuntimeError(
-                        "AGY chunk transport could not split an oversized line"
-                    )
-                chunks.append(piece)
-                remaining = remaining[len(piece) :]
-            continue
-        current.append(line)
-        current_bytes += line_bytes
-    if current:
-        chunks.append("\n".join(current))
+    start = 0
+    total = len(payload)
+    while start < total:
+        end = min(start + budget_bytes, total)
+        piece_bytes = payload[start:end]
+        while piece_bytes:
+            try:
+                piece = piece_bytes.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                piece_bytes = piece_bytes[:-1]
+        else:
+            piece = ""
+        if not piece:
+            raise RuntimeError(
+                "AGY chunk transport could not split content under the byte budget"
+            )
+        chunks.append(piece)
+        start += len(piece_bytes)
     return chunks or [""]
 
 
@@ -529,6 +516,13 @@ class AntigravityConversation:
         path that reaches the tools-disabled Hermes agent, so this is the
         only transport that neither truncates content nor writes it to disk.
         """
+
+        # Start each multi-part sequence with a clean between-chunk latch so a
+        # prior aborted sequence cannot poison this call.  In-flight aborts are
+        # still caught per-chunk by _execute's own _abort_requested latch; this
+        # flag only gates travel between chunks.
+        with self._process_lock:
+            self._sequence_abort_requested = False
 
         parts = _split_into_chunks(prompt_text, TRANSPORT_CHUNK_BUDGET_BYTES)
         total = len(parts)
