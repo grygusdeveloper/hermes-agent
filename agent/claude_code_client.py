@@ -45,14 +45,134 @@ from agent.portal_tags import get_conversation_context
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
-# Reuse the exact same proven tool-call text extraction as the Copilot ACP
-# bridge.  Claude Code emits the same ``<tool_call>{...}</tool_call>`` blocks
-# when its native tools are disabled and Hermes's tool schemas are injected.
+# Tool-call extraction shared with the Copilot ACP bridge (same <tool_call> shape).
 from agent.copilot_acp_client import (  # noqa: E402
     _completion_to_stream_chunks,
     _extract_tool_calls_from_text,
-    _format_messages_as_prompt,
+    _render_message_content,
 )
+
+
+def _format_messages_as_prompt(
+    messages: list[dict[str, Any]],
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+) -> str:
+    """Canonical Hermes→Claude-Code prompt with full tool-call linkage.
+
+    Unlike the ACP flattener, assistant ``tool_calls`` and tool-result
+    ``name``/``tool_call_id`` are preserved so fresh/expired full replays
+    remain semantically complete.
+    """
+
+    import json
+
+    sections: list[str] = [
+        "You are being used as the active Claude Code backend for Hermes.",
+        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using "
+        "<tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
+        "If no tool is needed, answer normally.",
+    ]
+    if model:
+        sections.append(f"Hermes requested model hint: {model}")
+
+    if isinstance(tools, list) and tools:
+        tool_specs: list[dict[str, Any]] = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function") or {}
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            tool_specs.append(
+                {
+                    "name": name.strip(),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }
+            )
+        if tool_specs:
+            sections.append(
+                "Available tools (OpenAI function schema). "
+                "When using a tool, emit ONLY <tool_call>{...}</tool_call> with one JSON object "
+                "containing id/type/function{name,arguments}. arguments must be a JSON string.\n"
+                + json.dumps(tool_specs, ensure_ascii=False)
+            )
+
+    if tool_choice is not None:
+        sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
+
+    transcript: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "unknown").strip().lower()
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id") or message.get("id") or ""
+            tool_name = message.get("name") or ""
+            rendered = _render_message_content(message.get("content"))
+            meta = []
+            if isinstance(tool_name, str) and tool_name.strip():
+                meta.append(f"name={tool_name.strip()}")
+            if isinstance(tool_call_id, str) and tool_call_id.strip():
+                meta.append(f"tool_call_id={tool_call_id.strip()}")
+            header = "Tool Result"
+            if meta:
+                header = f"Tool Result ({', '.join(meta)})"
+            transcript.append(f"{header}:\n{rendered}")
+            continue
+        if role not in {"system", "user", "assistant"}:
+            role = "context"
+
+        content = message.get("content")
+        rendered = _render_message_content(content)
+        tool_calls = message.get("tool_calls")
+        call_blocks: list[str] = []
+        if tool_calls:
+            for tc in tool_calls if isinstance(tool_calls, list) else []:
+                try:
+                    if hasattr(tc, "model_dump"):
+                        obj = tc.model_dump()
+                    elif isinstance(tc, dict):
+                        obj = tc
+                    else:
+                        obj = {
+                            "id": getattr(tc, "id", None),
+                            "type": getattr(tc, "type", "function"),
+                            "function": {
+                                "name": getattr(getattr(tc, "function", None), "name", None),
+                                "arguments": getattr(
+                                    getattr(tc, "function", None), "arguments", "{}"
+                                ),
+                            },
+                        }
+                    call_blocks.append(
+                        "<tool_call>"
+                        + json.dumps(obj, ensure_ascii=False)
+                        + "</tool_call>"
+                    )
+                except Exception:
+                    continue
+        body_parts = [p for p in (rendered, "\n".join(call_blocks)) if p]
+        if not body_parts:
+            continue
+        label = {
+            "system": "System",
+            "user": "User",
+            "assistant": "Assistant",
+            "context": "Context",
+        }.get(role, role.title())
+        transcript.append(f"{label}:\n" + "\n".join(body_parts))
+
+    if transcript:
+        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+
+    sections.append("Continue the conversation from the latest user request.")
+    return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
 class _ClaudeCodeChatCompletions:
@@ -163,6 +283,17 @@ class ClaudeCodeClient:
         # overwrite the main session's conversation mapping.
         state_key = get_conversation_context() if tools else None
 
+        if stream:
+            return self._stream_chat_completion(
+                prompt_text=prompt_text,
+                messages=messages or [],
+                model=model or "sonnet",
+                effort=effort,
+                tools_digest=tools_digest,
+                timeout_seconds=_effective_timeout,
+                state_key=state_key,
+            )
+
         response_text, reasoning_text = self._claude_session.run(
             prompt_text,
             messages=messages or [],
@@ -198,9 +329,170 @@ class ClaudeCodeClient:
             usage=usage,
             model=model or "claude-code",
         )
-        if stream:
-            return _completion_to_stream_chunks(completion)
         return completion
+
+    def _stream_chat_completion(
+        self,
+        *,
+        prompt_text: str,
+        messages: list[dict[str, Any]],
+        model: str,
+        effort: str | None,
+        tools_digest: str,
+        timeout_seconds: float,
+        state_key: str | None,
+    ):
+        """Yield OpenAI-style stream chunks as Claude Code assistant text arrives."""
+
+        import queue
+
+        q: queue.Queue[Any] = queue.Queue()
+        done = object()
+        error_box: dict[str, BaseException] = {}
+
+        def on_chunk(text: str) -> None:
+            q.put(("text", text))
+
+        def worker() -> None:
+            try:
+                response_text, reasoning_text = self._claude_session.run(
+                    prompt_text,
+                    messages=messages,
+                    model=model,
+                    effort=effort,
+                    tools_digest=tools_digest,
+                    timeout_seconds=timeout_seconds,
+                    cwd=self._claude_cwd,
+                    env=_build_subprocess_env(),
+                    state_key=state_key,
+                    command=self._claude_command,
+                    on_text_chunk=on_chunk,
+                )
+                q.put(("final", response_text, reasoning_text))
+            except BaseException as exc:  # noqa: BLE001 — surface to consumer
+                error_box["exc"] = exc
+            finally:
+                q.put(done)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        emitted_any = False
+        final_text = ""
+        final_reasoning = ""
+        try:
+            while True:
+                item = q.get()
+                if item is done:
+                    break
+                if isinstance(item, tuple) and item and item[0] == "text":
+                    emitted_any = True
+                    chunk_text = item[1]
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                index=0,
+                                delta=SimpleNamespace(
+                                    role="assistant",
+                                    content=chunk_text,
+                                    tool_calls=None,
+                                    reasoning_content=None,
+                                    reasoning=None,
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        model=model,
+                        usage=None,
+                    )
+                elif isinstance(item, tuple) and item and item[0] == "final":
+                    final_text = item[1] or ""
+                    final_reasoning = item[2] or ""
+            if error_box.get("exc"):
+                raise error_box["exc"]
+            if not emitted_any and final_text:
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            delta=SimpleNamespace(
+                                role="assistant",
+                                content=final_text,
+                                tool_calls=None,
+                                reasoning_content=final_reasoning or None,
+                                reasoning=final_reasoning or None,
+                            ),
+                            finish_reason=None,
+                        )
+                    ],
+                    model=model,
+                    usage=None,
+                )
+            # Finish + usage trailer.
+            tool_calls, cleaned = _extract_tool_calls_from_text(final_text or "")
+            finish = "tool_calls" if tool_calls else "stop"
+            if tool_calls:
+                # Emit tool call deltas if any (batch at end — models emit complete blocks).
+                deltas = []
+                for index, tc in enumerate(tool_calls):
+                    deltas.append(
+                        SimpleNamespace(
+                            index=index,
+                            id=getattr(tc, "id", None),
+                            type=getattr(tc, "type", "function"),
+                            function=SimpleNamespace(
+                                name=getattr(tc.function, "name", None),
+                                arguments=getattr(tc.function, "arguments", None),
+                            ),
+                        )
+                    )
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            delta=SimpleNamespace(
+                                role="assistant",
+                                content=cleaned or None,
+                                tool_calls=deltas,
+                                reasoning_content=final_reasoning or None,
+                                reasoning=final_reasoning or None,
+                            ),
+                            finish_reason=finish,
+                        )
+                    ],
+                    model=model,
+                    usage=None,
+                )
+            else:
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            delta=SimpleNamespace(
+                                role=None,
+                                content=None,
+                                tool_calls=None,
+                                reasoning_content=None,
+                                reasoning=None,
+                            ),
+                            finish_reason=finish,
+                        )
+                    ],
+                    model=model,
+                    usage=None,
+                )
+            yield SimpleNamespace(
+                choices=[],
+                model=model,
+                usage=SimpleNamespace(
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+                ),
+            )
+        finally:
+            thread.join(timeout=5)
 
 
 def _resolve_command() -> str:

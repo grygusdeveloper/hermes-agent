@@ -1193,8 +1193,11 @@ def init_agent(
             if agent.provider == "copilot-acp":
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
-            # claude-code: no special kwargs needed; ClaudeCodeClient resolves
-            # its own binary path and uses the fixed stream-json transport.
+            elif agent.provider == "claude-code":
+                # Propagate the runtime-resolved Claude executable so
+                # ClaudeCodeClient/session argv[0] matches auth resolution.
+                if agent.acp_command:
+                    client_kwargs["command"] = agent.acp_command
             effective_base = base_url
             if base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers

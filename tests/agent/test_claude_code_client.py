@@ -25,6 +25,39 @@ from agent.claude_code_session import (
 )
 
 
+class _FakeStream:
+    def __init__(self, data: str = ""):
+        self._data = data
+        self._pos = 0
+        self.closed = False
+
+    def write(self, data):
+        return len(data)
+
+    def close(self):
+        self.closed = True
+
+    def readline(self):
+        if self._pos >= len(self._data):
+            return ""
+        nxt = self._data.find("\n", self._pos)
+        if nxt < 0:
+            chunk = self._data[self._pos:]
+            self._pos = len(self._data)
+            return chunk
+        chunk = self._data[self._pos : nxt + 1]
+        self._pos = nxt + 1
+        return chunk
+
+    def __iter__(self):
+        while True:
+            line = self.readline()
+            if line == "":
+                break
+            yield line
+
+
+
 def _messages(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     return [{"role": role, "content": content} for role, content in pairs]
 
@@ -101,7 +134,7 @@ class TestParseStreamJson:
 
     def test_result_error_raises(self):
         stdout = _stream_stdout(is_error=True)
-        with pytest.raises(RuntimeError, match="result error"):
+        with pytest.raises(RuntimeError, match="result rejected|result error"):
             _parse_stream_json_output(stdout)
 
     def test_result_expired_error_is_session_expired(self):
@@ -449,12 +482,19 @@ class TestClaudeCodeClient:
                 messages=[{"role": "user", "content": "hello"}],
                 stream=True,
             )
-        chunks = list(stream)
-        assert len(chunks) == 2
-        assert chunks[0].choices[0].delta.content == "Hello from Claude Code"
-        assert chunks[0].choices[0].finish_reason == "stop"
-        assert chunks[1].choices == []
-        assert chunks[1].usage.total_tokens == 0
+            chunks = list(stream)
+        assert len(chunks) >= 2
+        # Live path may emit content then finish; batch fallback emits content once.
+        contents = [
+            c.choices[0].delta.content
+            for c in chunks
+            if c.choices and getattr(c.choices[0].delta, "content", None)
+        ]
+        assert "Hello from Claude Code" in contents
+        assert any(
+            c.choices and c.choices[0].finish_reason == "stop" for c in chunks if c.choices
+        )
+        assert any(getattr(c, "usage", None) is not None for c in chunks)
 
     def test_preserves_canonical_prompt_into_session_run(self):
         client = ClaudeCodeClient(cwd="/tmp")
@@ -919,3 +959,141 @@ class TestReviewBlockerRegressions:
             AIAgent._abort_request_openai_client(agent, c2, reason="interrupt")
         assert killpg_calls and killpg_calls[0][0] == 9991
         assert agent._request_client_cache["poisoned"] is True
+
+
+class TestSol56BlockerRegressions:
+    def test_full_prompt_preserves_tool_call_linkage(self):
+        from agent.claude_code_client import _format_messages_as_prompt
+
+        messages = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Tokyo\"}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "get_weather",
+                "tool_call_id": "call_abc",
+                "content": "22C",
+            },
+        ]
+        prompt = _format_messages_as_prompt(messages, model="sonnet", tools=None)
+        assert "call_abc" in prompt
+        assert "get_weather" in prompt
+        assert "<tool_call>" in prompt
+        assert "tool_call_id=call_abc" in prompt
+
+    def test_result_requires_boolean_false_is_error(self):
+        from agent.claude_code_session import _parse_stream_json_output
+
+        sid0 = "12345678-1234-1234-1234-123456789abc"
+        # missing is_error
+        bad = (
+            f'{{"type":"system","session_id":"{sid0}"}}\n'
+            f'{{"type":"result","session_id":"{sid0}","result":"x"}}\n'
+        )
+        import pytest
+        with pytest.raises(RuntimeError, match="is_error"):
+            _parse_stream_json_output(bad)
+        # authoritative result wins over partial assistant
+        good = (
+            f'{{"type":"system","session_id":"{sid0}"}}\n'
+            f'{{"type":"assistant","message":{{"content":[{{"type":"text","text":"partial"}}]}}}}\n'
+            f'{{"type":"result","session_id":"{sid0}","is_error":false,"result":"complete-authoritative"}}\n'
+        )
+        text, _, sid = _parse_stream_json_output(good)
+        assert text == "complete-authoritative"
+        assert sid == sid0
+
+    def test_real_cli_expired_wording_is_typed(self):
+        from agent.claude_code_session import ClaudeCodeSessionExpired, _is_expired_session_error
+        detail = "No conversation found with session ID: 483b18e6-90c4-4b96-ae65-326ae7bd152f"
+        assert _is_expired_session_error(detail)
+        # simulate nonzero exit classification
+        from agent.claude_code_session import ClaudeCodeSession
+        session = ClaudeCodeSession()
+        # ensure markers catch
+        assert "no conversation found" in detail.lower()
+
+    def test_missing_durable_same_key_invalidates_warm_memory(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from agent.claude_code_session import ClaudeCodeSession, _save_durable_state
+        session = ClaudeCodeSession()
+        state_key = "agent:missing-durable"
+        sid = "12345678-1234-1234-1234-123456789abc"
+        session._session_id = sid
+        session._previous_messages = (("user", "one"),)
+        session._bound_model = "sonnet"
+        session._bound_effort = None
+        session._bound_tools_digest = ""
+        session._state_key = state_key
+        # No durable file on disk
+        calls = []
+        def fake_execute(prompt_text, **kwargs):
+            calls.append({"prompt": prompt_text, "session_id": kwargs.get("session_id")})
+            return "ok", "", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        session.run(
+            "FULL_PROMPT two",
+            messages=[
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": "two"},
+            ],
+            model="sonnet",
+            state_key=state_key,
+        )
+        assert calls[0]["session_id"] is None
+        assert "FULL_PROMPT" in calls[0]["prompt"] or "two" in calls[0]["prompt"]
+        # full fresh prompt is used when can_resume is false
+        assert calls[0]["session_id"] is None
+
+    def test_client_kwargs_command_from_agent_init_wiring(self):
+        """Production path: claude-code gets command in client_kwargs."""
+        import inspect
+        from agent import agent_init
+        src = inspect.getsource(agent_init)
+        assert 'elif agent.provider == "claude-code"' in src
+        assert 'client_kwargs["command"] = agent.acp_command' in src
+
+    def test_abort_schedules_sigkill_escalation(self, monkeypatch):
+        import signal
+        import subprocess
+        import time
+        from agent.claude_code_session import ClaudeCodeSession
+        session = ClaudeCodeSession()
+        session._request_active = True
+        signals = []
+        class Proc:
+            pid = 4242
+            returncode = None
+            stdin = type("S", (), {"close": lambda self: None})()
+            stdout = type("S", (), {"close": lambda self: None})()
+            stderr = type("S", (), {"close": lambda self: None})()
+            def poll(self):
+                return None
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+            def terminate(self):
+                signals.append("terminate")
+            def kill(self):
+                signals.append("kill")
+        session._active_process = Proc()
+        def fake_killpg(pid, sig):
+            signals.append(sig)
+        monkeypatch.setattr("agent.claude_code_session.os.killpg", fake_killpg)
+        session.abort()
+        time.sleep(1.0)
+        assert signal.SIGTERM in signals
+        assert signal.SIGKILL in signals

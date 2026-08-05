@@ -76,6 +76,11 @@ _EXPIRED_SESSION_MARKERS = (
     "could not resume",
     "resume failed",
     "session does not exist",
+    # Exact Claude Code CLI 2.1.x wording observed on invalid --resume:
+    #   "No conversation found with session ID: <uuid>"
+    "no conversation found with session id",
+    "no conversation found",
+    "conversation not found",
 )
 
 
@@ -484,8 +489,9 @@ class ClaudeCodeSession:
     def abort(self) -> None:
         """Terminate the in-flight Claude Code process group without waiting.
 
-        Sends SIGTERM immediately, then escalates to SIGKILL after a short
-        grace so cancellation is not weaker than the timeout path.
+        Sends SIGTERM immediately, closes pipes so blocked readers unwind,
+        then escalates to SIGKILL after a short grace so cancellation is not
+        weaker than the timeout path — even when the CLI ignores SIGTERM.
         """
 
         with self._process_lock:
@@ -493,21 +499,35 @@ class ClaudeCodeSession:
                 return
             self._abort_requested = True
             process = self._active_process
-        if process is None or process.poll() is not None:
+        if process is None:
+            return
+        # Unblock readline/communicate waiters.
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, stream_name, None)
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if process.poll() is not None:
             return
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             return
-        # Escalate: do not leave children that ignore SIGTERM until communicate
-        # times out.  Best-effort non-blocking grace then SIGKILL.
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
         def _escalate() -> None:
             try:
-                if process.poll() is None:
-                    try:
-                        process.wait(timeout=2.0)
-                    except Exception:
-                        pass
+                try:
+                    process.wait(timeout=0.5)
+                except Exception:
+                    pass
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -535,6 +555,7 @@ class ClaudeCodeSession:
         env: dict[str, str] | None = None,
         state_key: str | None = None,
         command: str | None = None,
+        on_text_chunk: Any = None,
     ) -> tuple[str, str]:
         """Return ``(response, reasoning)`` using the durable Claude Code session.
 
@@ -563,8 +584,9 @@ class ClaudeCodeSession:
                         self._bound_effort,
                         self._bound_tools_digest,
                     ) = durable
-                elif state_key != self._state_key:
-                    # Key changed and no durable file: clear in-memory continuity.
+                else:
+                    # Missing/corrupt durable state invalidates warm memory for
+                    # this key — never resume a stale in-memory session_id.
                     self._session_id = None
                     self._previous_messages = ()
                     self._bound_model = None
@@ -603,6 +625,7 @@ class ClaudeCodeSession:
                             cwd=cwd,
                             env=env,
                             command=command,
+                            on_text_chunk=on_text_chunk,
                         )
                     except ClaudeCodeSessionExpired:
                         # Expired/invalid server session: retry once as a fresh
@@ -646,6 +669,7 @@ class ClaudeCodeSession:
                 cwd=cwd,
                 env=env,
                 command=command,
+                on_text_chunk=on_text_chunk,
             )
             resolved_session_id = _require_uuid_session_id(
                 session_id, where="fresh"
@@ -677,6 +701,7 @@ class ClaudeCodeSession:
         cwd: str | None,
         env: dict[str, str] | None,
         command: str | None = None,
+        on_text_chunk: Any = None,
     ) -> tuple[str, str, str]:
         """Run one request with an abort latch scoped to this exact call."""
 
@@ -695,6 +720,7 @@ class ClaudeCodeSession:
                 cwd=cwd,
                 env=env,
                 command=command,
+                on_text_chunk=on_text_chunk,
             )
             with self._process_lock:
                 if self._abort_requested:
@@ -720,10 +746,13 @@ class ClaudeCodeSession:
         cwd: str | None,
         env: dict[str, str] | None,
         command: str | None = None,
+        on_text_chunk: Any = None,
     ) -> tuple[str, str, str]:
-        """Launch ``claude`` with stream-json stdin and parse the event stream.
+        """Launch ``claude`` with stream-json stdin and parse the event stream live.
 
         Returns ``(response_text, reasoning_text, session_id)``.
+        When ``on_text_chunk`` is provided it is called with each assistant
+        text fragment as it arrives (live stream path).
         """
 
         claude_bin = (command or "").strip() or _resolve_claude_command()
@@ -747,17 +776,16 @@ class ClaudeCodeSession:
         if session_id:
             argv += [
                 "--resume",
-                _validate_flag_size(_require_uuid_session_id(session_id, where="resume-arg")),
+                _validate_flag_size(
+                    _require_uuid_session_id(session_id, where="resume-arg")
+                ),
             ]
         else:
-            # Stable fresh UUID so the session can be resumed later.
             import uuid
 
             argv += ["--session-id", str(uuid.uuid4())]
 
         process_env = _build_subprocess_env(env)
-
-        # stream-json input: one JSON object per line, then close stdin.
         input_payload = (
             json.dumps(
                 {
@@ -779,6 +807,7 @@ class ClaudeCodeSession:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    bufsize=1,
                     cwd=cwd or str(Path.home()),
                     env=process_env,
                     start_new_session=True,
@@ -790,28 +819,123 @@ class ClaudeCodeSession:
                 ) from exc
             self._active_process = process
 
-        try:
-            stdout, stderr = process.communicate(
-                input=input_payload,
-                timeout=timeout_seconds + 30,
-            )
-        except subprocess.TimeoutExpired:
-            self.abort()
-            _reap_process_group(process, grace_seconds=5.0)
-            raise RuntimeError("Claude Code request timed out")
+        stdin = getattr(process, "stdin", None)
+        stdout_stream = getattr(process, "stdout", None)
+        use_live = callable(getattr(stdin, "write", None)) and callable(
+            getattr(stdout_stream, "readline", None)
+        )
+
+        stdout = ""
+        stderr = ""
+
+        if use_live:
+            stderr_chunks: list[str] = []
+            stdout_lines: list[str] = []
+
+            def _stderr_reader() -> None:
+                err = getattr(process, "stderr", None)
+                if err is None:
+                    return
+                try:
+                    for line in err:
+                        stderr_chunks.append(line)
+                except Exception:
+                    pass
+
+            err_thread = threading.Thread(target=_stderr_reader, daemon=True)
+            err_thread.start()
+            try:
+                stdin.write(input_payload)
+                stdin.close()
+            except Exception as exc:
+                self.abort()
+                _reap_process_group(process, grace_seconds=2.0)
+                raise RuntimeError(f"Claude Code failed writing stdin: {exc}") from exc
+
+            deadline = time.monotonic() + float(timeout_seconds) + 30.0
+            try:
+                while True:
+                    if self._abort_requested:
+                        _reap_process_group(process, grace_seconds=2.0)
+                        raise RuntimeError("Claude Code request aborted")
+                    if time.monotonic() > deadline:
+                        self.abort()
+                        _reap_process_group(process, grace_seconds=5.0)
+                        raise RuntimeError("Claude Code request timed out")
+                    line = stdout_stream.readline()
+                    if line == "":
+                        break
+                    stdout_lines.append(line)
+                    if on_text_chunk is not None and line.strip().startswith("{"):
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            event = None
+                        if isinstance(event, dict) and event.get("type") == "assistant":
+                            message = event.get("message") or {}
+                            if isinstance(message, dict):
+                                for block in message.get("content") or []:
+                                    if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                    ):
+                                        chunk = str(block.get("text") or "")
+                                        if chunk:
+                                            try:
+                                                on_text_chunk(chunk)
+                                            except Exception:
+                                                pass
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    self.abort()
+                    _reap_process_group(process, grace_seconds=2.0)
+            finally:
+                err_thread.join(timeout=2)
+            stdout = "".join(stdout_lines)
+            stderr = "".join(stderr_chunks)
+        else:
+            # Batch path (also used by unit-test doubles exposing communicate()).
+            try:
+                stdout, stderr = process.communicate(
+                    input=input_payload,
+                    timeout=timeout_seconds + 30,
+                )
+            except subprocess.TimeoutExpired:
+                self.abort()
+                _reap_process_group(process, grace_seconds=5.0)
+                raise RuntimeError("Claude Code request timed out")
 
         if self._abort_requested:
             _reap_process_group(process, grace_seconds=2.0)
             raise RuntimeError("Claude Code request aborted")
 
-        if process.returncode != 0:
-            detail = stderr.strip()[-1000:] if stderr else f"exit {process.returncode}"
+        stdout = stdout or ""
+        stderr = stderr or ""
+
+        if process.returncode not in (0, None) and process.returncode != 0:
+            detail_parts = []
+            if stderr.strip():
+                detail_parts.append(stderr.strip()[-1000:])
+            if stdout.strip():
+                detail_parts.append(stdout.strip()[-1000:])
+            detail = "\n".join(detail_parts) if detail_parts else f"exit {process.returncode}"
             if session_id and _is_expired_session_error(detail):
                 raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
-            raise RuntimeError(f"Claude Code failed (exit {process.returncode}): {detail}")
+            raise RuntimeError(
+                f"Claude Code failed (exit {process.returncode}): {detail}"
+            )
 
-        response, reasoning, result_session_id = _parse_stream_json_output(stdout)
+        try:
+            response, reasoning, result_session_id = _parse_stream_json_output(stdout)
+        except ClaudeCodeSessionExpired:
+            raise
+        except RuntimeError as exc:
+            if session_id and _is_expired_session_error(str(exc)):
+                raise ClaudeCodeSessionExpired(str(exc)) from exc
+            raise
         return response, reasoning, result_session_id
+
 
 
 def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
@@ -884,16 +1008,47 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
                     "Claude Code init/result session_id mismatch: "
                     f"{init_session_id} != {result_session_id}"
                 )
-            if event.get("is_error"):
-                detail = str(event.get("result") or "")[:300]
+            # Typed successful envelope only: is_error must be the boolean False.
+            # Reject missing/wrong-type is_error and error subtypes.
+            is_error = event.get("is_error")
+            subtype = str(event.get("subtype") or "").strip().lower()
+            errors = event.get("errors")
+            if is_error is not False:
+                detail = str(event.get("result") or errors or "is_error not false")[:300]
+                if _is_expired_session_error(detail) or (
+                    isinstance(errors, list)
+                    and any(_is_expired_session_error(str(e)) for e in errors)
+                ):
+                    raise ClaudeCodeSessionExpired(
+                        f"Claude Code result error: {detail}"
+                    )
+                raise RuntimeError(
+                    f"Claude Code result rejected (is_error={is_error!r}, "
+                    f"subtype={subtype!r}): {detail}"
+                )
+            if subtype and subtype not in {"success", "result_success", ""}:
+                if subtype in {"error", "failure", "failed"}:
+                    detail = str(event.get("result") or "")[:300]
+                    if _is_expired_session_error(detail):
+                        raise ClaudeCodeSessionExpired(
+                            f"Claude Code result error: {detail}"
+                        )
+                    raise RuntimeError(
+                        f"Claude Code result subtype {subtype!r}: {detail}"
+                    )
+            if isinstance(errors, list) and errors:
+                detail = "; ".join(str(e) for e in errors)[:300]
                 if _is_expired_session_error(detail):
                     raise ClaudeCodeSessionExpired(
                         f"Claude Code result error: {detail}"
                     )
-                raise RuntimeError(f"Claude Code result error: {detail}")
+                raise RuntimeError(f"Claude Code result errors: {detail}")
             final = event.get("result")
-            if isinstance(final, str):
-                result_text = final.strip()
+            if not isinstance(final, str):
+                raise RuntimeError(
+                    "Claude Code successful result missing string result field"
+                )
+            result_text = final
             saw_successful_result = True
             finished = True
             continue
@@ -905,8 +1060,9 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
             "Claude Code stream missing a terminal successful result event"
         )
 
-    # Prefer the accumulated streamed assistant text; fall back to the
-    # ``result`` envelope's flattened text when streaming produced nothing.
-    response = "".join(text_parts) or result_text
+    # Authoritative terminal result text wins over partial assistant chunks.
+    # If both are present and disagree, prefer the terminal result (complete).
+    streamed = "".join(text_parts)
+    response = result_text if result_text.strip() else streamed
     reasoning = "".join(reasoning_parts)
     return response, reasoning, result_session_id

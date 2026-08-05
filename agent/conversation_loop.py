@@ -2651,10 +2651,11 @@ def run_conversation(
                 # returns a plain SimpleNamespace — not an iterable
                 # stream.  Mirror the ACP exclusion used for Responses
                 # API upgrade (lines ~1083-1085).
+                # Claude Code is excluded from this ban: it implements live
+                # stream-json reading and yields OpenAI-style deltas.
                 elif (
-                    agent.provider in {"copilot-acp", "claude-code"}
+                    agent.provider in {"copilot-acp"}
                     or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp://claude-code")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
                 ):
                     _use_streaming = False
