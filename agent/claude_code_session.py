@@ -431,6 +431,78 @@ def _is_soft_limit_notice(text: str) -> bool:
     return len(non_empty) <= 6
 
 
+# Short "I'm about to start" preambles that the CLI sometimes returns as a
+# complete successful result when the turn was cut short mid-process.
+_INCOMPLETE_PREAMBLE_STARTERS = (
+    "i'll ",
+    "i will ",
+    "let me ",
+    "i'm going to ",
+    "i am going to ",
+    "i'm about to ",
+    "checking ",
+    "looking ",
+    "analyzing ",
+    "investigating ",
+    "implementing ",
+    "applying ",
+    "fixing ",
+    "working on ",
+    "processing ",
+    "doing a ",
+    "i'll do ",
+    "i will do ",
+)
+
+
+def _is_incomplete_preamble_response(
+    text: str,
+    *,
+    had_tools: bool,
+    has_tool_calls: bool,
+) -> bool:
+    """Detect short planning-only replies that should not end the turn.
+
+    Observed failure mode: Claude Code returns a successful result whose entire
+    body is first-thoughts / process narration (\"I'll do a fresh pass...\") and
+    Hermes treats that as the final answer. When tools were available and no
+    tool_call was emitted, retry instead of answering with the preamble.
+    """
+
+    if has_tool_calls:
+        return False
+    # Only apply when the agent turn had tools — pure chat can legitimately
+    # be a short acknowledgment.
+    if not had_tools:
+        return False
+    body = (text or "").strip()
+    if not body:
+        return True
+    if len(body) > 350:
+        return False
+    # Multi-paragraph answers are real content.
+    if body.count("\n\n") >= 2:
+        return False
+    lower = body.lower()
+    starts = lower.startswith(_INCOMPLETE_PREAMBLE_STARTERS) or any(
+        lower.startswith(s) for s in _INCOMPLETE_PREAMBLE_STARTERS
+    )
+    if not starts:
+        # Also catch leading markdown bullets / fillers before the starter.
+        stripped = lower.lstrip("#>*- \t")
+        starts = stripped.startswith(_INCOMPLETE_PREAMBLE_STARTERS)
+    if not starts:
+        return False
+    # Short planning sentence(s) without a substantial body.
+    sentences = [s.strip() for s in body.replace("!", ".").replace("?", ".").split(".") if s.strip()]
+    return len(sentences) <= 3 and len(body) <= 350
+
+
+def _response_has_tool_calls(text: str) -> bool:
+    body = text or ""
+    return "<tool_call>" in body or "</tool_call>" in body
+
+
 def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     """Build a child-process environment.
 
@@ -677,6 +749,7 @@ class ClaudeCodeSession:
                             env=env,
                             command=command,
                             on_text_chunk=on_text_chunk,
+                            had_tools=bool(normalized_tools),
                         )
                     except ClaudeCodeSessionExpired:
                         # Expired/invalid server session: retry once as a fresh
@@ -721,6 +794,7 @@ class ClaudeCodeSession:
                 env=env,
                 command=command,
                 on_text_chunk=on_text_chunk,
+                had_tools=bool(normalized_tools),
             )
             resolved_session_id = _require_uuid_session_id(
                 session_id, where="fresh"
@@ -754,15 +828,17 @@ class ClaudeCodeSession:
         command: str | None = None,
         on_text_chunk: Any = None,
         max_attempts: int = 3,
+        had_tools: bool = False,
     ) -> tuple[str, str, str]:
-        """Run one CLI request, retrying soft limit/billing notices.
+        """Run one CLI request, retrying soft notices and incomplete preambles.
 
-        Soft notices are *not* answers. Retry the same payload (same resume
-        session when provided) with short backoff. Only after retries exhaust
-        raise a clear provider error for Hermes to surface.
+        Soft notices and short planning-only preambles are *not* answers.
+        Retry the same payload (same resume session when provided) with short
+        backoff. Only after retries exhaust raise a clear provider error for
+        Hermes to surface.
 
-        Streaming is deferred until a non-notice answer is confirmed so a
-        soft-limit banner can never become the live Discord answer.
+        Streaming is deferred until a validated answer is confirmed so a
+        banner/preamble can never become the live Discord answer.
         """
 
         last_notice = ""
@@ -803,6 +879,24 @@ class ClaudeCodeSession:
                 time.sleep(min(2.0 * attempt, 6.0))
                 continue
 
+            if _is_incomplete_preamble_response(
+                response,
+                had_tools=had_tools,
+                has_tool_calls=_response_has_tool_calls(response),
+            ):
+                last_notice = response.strip()
+                if attempt >= attempts:
+                    # Last attempt: still don't treat pure preamble as a real
+                    # answer when tools were expected — surface a clear error
+                    # so the gateway doesn't deliver first-thoughts as final.
+                    raise RuntimeError(
+                        "Claude Code CLI returned only intermediate planning "
+                        f"text after {attempts} attempts (not treated as an "
+                        f"answer). Detail: {last_notice[:400]}"
+                    )
+                time.sleep(min(1.0 * attempt, 3.0))
+                continue
+
             # Confirmed non-notice answer — emit once for stream consumers.
             if on_text_chunk is not None and response:
                 try:
@@ -812,7 +906,7 @@ class ClaudeCodeSession:
             return response, reasoning, sid
 
         raise RuntimeError(
-            "Claude Code CLI soft usage/limit notice after retries. "
+            "Claude Code CLI soft usage/limit or incomplete preamble after retries. "
             f"Detail: {last_notice[:400]}"
         )
 

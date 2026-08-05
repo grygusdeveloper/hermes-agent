@@ -1292,3 +1292,51 @@ class TestClaudeCodeSoftLimitRetry:
                 env={},
                 max_attempts=3,
             )
+
+    def test_incomplete_preamble_retries_when_tools_available(self, monkeypatch):
+        from agent.claude_code_session import _is_incomplete_preamble_response
+
+        assert _is_incomplete_preamble_response(
+            "I'll do a fresh, critical pass over the live code rather than repeating prior review summaries.",
+            had_tools=True,
+            has_tool_calls=False,
+        )
+        assert not _is_incomplete_preamble_response(
+            "I'll do a fresh pass.",
+            had_tools=False,
+            has_tool_calls=False,
+        )
+        assert not _is_incomplete_preamble_response(
+            "Done. Here is the full analysis of the provider with detailed findings.",
+            had_tools=True,
+            has_tool_calls=False,
+        )
+
+        session = ClaudeCodeSession()
+        calls = {"n": 0}
+        preamble = "I'll do a fresh, critical pass over the live code rather than repeating prior review summaries."
+
+        def fake_execute(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return preamble, "", "12345678-1234-1234-1234-123456789abc"
+            return "Here is the full analysis with conclusions.", "", "12345678-1234-1234-1234-123456789abc"
+
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
+        chunks = []
+        response, _, _ = session._execute_with_soft_limit_retry(
+            "prompt",
+            session_id=None,
+            model="claude-sonnet-5",
+            effort="high",
+            timeout_seconds=30,
+            cwd="/tmp",
+            env={},
+            on_text_chunk=chunks.append,
+            max_attempts=3,
+            had_tools=True,
+        )
+        assert calls["n"] == 2
+        assert response.startswith("Here is the full analysis")
+        assert chunks == [response]
