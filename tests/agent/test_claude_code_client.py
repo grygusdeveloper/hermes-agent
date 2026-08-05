@@ -105,6 +105,23 @@ class TestParseStreamJson:
         with pytest.raises(RuntimeError, match="result error"):
             _parse_stream_json_output(stdout)
 
+    def test_result_expired_error_is_session_expired(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "is_error": True,
+                        "result": "session not found",
+                        "session_id": sid,
+                    }
+                )
+            ]
+        )
+        with pytest.raises(ClaudeCodeSessionExpired, match="session not found"):
+            _parse_stream_json_output(stdout)
+
 
 class TestIncrementalAndFingerprints:
     def test_incremental_prompt_skips_assistant(self):

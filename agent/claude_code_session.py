@@ -721,6 +721,10 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
                 session_id = sid.strip()
             if event.get("is_error"):
                 detail = str(event.get("result") or "")[:300]
+                if _is_expired_session_error(detail):
+                    raise ClaudeCodeSessionExpired(
+                        f"Claude Code result error: {detail}"
+                    )
                 raise RuntimeError(f"Claude Code result error: {detail}")
             final = event.get("result")
             if isinstance(final, str) and final.strip():
