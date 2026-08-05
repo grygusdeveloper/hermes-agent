@@ -1097,3 +1097,132 @@ class TestSol56BlockerRegressions:
         time.sleep(1.0)
         assert signal.SIGTERM in signals
         assert signal.SIGKILL in signals
+
+
+class TestOpusDeepReviewFixes:
+    def test_live_readline_timeout_watchdog(self, monkeypatch):
+        """Blocked readline must still hit timeout via watchdog (not hang)."""
+        import threading
+        import time
+        from agent.claude_code_session import ClaudeCodeSession
+
+        session = ClaudeCodeSession()
+        started = time.monotonic()
+        closed = threading.Event()
+
+        class BlockingStdout:
+            def readline(self):
+                # Block until abort closes the stream (watchdog path).
+                closed.wait(timeout=120)
+                return ""
+
+            def close(self):
+                closed.set()
+
+        class BlockingStderr:
+            def __iter__(self):
+                return iter(())
+            def close(self):
+                return None
+
+        class FakeProc:
+            returncode = None
+            pid = 5150
+
+            def __init__(self):
+                self.stdin = type(
+                    "S",
+                    (),
+                    {
+                        "write": lambda self, d: len(d),
+                        "close": lambda self: None,
+                    },
+                )()
+                self.stdout = BlockingStdout()
+                self.stderr = BlockingStderr()
+
+            def poll(self):
+                return -9 if closed.is_set() else None
+
+            def wait(self, timeout=None):
+                closed.wait(timeout=timeout or 0.1)
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self):
+                closed.set()
+                self.returncode = -9
+
+            def terminate(self):
+                closed.set()
+                self.returncode = -15
+
+        monkeypatch.setattr(
+            "agent.claude_code_session.subprocess.Popen",
+            lambda *a, **k: FakeProc(),
+        )
+        def fake_killpg(pid, sig):
+            closed.set()
+        monkeypatch.setattr("agent.claude_code_session.os.killpg", fake_killpg)
+        with pytest.raises(RuntimeError, match="timed out|aborted"):
+            session._execute(
+                "hi",
+                session_id=None,
+                model="sonnet",
+                effort=None,
+                timeout_seconds=0.5,
+                cwd="/tmp",
+                env={"HOME": "/tmp", "PATH": "/usr/bin", "LANG": "C.UTF-8"},
+                command="/bin/true",
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed < 15.0, f"watchdog did not fire promptly: {elapsed:.1f}s"
+
+    def test_stream_tool_call_content_not_duplicated_or_leaked(self):
+        """Streamed content must equal cleaned non-stream text (no raw tool XML)."""
+        client = ClaudeCodeClient(cwd="/tmp")
+        raw = (
+            'I will check.\n'
+            '<tool_call>{"id":"call_1","type":"function",'
+            '"function":{"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}}'
+            '</tool_call>'
+        )
+        with patch.object(client._claude_session, "run", return_value=(raw, "")):
+            # Non-stream baseline
+            complete = client._create_chat_completion(
+                model="sonnet",
+                messages=[{"role": "user", "content": "weather?"}],
+                tools=[{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+                stream=False,
+            )
+            cleaned = complete.choices[0].message.content or ""
+            assert complete.choices[0].message.tool_calls
+            assert "<tool_call>" not in cleaned
+
+            stream = client._create_chat_completion(
+                model="sonnet",
+                messages=[{"role": "user", "content": "weather?"}],
+                tools=[{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+                stream=True,
+            )
+            parts = []
+            saw_tools = False
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if getattr(delta, "content", None):
+                    parts.append(delta.content)
+                if getattr(delta, "tool_calls", None):
+                    saw_tools = True
+            joined = "".join(parts)
+            assert joined == cleaned
+            assert "<tool_call>" not in joined
+            assert saw_tools
+
+    def test_auxiliary_path_uses_distinct_client_type(self):
+        """Auxiliary construction returns ClaudeCodeClient instances, not shared sessions."""
+        from agent.claude_code_client import ClaudeCodeClient
+        a = ClaudeCodeClient(cwd="/tmp")
+        b = ClaudeCodeClient(cwd="/tmp")
+        assert a._claude_session is not b._claude_session

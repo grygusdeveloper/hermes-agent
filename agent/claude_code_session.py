@@ -831,6 +831,7 @@ class ClaudeCodeSession:
         if use_live:
             stderr_chunks: list[str] = []
             stdout_lines: list[str] = []
+            timed_out = threading.Event()
 
             def _stderr_reader() -> None:
                 err = getattr(process, "stderr", None)
@@ -842,26 +843,42 @@ class ClaudeCodeSession:
                 except Exception:
                     pass
 
+            def _timeout_watchdog() -> None:
+                # Unblock a hung readline() by aborting the process group and
+                # closing pipes — deadline checks alone cannot run while blocked.
+                timed_out.set()
+                try:
+                    self.abort()
+                except Exception:
+                    pass
+
             err_thread = threading.Thread(target=_stderr_reader, daemon=True)
             err_thread.start()
+            # Enforce the caller timeout even when readline() is blocked.
+            # Small grace covers scheduling jitter; do not add the large batch
+            # drain allowance here or hung children evade the contract.
+            watchdog = threading.Timer(
+                max(0.05, float(timeout_seconds) + 5.0), _timeout_watchdog
+            )
+            watchdog.daemon = True
+            watchdog.start()
             try:
                 stdin.write(input_payload)
                 stdin.close()
             except Exception as exc:
+                watchdog.cancel()
                 self.abort()
                 _reap_process_group(process, grace_seconds=2.0)
                 raise RuntimeError(f"Claude Code failed writing stdin: {exc}") from exc
 
-            deadline = time.monotonic() + float(timeout_seconds) + 30.0
             try:
                 while True:
-                    if self._abort_requested:
-                        _reap_process_group(process, grace_seconds=2.0)
-                        raise RuntimeError("Claude Code request aborted")
-                    if time.monotonic() > deadline:
-                        self.abort()
+                    if timed_out.is_set():
                         _reap_process_group(process, grace_seconds=5.0)
                         raise RuntimeError("Claude Code request timed out")
+                    if self._abort_requested and not timed_out.is_set():
+                        _reap_process_group(process, grace_seconds=2.0)
+                        raise RuntimeError("Claude Code request aborted")
                     line = stdout_stream.readline()
                     if line == "":
                         break
@@ -891,7 +908,11 @@ class ClaudeCodeSession:
                     self.abort()
                     _reap_process_group(process, grace_seconds=2.0)
             finally:
+                watchdog.cancel()
                 err_thread.join(timeout=2)
+            if timed_out.is_set():
+                _reap_process_group(process, grace_seconds=5.0)
+                raise RuntimeError("Claude Code request timed out")
             stdout = "".join(stdout_lines)
             stderr = "".join(stderr_chunks)
         else:

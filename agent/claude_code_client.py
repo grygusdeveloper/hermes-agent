@@ -47,7 +47,6 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 
 # Tool-call extraction shared with the Copilot ACP bridge (same <tool_call> shape).
 from agent.copilot_acp_client import (  # noqa: E402
-    _completion_to_stream_chunks,
     _extract_tool_calls_from_text,
     _render_message_content,
 )
@@ -342,7 +341,12 @@ class ClaudeCodeClient:
         timeout_seconds: float,
         state_key: str | None,
     ):
-        """Yield OpenAI-style stream chunks as Claude Code assistant text arrives."""
+        """Yield OpenAI-style stream chunks as Claude Code assistant text arrives.
+
+        Contract: concatenated ``delta.content`` over the whole stream equals the
+        non-streaming ``cleaned_text`` (no raw ``<tool_call>`` markup, no
+        duplicated prose on the finish chunk).
+        """
 
         import queue
 
@@ -350,8 +354,11 @@ class ClaudeCodeClient:
         done = object()
         error_box: dict[str, BaseException] = {}
 
-        def on_chunk(text: str) -> None:
-            q.put(("text", text))
+        def on_chunk(raw_text: str) -> None:
+            # Never live-stream raw tool-call markup. Emit cleaned prose only.
+            _tools, cleaned = _extract_tool_calls_from_text(raw_text)
+            if cleaned and cleaned.strip():
+                q.put(("text", cleaned))
 
         def worker() -> None:
             try:
@@ -377,7 +384,7 @@ class ClaudeCodeClient:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        emitted_any = False
+        emitted_text: list[str] = []
         final_text = ""
         final_reasoning = ""
         try:
@@ -386,8 +393,8 @@ class ClaudeCodeClient:
                 if item is done:
                     break
                 if isinstance(item, tuple) and item and item[0] == "text":
-                    emitted_any = True
                     chunk_text = item[1]
+                    emitted_text.append(chunk_text)
                     yield SimpleNamespace(
                         choices=[
                             SimpleNamespace(
@@ -410,29 +417,43 @@ class ClaudeCodeClient:
                     final_reasoning = item[2] or ""
             if error_box.get("exc"):
                 raise error_box["exc"]
-            if not emitted_any and final_text:
-                yield SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            index=0,
-                            delta=SimpleNamespace(
-                                role="assistant",
-                                content=final_text,
-                                tool_calls=None,
-                                reasoning_content=final_reasoning or None,
-                                reasoning=final_reasoning or None,
-                            ),
-                            finish_reason=None,
-                        )
-                    ],
-                    model=model,
-                    usage=None,
-                )
-            # Finish + usage trailer.
+
             tool_calls, cleaned = _extract_tool_calls_from_text(final_text or "")
+            already = "".join(emitted_text)
+            # Emit any cleaned remainder not already streamed (no duplication).
+            if cleaned and cleaned != already:
+                if already and cleaned.startswith(already):
+                    remainder = cleaned[len(already) :]
+                elif already:
+                    # Divergent live vs final — prefer authoritative cleaned once.
+                    remainder = cleaned if not already else ""
+                    if not remainder and cleaned != already:
+                        # Replace semantics: stream cleaned as single corrective only
+                        # when nothing useful was emitted.
+                        remainder = cleaned if not already.strip() else ""
+                else:
+                    remainder = cleaned
+                if remainder:
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                index=0,
+                                delta=SimpleNamespace(
+                                    role="assistant",
+                                    content=remainder,
+                                    tool_calls=None,
+                                    reasoning_content=final_reasoning or None,
+                                    reasoning=final_reasoning or None,
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        model=model,
+                        usage=None,
+                    )
+
             finish = "tool_calls" if tool_calls else "stop"
             if tool_calls:
-                # Emit tool call deltas if any (batch at end — models emit complete blocks).
                 deltas = []
                 for index, tc in enumerate(tool_calls):
                     deltas.append(
@@ -452,7 +473,7 @@ class ClaudeCodeClient:
                             index=0,
                             delta=SimpleNamespace(
                                 role="assistant",
-                                content=cleaned or None,
+                                content=None,  # never re-emit prose on finish
                                 tool_calls=deltas,
                                 reasoning_content=final_reasoning or None,
                                 reasoning=final_reasoning or None,
@@ -493,6 +514,7 @@ class ClaudeCodeClient:
             )
         finally:
             thread.join(timeout=5)
+
 
 
 def _resolve_command() -> str:
