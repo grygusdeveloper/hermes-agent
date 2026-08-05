@@ -10,11 +10,14 @@ from unittest.mock import Mock
 import pytest
 
 from agent.antigravity_session import (
+    INLINE_PROMPT_LIMIT_BYTES,
+    TRANSPORT_CHUNK_BUDGET_BYTES,
     AntigravityConversation,
     AntigravityConversationExpired,
     _durable_transition_lock,
     _incremental_prompt,
     _message_fingerprint,
+    _split_into_chunks,
     _validate_prompt_size,
 )
 from agent.copilot_acp_client import CopilotACPClient
@@ -735,3 +738,134 @@ def test_abort_before_atomic_success_transition_cannot_be_lost(monkeypatch):
     assert "AGY request aborted" in str(outcome[0])
     assert conversation._request_active is False
     assert conversation._abort_requested is False
+
+
+def test_split_into_chunks_keeps_small_text_whole():
+    assert _split_into_chunks("short", 1_000) == ["short"]
+
+
+def test_split_into_chunks_respects_budget_and_preserves_content():
+    text = "\n".join(f"line {i} " + ("x" * 50) for i in range(2_000))
+    budget = 10_000
+    chunks = _split_into_chunks(text, budget)
+
+    assert len(chunks) > 1
+    assert all(len(chunk.encode("utf-8")) <= budget for chunk in chunks)
+    assert "\n".join(chunks) == text
+
+
+def test_split_into_chunks_hard_splits_a_single_oversized_line():
+    line = "y" * 30_000
+    budget = 10_000
+    chunks = _split_into_chunks(line, budget)
+
+    assert len(chunks) > 1
+    assert all(len(chunk.encode("utf-8")) <= budget for chunk in chunks)
+    assert "".join(chunks) == line
+
+
+def test_split_into_chunks_does_not_corrupt_multibyte_boundaries():
+    line = "🙂" * 20_000
+    budget = 10_000
+    chunks = _split_into_chunks(line, budget)
+
+    assert all(len(chunk.encode("utf-8")) <= budget for chunk in chunks)
+    for chunk in chunks:
+        chunk.encode("utf-8").decode("utf-8")  # must not raise
+    assert "".join(chunks) == line
+
+
+def test_fresh_oversized_prompt_is_delivered_as_multiple_turns(monkeypatch):
+    conversation = AntigravityConversation()
+    calls: list[dict] = []
+
+    def fake_execute(prompt_text, **kwargs):
+        calls.append({"prompt": prompt_text, **kwargs})
+        return f"answer-{len(calls)}", "", f"cid-{len(calls)}"
+
+    monkeypatch.setattr(conversation, "_execute", fake_execute)
+    oversized = "z" * (INLINE_PROMPT_LIMIT_BYTES * 3)
+    messages = _messages(("user", oversized))
+
+    response, _ = conversation.run(oversized, messages=messages, model="gemini")
+
+    assert len(calls) > 1
+    assert response == f"answer-{len(calls)}"
+    # Every chunk fits under the raw argv ceiling even with the wrapper text.
+    assert all(
+        len(call["prompt"].encode("utf-8")) <= INLINE_PROMPT_LIMIT_BYTES
+        for call in calls
+    )
+    # Each call after the first resumes the AGY conversation the previous
+    # call returned; the conversation is never dropped mid-sequence.
+    assert calls[0]["conversation_id"] is None
+    for previous, current in zip(calls, calls[1:]):
+        assert current["conversation_id"] == f"cid-{calls.index(previous) + 1}"
+    # Only the final part instructs the model to actually respond.
+    for call in calls[:-1]:
+        assert "part" in call["prompt"]
+        assert "OK" in call["prompt"]
+    assert "final part" in calls[-1]["prompt"]
+    assert conversation._conversation_id == f"cid-{len(calls)}"
+
+
+def test_multipart_missing_conversation_id_fails_closed(monkeypatch):
+    conversation = AntigravityConversation()
+    execute = Mock(side_effect=[("ok", "", "cid-1"), ("ok", "", "")])
+    monkeypatch.setattr(conversation, "_execute", execute)
+    oversized = "q" * (INLINE_PROMPT_LIMIT_BYTES * 3)
+
+    with pytest.raises(RuntimeError, match="did not return a conversation_id"):
+        conversation._execute_multipart(
+            oversized,
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=30,
+            cwd=None,
+            env=None,
+        )
+
+
+def test_abort_between_chunks_stops_remaining_multipart_turns(monkeypatch):
+    conversation = AntigravityConversation()
+    calls: list[str] = []
+
+    def fake_execute(prompt_text, **kwargs):
+        calls.append(prompt_text)
+        if len(calls) == 1:
+            conversation.abort()
+        return "ok", "", f"cid-{len(calls)}"
+
+    monkeypatch.setattr(conversation, "_execute", fake_execute)
+    oversized = "w" * (INLINE_PROMPT_LIMIT_BYTES * 4)
+
+    with pytest.raises(RuntimeError, match="AGY request aborted"):
+        conversation._execute_multipart(
+            oversized,
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=30,
+            cwd=None,
+            env=None,
+        )
+
+    assert len(calls) == 1
+
+
+def test_small_prompt_still_goes_through_single_execute_call(monkeypatch):
+    conversation = AntigravityConversation()
+    execute = Mock(return_value=("answer", "", "cid-1"))
+    monkeypatch.setattr(conversation, "_execute", execute)
+
+    conversation.run(
+        "small prompt", messages=_messages(("user", "hi")), model="gemini"
+    )
+
+    execute.assert_called_once()
+    assert execute.call_args.args[0] == "small prompt"
+
+
+def test_transport_chunk_budget_leaves_headroom_under_argv_ceiling():
+    assert 0 < TRANSPORT_CHUNK_BUDGET_BYTES < INLINE_PROMPT_LIMIT_BYTES

@@ -24,6 +24,15 @@ from typing import Any
 # Linux limits each execve argument to MAX_ARG_STRLEN (normally 128 KiB).
 # Leave headroom for encoding and platform variation.
 INLINE_PROMPT_LIMIT_BYTES = 120_000
+# AGY's --print has no stdin or file-attachment path that reaches the
+# tools-disabled Hermes agent (its "@path" expansion depends on the model's
+# own native file tool, which the Hermes agent profile deliberately has none
+# of, so Hermes stays the sole tool-call owner). A prompt over the argv
+# ceiling is instead delivered as multiple sequential turns on one AGY
+# conversation. Reserve headroom under the raw ceiling for the small
+# multi-part wrapper text added to each chunk.
+_CHUNK_WRAPPER_RESERVE_BYTES = 4_000
+TRANSPORT_CHUNK_BUDGET_BYTES = INLINE_PROMPT_LIMIT_BYTES - _CHUNK_WRAPPER_RESERVE_BYTES
 _CONVERSATION_ID_RE = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
@@ -265,7 +274,58 @@ def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> 
             "tool": "Tool Result",
         }.get(role, role.title() or "Context")
         parts.append(f"{label}:\n{rendered}")
-    return _validate_prompt_size("\n\n".join(parts))
+    # Oversized output is delivered as multiple sequential turns by the
+    # caller (see _execute_multipart); do not reject it here.
+    return "\n\n".join(parts)
+
+
+def _split_into_chunks(text: str, budget_bytes: int) -> list[str]:
+    """Split text into UTF-8-safe pieces no larger than budget_bytes.
+
+    Prefers splitting on line boundaries; a single line larger than the
+    budget is hard-split on a UTF-8 character boundary so no content is
+    lost or corrupted.
+    """
+
+    if len(text.encode("utf-8")) <= budget_bytes:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for line in text.split("\n"):
+        line_bytes = len(line.encode("utf-8")) + 1
+        if current and current_bytes + line_bytes > budget_bytes:
+            chunks.append("\n".join(current))
+            current = []
+            current_bytes = 0
+        if line_bytes > budget_bytes:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_bytes = 0
+            remaining = line
+            while remaining:
+                piece_bytes = remaining.encode("utf-8")[:budget_bytes]
+                while piece_bytes:
+                    try:
+                        piece = piece_bytes.decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        piece_bytes = piece_bytes[:-1]
+                else:
+                    piece = ""
+                if not piece:
+                    raise RuntimeError(
+                        "AGY chunk transport could not split an oversized line"
+                    )
+                chunks.append(piece)
+                remaining = remaining[len(piece) :]
+            continue
+        current.append(line)
+        current_bytes += line_bytes
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
 
 
 class AntigravityConversationExpired(RuntimeError):
@@ -298,6 +358,9 @@ class AntigravityConversation:
         self._active_process: subprocess.Popen[str] | None = None
         self._abort_requested = False
         self._request_active = False
+        # Set for the lifetime of a whole run() call so abort() can stop a
+        # multi-part sequence between chunks, not only mid-subprocess.
+        self._sequence_abort_requested = False
 
     def reset(self) -> None:
         with self._lock:
@@ -311,6 +374,7 @@ class AntigravityConversation:
         """Terminate the in-flight AGY process without waiting on state locks."""
 
         with self._process_lock:
+            self._sequence_abort_requested = True
             if not self._request_active:
                 return
             self._abort_requested = True
@@ -356,7 +420,7 @@ class AntigravityConversation:
                 incremental = _incremental_prompt(messages, previous_count)
                 if incremental:
                     try:
-                        response, reasoning, conversation_id = self._execute(
+                        response, reasoning, conversation_id = self._deliver(
                             incremental,
                             conversation_id=self._conversation_id,
                             model=model,
@@ -390,8 +454,8 @@ class AntigravityConversation:
                             )
                         return response, reasoning
 
-            response, reasoning, conversation_id = self._execute(
-                _validate_prompt_size(prompt_text),
+            response, reasoning, conversation_id = self._deliver(
+                prompt_text,
                 conversation_id=None,
                 model=model,
                 effort=effort,
@@ -412,6 +476,102 @@ class AntigravityConversation:
                     self._previous_messages,
                 )
             return response, reasoning
+
+    def _deliver(
+        self,
+        prompt_text: str,
+        *,
+        conversation_id: str | None,
+        model: str,
+        effort: str,
+        timeout_seconds: float,
+        cwd: str | None,
+        env: dict[str, str] | None,
+    ) -> tuple[str, str, str]:
+        """Send prompt_text, splitting into sequential turns above the argv ceiling."""
+
+        with self._process_lock:
+            self._sequence_abort_requested = False
+        if len(prompt_text.encode("utf-8")) <= INLINE_PROMPT_LIMIT_BYTES:
+            return self._execute(
+                prompt_text,
+                conversation_id=conversation_id,
+                model=model,
+                effort=effort,
+                timeout_seconds=timeout_seconds,
+                cwd=cwd,
+                env=env,
+            )
+        return self._execute_multipart(
+            prompt_text,
+            conversation_id=conversation_id,
+            model=model,
+            effort=effort,
+            timeout_seconds=timeout_seconds,
+            cwd=cwd,
+            env=env,
+        )
+
+    def _execute_multipart(
+        self,
+        prompt_text: str,
+        *,
+        conversation_id: str | None,
+        model: str,
+        effort: str,
+        timeout_seconds: float,
+        cwd: str | None,
+        env: dict[str, str] | None,
+    ) -> tuple[str, str, str]:
+        """Deliver a body over the argv ceiling as sequential turns on one
+        AGY conversation, using the same server-side resume AGY already
+        provides for incremental context. AGY's --print has no stdin or file
+        path that reaches the tools-disabled Hermes agent, so this is the
+        only transport that neither truncates content nor writes it to disk.
+        """
+
+        parts = _split_into_chunks(prompt_text, TRANSPORT_CHUNK_BUDGET_BYTES)
+        total = len(parts)
+        current_conversation_id = conversation_id
+        response = ""
+        reasoning = ""
+        for index, part in enumerate(parts, start=1):
+            with self._process_lock:
+                if self._sequence_abort_requested:
+                    raise RuntimeError("AGY request aborted")
+            if index < total:
+                wrapped = (
+                    f"System: This is part {index} of {total} of one oversized "
+                    "Hermes request, split only because of a local transport "
+                    "limit (not a model context limit). Wait for every part "
+                    "before responding to the request itself. Reply with only "
+                    "the single word OK to confirm receipt of this part.\n\n" + part
+                )
+            else:
+                wrapped = (
+                    f"System: This is the final part {index} of {total}. You "
+                    "now have the complete request across all parts, in order. "
+                    "Process it as one message and respond normally now.\n\n" + part
+                )
+            response, reasoning, returned_id = self._execute(
+                wrapped,
+                conversation_id=current_conversation_id,
+                model=model,
+                effort=effort,
+                timeout_seconds=timeout_seconds,
+                cwd=cwd,
+                env=env,
+            )
+            if not returned_id:
+                raise RuntimeError(
+                    "AGY did not return a conversation_id mid multi-part transport"
+                )
+            current_conversation_id = returned_id
+        if current_conversation_id is None:
+            raise RuntimeError(
+                "AGY multi-part transport produced no conversation_id"
+            )
+        return response, reasoning, current_conversation_id
 
     def _execute(
         self,
