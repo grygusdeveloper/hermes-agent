@@ -132,7 +132,7 @@ class ClaudeCodeClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         stream: bool = False,
-        **_: Any,
+        **kwargs: Any,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
             messages or [],
@@ -154,8 +154,9 @@ class ClaudeCodeClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        # Resolve the configured effort for this agent/model, if any.
-        effort = _resolve_effort()
+        # Prefer per-request effort kwargs, then configured agent effort.
+        effort = _resolve_effort_from_kwargs(kwargs) or _resolve_effort()
+        tools_digest = _tools_digest(tools)
 
         # Only the main tool-enabled agent owns durable Claude Code continuity.
         # Auxiliary title/compression calls have no tool schema and must not
@@ -167,6 +168,7 @@ class ClaudeCodeClient:
             messages=messages or [],
             model=model or "sonnet",
             effort=effort,
+            tools_digest=tools_digest,
             timeout_seconds=_effective_timeout,
             cwd=self._claude_cwd,
             env=_build_subprocess_env(),
@@ -207,6 +209,49 @@ def _resolve_command() -> str:
         or os.getenv("CLAUDE_BIN", "").strip()
         or "claude"
     )
+
+
+def _tools_digest(tools: list[dict[str, Any]] | None) -> str:
+    """Stable identity for the Hermes tool surface (not the prompt body)."""
+
+    if not tools:
+        return ""
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    if not names:
+        return ""
+    import hashlib
+    import json as _json
+
+    canonical = _json.dumps(sorted(set(names)), separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_effort_from_kwargs(kwargs: dict[str, Any]) -> str | None:
+    """Pull effort from OpenAI-style / Hermes kwargs when present."""
+
+    for key in ("effort", "reasoning_effort"):
+        value = kwargs.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip().lower()
+            if normalized in {"low", "medium", "high", "xhigh", "max"}:
+                return normalized
+    reasoning = kwargs.get("reasoning")
+    if isinstance(reasoning, dict):
+        value = reasoning.get("effort")
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip().lower()
+            if normalized in {"low", "medium", "high", "xhigh", "max"}:
+                return normalized
+    return None
 
 
 def _resolve_effort() -> str | None:

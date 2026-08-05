@@ -62,7 +62,7 @@ _SESSION_ID_RE = re.compile(
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
 _MESSAGE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 _STATE_LOCK = threading.Lock()
 
 # Markers that indicate the Claude Code server session is gone / expired.
@@ -218,7 +218,7 @@ def _durable_transition_lock(state_key: str | None):
 
 def _load_durable_state(
     state_key: str,
-) -> tuple[str, tuple[tuple[str, str], ...]] | None:
+) -> tuple[str, tuple[tuple[str, str], ...], str, str | None, str] | None:
     path = _state_path(state_key)
     try:
         with _STATE_LOCK:
@@ -232,7 +232,16 @@ def _load_durable_state(
         return None
     session_id = payload.get("session_id")
     raw_fingerprints = payload.get("message_fingerprints")
+    model = payload.get("model")
+    effort = payload.get("effort")
+    tools_digest = payload.get("tools_digest")
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    if effort is not None and not isinstance(effort, str):
+        return None
+    if not isinstance(tools_digest, str):
         return None
     if not isinstance(raw_fingerprints, list):
         return None
@@ -246,13 +255,23 @@ def _load_durable_state(
         if not _MESSAGE_DIGEST_RE.fullmatch(digest):
             return None
         fingerprints.append((role, digest))
-    return session_id, tuple(fingerprints)
+    return (
+        session_id,
+        tuple(fingerprints),
+        model.strip(),
+        effort.strip() if isinstance(effort, str) and effort.strip() else None,
+        tools_digest,
+    )
 
 
 def _save_durable_state(
     state_key: str,
     session_id: str,
     fingerprints: tuple[tuple[str, str], ...],
+    *,
+    model: str,
+    effort: str | None,
+    tools_digest: str,
 ) -> None:
     directory = _state_dir()
     path = _state_path(state_key)
@@ -261,6 +280,9 @@ def _save_durable_state(
         "state_key_hash": hashlib.sha256(state_key.encode("utf-8")).hexdigest(),
         "session_id": session_id,
         "message_fingerprints": [list(item) for item in fingerprints],
+        "model": model,
+        "effort": effort,
+        "tools_digest": tools_digest,
     }
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     with _STATE_LOCK:
@@ -346,13 +368,21 @@ def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, s
 
     Authentication is delegated to the already-authenticated Claude Code CLI
     (it reads its own OAuth/keychain state).  We never inject credentials here.
+    Default path uses the Hermes scrubber so Tier-1 secrets (gateway tokens,
+    etc.) are stripped when callers omit an explicit env.
     """
 
-    env = dict(base_env or os.environ)
+    if base_env is None:
+        try:
+            from tools.environments.local import hermes_subprocess_env
+
+            env = hermes_subprocess_env(inherit_credentials=True)
+        except Exception:
+            env = dict(os.environ)
+    else:
+        env = dict(base_env)
     env.setdefault("HOME", str(Path.home()))
     env.setdefault("LANG", "C.UTF-8")
-    # Claude Code writes session history under this; keep it stable per host.
-    env.pop("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", None)
     return env
 
 
@@ -376,6 +406,9 @@ class ClaudeCodeSession:
         self._session_id: str | None = None
         self._previous_messages: tuple[tuple[str, str], ...] = ()
         self._state_key: str | None = None
+        self._bound_model: str | None = None
+        self._bound_effort: str | None = None
+        self._bound_tools_digest: str = ""
         self._lock = threading.RLock()
         self._process_lock = threading.Lock()
         self._active_process: subprocess.Popen[str] | None = None
@@ -389,6 +422,9 @@ class ClaudeCodeSession:
             self._session_id = None
             self._previous_messages = ()
             self._state_key = None
+            self._bound_model = None
+            self._bound_effort = None
+            self._bound_tools_digest = ""
 
     def abort(self) -> None:
         """Terminate the in-flight Claude Code process group without waiting."""
@@ -412,6 +448,7 @@ class ClaudeCodeSession:
         messages: list[dict[str, Any]],
         model: str,
         effort: str | None = None,
+        tools_digest: str = "",
         timeout_seconds: float = 270.0,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
@@ -425,18 +462,35 @@ class ClaudeCodeSession:
         """
 
         current = _message_fingerprint(messages)
+        normalized_effort = effort.strip() if isinstance(effort, str) and effort.strip() else None
+        normalized_tools = tools_digest if isinstance(tools_digest, str) else ""
         with self._lock, _durable_transition_lock(state_key):
             if state_key != self._state_key:
                 self._session_id = None
                 self._previous_messages = ()
+                self._bound_model = None
+                self._bound_effort = None
+                self._bound_tools_digest = ""
                 self._state_key = state_key
                 if state_key:
                     durable = _load_durable_state(state_key)
                     if durable:
-                        self._session_id, self._previous_messages = durable
+                        (
+                            self._session_id,
+                            self._previous_messages,
+                            self._bound_model,
+                            self._bound_effort,
+                            self._bound_tools_digest,
+                        ) = durable
             previous_count = len(self._previous_messages)
+            identity_matches = (
+                self._bound_model == model
+                and self._bound_effort == normalized_effort
+                and self._bound_tools_digest == normalized_tools
+            )
             can_resume = bool(
                 self._session_id
+                and identity_matches
                 and len(current) > previous_count
                 and current[:previous_count] == self._previous_messages
             )
@@ -448,7 +502,7 @@ class ClaudeCodeSession:
                             incremental,
                             session_id=self._session_id,
                             model=model,
-                            effort=effort,
+                            effort=normalized_effort,
                             timeout_seconds=timeout_seconds,
                             cwd=cwd,
                             env=env,
@@ -458,6 +512,9 @@ class ClaudeCodeSession:
                         # conversation with the complete prompt.
                         self._session_id = None
                         self._previous_messages = ()
+                        self._bound_model = None
+                        self._bound_effort = None
+                        self._bound_tools_digest = ""
                         if state_key:
                             _delete_durable_state(state_key)
                     else:
@@ -468,11 +525,17 @@ class ClaudeCodeSession:
                             )
                         self._session_id = resolved_session_id
                         self._previous_messages = current
+                        self._bound_model = model
+                        self._bound_effort = normalized_effort
+                        self._bound_tools_digest = normalized_tools
                         if state_key:
                             _save_durable_state(
                                 state_key,
                                 resolved_session_id,
                                 self._previous_messages,
+                                model=model,
+                                effort=normalized_effort,
+                                tools_digest=normalized_tools,
                             )
                         return response, reasoning
 
@@ -482,7 +545,7 @@ class ClaudeCodeSession:
                 prompt_text,
                 session_id=None,
                 model=model,
-                effort=effort,
+                effort=normalized_effort,
                 timeout_seconds=timeout_seconds,
                 cwd=cwd,
                 env=env,
@@ -494,11 +557,17 @@ class ClaudeCodeSession:
                 )
             self._session_id = session_id
             self._previous_messages = current
+            self._bound_model = model
+            self._bound_effort = normalized_effort
+            self._bound_tools_digest = normalized_tools
             if state_key:
                 _save_durable_state(
                     state_key,
                     self._session_id,
                     self._previous_messages,
+                    model=model,
+                    effort=normalized_effort,
+                    tools_digest=normalized_tools,
                 )
             return response, reasoning
 
@@ -630,8 +699,19 @@ class ClaudeCodeSession:
             try:
                 process.wait(timeout=5)
             except Exception:
-                process.kill()
-                process.wait()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
             raise RuntimeError("Claude Code request timed out")
 
         if self._abort_requested:

@@ -5142,7 +5142,9 @@ class AIAgent:
         # CopilotACPClient is request-local for normal chat-completions calls.
         # Antigravity's AGY conversation must instead live with the cached
         # primary agent client so incremental context survives between turns.
+        # Claude Code sessions follow the same primary-owner pattern.
         from agent.copilot_acp_client import CopilotACPClient
+        from agent.claude_code_client import ClaudeCodeClient
 
         if (
             isinstance(primary_client, CopilotACPClient)
@@ -5154,6 +5156,11 @@ class AIAgent:
                 primary_client._antigravity_conversation
             )
             client._owns_antigravity_conversation = False
+        if isinstance(primary_client, ClaudeCodeClient) and isinstance(
+            client, ClaudeCodeClient
+        ):
+            client._claude_session = primary_client._claude_session
+            client._owns_claude_session = False
         with self._openai_client_lock():
             cache = self._request_client_cache_ref()
             if cache["client"] is None:
@@ -5239,6 +5246,7 @@ class AIAgent:
                 cache["poisoned"] = True
         try:
             from agent.copilot_acp_client import CopilotACPClient
+            from agent.claude_code_client import ClaudeCodeClient
 
             if isinstance(client, CopilotACPClient) and client._is_antigravity():
                 client._antigravity_conversation.abort()
@@ -5248,8 +5256,16 @@ class AIAgent:
                     self._client_log_context(),
                 )
                 return
+            if isinstance(client, ClaudeCodeClient):
+                client._claude_session.abort()
+                logger.info(
+                    "Claude Code request aborted (%s, shared=False) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+                return
         except Exception:
-            logger.debug("Antigravity request abort failed", exc_info=True)
+            logger.debug("Subprocess request abort failed", exc_info=True)
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
             # tcp_force_closed=0 means the stranger-thread abort found no

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
-import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -222,6 +221,8 @@ class TestClaudeCodeSession:
             "full first prompt",
             messages=first_messages,
             model="sonnet",
+            effort="low",
+            tools_digest="toolsA",
             state_key=state_key,
         )
 
@@ -230,6 +231,8 @@ class TestClaudeCodeSession:
         payload = state_files[0].read_text(encoding="utf-8")
         assert secret not in payload
         assert session_id in payload
+        assert '"model":"sonnet"' in payload
+        assert '"tools_digest":"toolsA"' in payload
 
         second = ClaudeCodeSession()
         calls: list[dict] = []
@@ -247,11 +250,30 @@ class TestClaudeCodeSession:
             "full second prompt",
             messages=second_messages,
             model="sonnet",
+            effort="low",
+            tools_digest="toolsA",
             state_key=state_key,
         )
         assert calls[0]["session_id"] == session_id
         assert "follow up" in calls[0]["prompt"]
         assert secret not in calls[0]["prompt"]
+
+    def test_model_change_forces_fresh_session(self, monkeypatch):
+        session = ClaudeCodeSession()
+        calls: list[dict] = []
+
+        def fake_execute(prompt_text, **kwargs):
+            calls.append({"prompt": prompt_text, **kwargs})
+            return "ok", "", f"12345678-1234-1234-1234-12345678900{len(calls)}"
+
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        first = _messages(("user", "one"))
+        session.run("FULL1", messages=first, model="sonnet", effort="low")
+        second = first + _messages(("assistant", "ok"), ("user", "two"))
+        session.run("FULL2", messages=second, model="opus", effort="low")
+        assert calls[0]["session_id"] is None
+        assert calls[1]["session_id"] is None  # model change => fresh
+        assert calls[1]["model"] == "opus"
 
     def test_abort_kills_active_process_group(self, monkeypatch):
         session = ClaudeCodeSession()
@@ -273,6 +295,31 @@ class TestClaudeCodeSession:
         session.abort()
         assert killed and killed[0][0] == 4242
         assert session._abort_requested is True
+
+    def test_production_abort_path_calls_claude_session_abort(self):
+        """Stranger-thread interrupt must killpg via ClaudeCodeSession.abort."""
+        from run_agent import AIAgent
+        from agent.claude_code_client import ClaudeCodeClient
+
+        client = ClaudeCodeClient(cwd="/tmp")
+        aborted = {"called": False}
+
+        def fake_abort():
+            aborted["called"] = True
+
+        client._claude_session.abort = fake_abort  # type: ignore[method-assign]
+        agent = AIAgent.__new__(AIAgent)
+        agent._openai_client_lock = lambda: nullcontext()  # type: ignore
+        agent._request_client_cache_ref = lambda: {
+            "client": client,
+            "kwargs": None,
+            "poisoned": False,
+            "in_use": True,
+        }
+        agent._client_log_context = lambda: ""
+        agent._force_close_tcp_sockets = lambda client: 0  # type: ignore[method-assign]
+        AIAgent._abort_request_openai_client(agent, client, reason="interrupt_test")
+        assert aborted["called"] is True
 
     def test_execute_builds_stream_json_stdin_and_tools_disabled(self, monkeypatch):
         session = ClaudeCodeSession()
