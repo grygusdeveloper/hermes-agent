@@ -9858,7 +9858,10 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "status_fn": _anthropic_oauth_status,
     },
     {
-        "id": "claude-code",
+        # Distinct from the first-class claude-code external-process provider
+        # above.  This card is the synthetic Anthropic *subscription* OAuth
+        # row managed by the Claude Code CLI credential store.
+        "id": "claude-code-subscription",
         "name": "Anthropic OAuth: Required Extra Usage Credits to Use Subscription",
         "flow": "external",
         "cli_command": "claude setup-token",
@@ -9981,7 +9984,7 @@ def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str
     """
     if provider.get("flow") != "external":
         return None
-    if provider.get("id") == "claude-code":
+    if provider.get("id") in {"claude-code", "claude-code-subscription"}:
         rm_file = "rm -f ~/.claude/.credentials.json"
         if sys.platform == "darwin":
             return f'security delete-generic-password -s "Claude Code-credentials" 2>/dev/null; {rm_file}'

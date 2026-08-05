@@ -156,7 +156,7 @@ class ClaudeCodeClient:
 
         # Prefer per-request effort kwargs, then configured agent effort.
         effort = _resolve_effort_from_kwargs(kwargs) or _resolve_effort()
-        tools_digest = _tools_digest(tools)
+        tools_digest = _tools_digest(tools, tool_choice=tool_choice)
 
         # Only the main tool-enabled agent owns durable Claude Code continuity.
         # Auxiliary title/compression calls have no tool schema and must not
@@ -173,6 +173,7 @@ class ClaudeCodeClient:
             cwd=self._claude_cwd,
             env=_build_subprocess_env(),
             state_key=state_key,
+            command=self._claude_command,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -211,27 +212,44 @@ def _resolve_command() -> str:
     )
 
 
-def _tools_digest(tools: list[dict[str, Any]] | None) -> str:
-    """Stable identity for the Hermes tool surface (not the prompt body)."""
+def _tools_digest(
+    tools: list[dict[str, Any]] | None,
+    *,
+    tool_choice: Any = None,
+) -> str:
+    """Stable identity for the complete Hermes tool surface.
 
-    if not tools:
-        return ""
-    names: list[str] = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-        if not isinstance(fn, dict):
-            continue
-        name = fn.get("name")
-        if isinstance(name, str) and name.strip():
-            names.append(name.strip())
-    if not names:
-        return ""
+    Hashes canonical tool schemas (not just names), tool_choice, and a
+    prompt-format version so schema/description changes force a fresh
+    Claude Code session instead of resuming with stale tool instructions.
+    """
+
     import hashlib
     import json as _json
 
-    canonical = _json.dumps(sorted(set(names)), separators=(",", ":"), ensure_ascii=True)
+    def _normalize(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(k): _normalize(v)
+                for k, v in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [_normalize(item) for item in value]
+        return str(value)
+
+    specs: list[Any] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        specs.append(_normalize(tool))
+    payload = {
+        "format_version": 1,
+        "tools": specs,
+        "tool_choice": _normalize(tool_choice),
+    }
+    canonical = _json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

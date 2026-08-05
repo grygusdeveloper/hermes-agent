@@ -343,12 +343,24 @@ def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> 
         if role == "assistant":
             continue
         rendered = _render_content(message.get("content"))
-        if not rendered:
+        if not rendered and role != "tool":
+            continue
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id") or message.get("id") or ""
+            tool_name = message.get("name") or ""
+            header = "Tool Result"
+            meta_bits = []
+            if isinstance(tool_name, str) and tool_name.strip():
+                meta_bits.append(f"name={tool_name.strip()}")
+            if isinstance(tool_call_id, str) and tool_call_id.strip():
+                meta_bits.append(f"tool_call_id={tool_call_id.strip()}")
+            if meta_bits:
+                header = f"Tool Result ({', '.join(meta_bits)})"
+            parts.append(f"{header}:\n{rendered}")
             continue
         label = {
             "system": "System",
             "user": "User",
-            "tool": "Tool Result",
         }.get(role, role.title() or "Context")
         parts.append(f"{label}:\n{rendered}")
     return "\n\n".join(parts)
@@ -369,21 +381,55 @@ def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, s
     Authentication is delegated to the already-authenticated Claude Code CLI
     (it reads its own OAuth/keychain state).  We never inject credentials here.
     Default path uses the Hermes scrubber so Tier-1 secrets (gateway tokens,
-    etc.) are stripped when callers omit an explicit env.
+    etc.) are stripped when callers omit an explicit env.  There is no
+    fail-open raw ``os.environ`` path — if the scrubber is unavailable, raise.
     """
 
     if base_env is None:
-        try:
-            from tools.environments.local import hermes_subprocess_env
+        from tools.environments.local import hermes_subprocess_env
 
-            env = hermes_subprocess_env(inherit_credentials=True)
-        except Exception:
-            env = dict(os.environ)
+        env = hermes_subprocess_env(inherit_credentials=True)
     else:
         env = dict(base_env)
     env.setdefault("HOME", str(Path.home()))
     env.setdefault("LANG", "C.UTF-8")
     return env
+
+
+def _require_uuid_session_id(session_id: str, *, where: str) -> str:
+    sid = (session_id or "").strip()
+    if not _SESSION_ID_RE.fullmatch(sid):
+        raise RuntimeError(
+            f"Claude Code returned a malformed session_id from {where}: {sid!r}"
+        )
+    return sid
+
+
+def _reap_process_group(process: subprocess.Popen[str], *, grace_seconds: float = 5.0) -> None:
+    """Ensure the whole process group is dead after timeout/abort.
+
+    ``process.wait()`` only reaps the leader.  After a graceful SIGTERM, kill
+    the group with SIGKILL regardless of whether the leader already exited,
+    then reap the leader.
+    """
+
+    try:
+        process.wait(timeout=grace_seconds)
+    except Exception:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except Exception:
+        pass
 
 
 class ClaudeCodeSession:
@@ -453,35 +499,50 @@ class ClaudeCodeSession:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         state_key: str | None = None,
+        command: str | None = None,
     ) -> tuple[str, str]:
         """Return ``(response, reasoning)`` using the durable Claude Code session.
 
         ``prompt_text`` is the *complete* formatted prompt (system + tools +
         transcript) used for a fresh session or an expired-session retry.
         ``messages`` drives incremental continuation.
+        ``command`` is the resolved Claude Code CLI binary path (required for
+        exact executable selection; falls back to env/PATH resolution only
+        when omitted).
         """
 
         current = _message_fingerprint(messages)
         normalized_effort = effort.strip() if isinstance(effort, str) and effort.strip() else None
         normalized_tools = tools_digest if isinstance(tools_digest, str) else ""
         with self._lock, _durable_transition_lock(state_key):
-            if state_key != self._state_key:
+            # Always reload durable state under the lease before dispatch so a
+            # long-lived owner cannot publish a divergent branch after another
+            # process advanced the same conversation.
+            if state_key:
+                durable = _load_durable_state(state_key)
+                if durable:
+                    (
+                        self._session_id,
+                        self._previous_messages,
+                        self._bound_model,
+                        self._bound_effort,
+                        self._bound_tools_digest,
+                    ) = durable
+                elif state_key != self._state_key:
+                    # Key changed and no durable file: clear in-memory continuity.
+                    self._session_id = None
+                    self._previous_messages = ()
+                    self._bound_model = None
+                    self._bound_effort = None
+                    self._bound_tools_digest = ""
+                self._state_key = state_key
+            elif state_key != self._state_key:
                 self._session_id = None
                 self._previous_messages = ()
                 self._bound_model = None
                 self._bound_effort = None
                 self._bound_tools_digest = ""
                 self._state_key = state_key
-                if state_key:
-                    durable = _load_durable_state(state_key)
-                    if durable:
-                        (
-                            self._session_id,
-                            self._previous_messages,
-                            self._bound_model,
-                            self._bound_effort,
-                            self._bound_tools_digest,
-                        ) = durable
             previous_count = len(self._previous_messages)
             identity_matches = (
                 self._bound_model == model
@@ -506,6 +567,7 @@ class ClaudeCodeSession:
                             timeout_seconds=timeout_seconds,
                             cwd=cwd,
                             env=env,
+                            command=command,
                         )
                     except ClaudeCodeSessionExpired:
                         # Expired/invalid server session: retry once as a fresh
@@ -518,11 +580,10 @@ class ClaudeCodeSession:
                         if state_key:
                             _delete_durable_state(state_key)
                     else:
-                        resolved_session_id = session_id or self._session_id
-                        if not resolved_session_id:
-                            raise RuntimeError(
-                                "Claude Code resume did not preserve a session_id"
-                            )
+                        resolved_session_id = _require_uuid_session_id(
+                            session_id or self._session_id or "",
+                            where="resume",
+                        )
                         self._session_id = resolved_session_id
                         self._previous_messages = current
                         self._bound_model = model
@@ -549,13 +610,12 @@ class ClaudeCodeSession:
                 timeout_seconds=timeout_seconds,
                 cwd=cwd,
                 env=env,
+                command=command,
             )
-            if not session_id:
-                raise RuntimeError(
-                    "Claude Code did not return a session_id; durable "
-                    "continuation cannot be established"
-                )
-            self._session_id = session_id
+            resolved_session_id = _require_uuid_session_id(
+                session_id, where="fresh"
+            )
+            self._session_id = resolved_session_id
             self._previous_messages = current
             self._bound_model = model
             self._bound_effort = normalized_effort
@@ -581,6 +641,7 @@ class ClaudeCodeSession:
         timeout_seconds: float,
         cwd: str | None,
         env: dict[str, str] | None,
+        command: str | None = None,
     ) -> tuple[str, str, str]:
         """Run one request with an abort latch scoped to this exact call."""
 
@@ -598,6 +659,7 @@ class ClaudeCodeSession:
                 timeout_seconds=timeout_seconds,
                 cwd=cwd,
                 env=env,
+                command=command,
             )
             with self._process_lock:
                 if self._abort_requested:
@@ -622,14 +684,15 @@ class ClaudeCodeSession:
         timeout_seconds: float,
         cwd: str | None,
         env: dict[str, str] | None,
+        command: str | None = None,
     ) -> tuple[str, str, str]:
         """Launch ``claude`` with stream-json stdin and parse the event stream.
 
         Returns ``(response_text, reasoning_text, session_id)``.
         """
 
-        claude_bin = _resolve_claude_command()
-        command = [
+        claude_bin = (command or "").strip() or _resolve_claude_command()
+        argv = [
             claude_bin,
             "-p",
             "--model",
@@ -645,14 +708,17 @@ class ClaudeCodeSession:
             "",
         ]
         if effort:
-            command += ["--effort", _validate_flag_size(str(effort))]
+            argv += ["--effort", _validate_flag_size(str(effort))]
         if session_id:
-            command += ["--resume", _validate_flag_size(str(session_id))]
+            argv += [
+                "--resume",
+                _validate_flag_size(_require_uuid_session_id(session_id, where="resume-arg")),
+            ]
         else:
             # Stable fresh UUID so the session can be resumed later.
             import uuid
 
-            command += ["--session-id", str(uuid.uuid4())]
+            argv += ["--session-id", str(uuid.uuid4())]
 
         process_env = _build_subprocess_env(env)
 
@@ -673,7 +739,7 @@ class ClaudeCodeSession:
                 raise RuntimeError("Claude Code request aborted before launch")
             try:
                 process = subprocess.Popen(
-                    command,
+                    argv,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -696,25 +762,11 @@ class ClaudeCodeSession:
             )
         except subprocess.TimeoutExpired:
             self.abort()
-            try:
-                process.wait(timeout=5)
-            except Exception:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except Exception:
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
-                try:
-                    process.wait(timeout=5)
-                except Exception:
-                    pass
+            _reap_process_group(process, grace_seconds=5.0)
             raise RuntimeError("Claude Code request timed out")
 
         if self._abort_requested:
+            _reap_process_group(process, grace_seconds=2.0)
             raise RuntimeError("Claude Code request aborted")
 
         if process.returncode != 0:
@@ -724,58 +776,50 @@ class ClaudeCodeSession:
             raise RuntimeError(f"Claude Code failed (exit {process.returncode}): {detail}")
 
         response, reasoning, result_session_id = _parse_stream_json_output(stdout)
-        if not response and not reasoning:
-            detail = stderr.strip()[-500:] if stderr else "empty response"
-            # An empty result with a non-zero-ish stderr may still be an
-            # expired-session case where the CLI exited 0 with an error event.
-            if session_id and _is_expired_session_error(detail):
-                raise ClaudeCodeSessionExpired(f"Claude Code empty response: {detail}")
-        else:
-            detail = ""
-        if not result_session_id:
-            # The ``result`` event always carries the session_id for a
-            # successful turn.  Missing it means the stream was malformed.
-            raise RuntimeError(
-                f"Claude Code did not return a session_id; stderr: {detail or '(none)'}"
-            )
         return response, reasoning, result_session_id
 
 
 def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
     """Parse a Claude Code ``stream-json`` stdout into (text, reasoning, session_id).
 
-    Event types observed (Claude Code 2.1.x):
-      * ``system`` (subtype ``init``) — carries the initial ``session_id``.
-      * ``assistant`` — ``message.content`` may contain ``{type:text}`` and
-        ``{type:thinking}`` blocks; text accumulates the response, thinking
-        accumulates reasoning.
-      * ``user`` — tool results (ignored here; Claude Code tools are disabled).
-      * ``result`` — final envelope with ``result`` (full text), ``session_id``,
-        and ``is_error``.
+    Requires exactly one terminal successful ``result`` event and a UUID-valid
+    session_id.  Partial streams (system/assistant only) are rejected.
     """
 
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
-    session_id = ""
+    init_session_id = ""
+    result_session_id = ""
     result_text = ""
+    saw_successful_result = False
+    trailing_garbage = False
+    finished = False
 
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
+        if not line:
+            continue
+        if finished:
+            # Any non-empty content after a terminal result is truncated/malformed.
+            trailing_garbage = True
+            break
         if not line.startswith("{"):
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Claude Code stream contained malformed JSON: {exc}"
+            ) from exc
         if not isinstance(event, dict):
-            continue
+            raise RuntimeError("Claude Code stream contained a non-object event")
 
         event_type = event.get("type")
 
         if event_type == "system":
             sid = event.get("session_id")
             if isinstance(sid, str) and sid.strip():
-                session_id = sid.strip()
+                init_session_id = _require_uuid_session_id(sid, where="system/init")
             continue
 
         if event_type == "assistant":
@@ -797,8 +841,14 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
 
         if event_type == "result":
             sid = event.get("session_id")
-            if isinstance(sid, str) and sid.strip():
-                session_id = sid.strip()
+            if not isinstance(sid, str) or not sid.strip():
+                raise RuntimeError("Claude Code result event missing session_id")
+            result_session_id = _require_uuid_session_id(sid, where="result")
+            if init_session_id and result_session_id != init_session_id:
+                raise RuntimeError(
+                    "Claude Code init/result session_id mismatch: "
+                    f"{init_session_id} != {result_session_id}"
+                )
             if event.get("is_error"):
                 detail = str(event.get("result") or "")[:300]
                 if _is_expired_session_error(detail):
@@ -807,12 +857,21 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
                     )
                 raise RuntimeError(f"Claude Code result error: {detail}")
             final = event.get("result")
-            if isinstance(final, str) and final.strip():
+            if isinstance(final, str):
                 result_text = final.strip()
+            saw_successful_result = True
+            finished = True
             continue
+
+    if trailing_garbage:
+        raise RuntimeError("Claude Code stream had content after the terminal result")
+    if not saw_successful_result:
+        raise RuntimeError(
+            "Claude Code stream missing a terminal successful result event"
+        )
 
     # Prefer the accumulated streamed assistant text; fall back to the
     # ``result`` envelope's flattened text when streaming produced nothing.
     response = "".join(text_parts) or result_text
     reasoning = "".join(reasoning_parts)
-    return response, reasoning, session_id
+    return response, reasoning, result_session_id

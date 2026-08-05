@@ -551,3 +551,371 @@ class TestProviderRegistration:
             )
         assert isinstance(client, ClaudeCodeClient)
         assert client.base_url == "acp://claude-code"
+
+
+class TestReviewBlockerRegressions:
+    def test_partial_stream_without_result_is_rejected(self):
+        sid = "12345678-1234-1234-1234-123456789abc"
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": sid,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "partial"}],
+                        },
+                        "session_id": sid,
+                    }
+                ),
+            ]
+        )
+        with pytest.raises(RuntimeError, match="missing a terminal successful result"):
+            _parse_stream_json_output(stdout)
+
+    def test_non_uuid_session_id_is_rejected(self):
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "is_error": False,
+                        "result": "ok",
+                        "session_id": "not-a-uuid",
+                    }
+                )
+            ]
+        )
+        with pytest.raises(RuntimeError, match="malformed session_id"):
+            _parse_stream_json_output(stdout)
+
+    def test_trailing_content_after_result_is_rejected(self):
+        sid = "12345678-1234-1234-1234-123456789abc"
+        stdout = _stream_stdout(text="ok", session_id=sid) + json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}
+        )
+        with pytest.raises(RuntimeError, match="after the terminal result"):
+            _parse_stream_json_output(stdout)
+
+    def test_incremental_tool_results_include_name_and_call_id(self):
+        msgs = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "tool",
+                "name": "lookup",
+                "tool_call_id": "call_a",
+                "content": "same-body",
+            },
+            {
+                "role": "tool",
+                "name": "lookup",
+                "tool_call_id": "call_b",
+                "content": "same-body",
+            },
+        ]
+        prompt = _incremental_prompt(msgs, previous_count=1)
+        assert "tool_call_id=call_a" in prompt
+        assert "tool_call_id=call_b" in prompt
+        assert "name=lookup" in prompt
+
+    def test_tools_digest_includes_full_schema_not_just_names(self):
+        from agent.claude_code_client import _tools_digest
+
+        a = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "A",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                },
+            }
+        ]
+        b = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "B totally different",
+                    "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}},
+                },
+            }
+        ]
+        assert _tools_digest(a, tool_choice="auto") != _tools_digest(b, tool_choice="auto")
+        assert _tools_digest(a, tool_choice="auto") != _tools_digest(a, tool_choice="required")
+
+    def test_custom_command_is_argv0(self, monkeypatch):
+        session = ClaudeCodeSession()
+        captured: dict = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return (_stream_stdout(text="OK"), "")
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                return None
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = list(command)
+            return FakeProc()
+
+        monkeypatch.setattr("agent.claude_code_session.subprocess.Popen", fake_popen)
+        session._execute(
+            "hi",
+            session_id=None,
+            model="sonnet",
+            effort=None,
+            timeout_seconds=10,
+            cwd="/tmp",
+            env={"HOME": "/tmp", "PATH": "/usr/bin"},
+            command="/custom/bin/claude-exact",
+        )
+        assert captured["command"][0] == "/custom/bin/claude-exact"
+
+    def test_client_propagates_command_to_session(self):
+        client = ClaudeCodeClient(command="/custom/claude", cwd="/tmp")
+        seen: dict = {}
+
+        def fake_run(prompt_text, **kwargs):
+            seen.update(kwargs)
+            return "ok", ""
+
+        with patch.object(client._claude_session, "run", side_effect=fake_run):
+            client._create_chat_completion(
+                model="sonnet",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert seen["command"] == "/custom/claude"
+
+    def test_timeout_always_sigkills_process_group(self, monkeypatch):
+        import signal as _signal
+
+        session = ClaudeCodeSession()
+        signals: list[int] = []
+
+        class FakeProc:
+            pid = 7777
+            returncode = None
+
+            def communicate(self, input=None, timeout=None):
+                import subprocess as sp
+
+                raise sp.TimeoutExpired(cmd=["claude"], timeout=timeout)
+
+            def wait(self, timeout=None):
+                self.returncode = -15
+                return self.returncode
+
+            def kill(self):
+                return None
+
+            def poll(self):
+                return self.returncode
+
+        def fake_popen(command, **kwargs):
+            return FakeProc()
+
+        def fake_killpg(pid, sig):
+            signals.append(sig)
+
+        monkeypatch.setattr("agent.claude_code_session.subprocess.Popen", fake_popen)
+        monkeypatch.setattr("agent.claude_code_session.os.killpg", fake_killpg)
+        with pytest.raises(RuntimeError, match="timed out"):
+            session._execute(
+                "hi",
+                session_id=None,
+                model="sonnet",
+                effort=None,
+                timeout_seconds=1,
+                cwd="/tmp",
+                env={"HOME": "/tmp", "PATH": "/usr/bin"},
+                command="claude",
+            )
+        assert _signal.SIGTERM in signals
+        assert _signal.SIGKILL in signals
+
+    def test_cross_process_reload_before_dispatch(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_key = "agent:main:discord:thread:cross:1"
+        sid1 = "11111111-1111-1111-1111-111111111111"
+
+        owner_a = ClaudeCodeSession()
+        monkeypatch.setattr(
+            owner_a,
+            "_execute",
+            lambda prompt_text, **kwargs: ("a1", "", sid1),
+        )
+        first = _messages(("user", "one"))
+        owner_a.run(
+            "FULL1",
+            messages=first,
+            model="sonnet",
+            effort="low",
+            tools_digest="t1",
+            state_key=state_key,
+        )
+
+        owner_b = ClaudeCodeSession()
+        calls_b: list[dict] = []
+
+        def exec_b(prompt_text, **kwargs):
+            calls_b.append({"prompt": prompt_text, **kwargs})
+            return "b2", "", sid1
+
+        monkeypatch.setattr(owner_b, "_execute", exec_b)
+        second = first + _messages(("assistant", "a1"), ("user", "two"))
+        owner_b.run(
+            "FULL2",
+            messages=second,
+            model="sonnet",
+            effort="low",
+            tools_digest="t1",
+            state_key=state_key,
+        )
+        assert calls_b[0]["session_id"] == sid1
+
+        calls_a: list[dict] = []
+
+        def exec_a(prompt_text, **kwargs):
+            calls_a.append({"prompt": prompt_text, **kwargs})
+            return "a3", "", sid1
+
+        monkeypatch.setattr(owner_a, "_execute", exec_a)
+        third = second + _messages(("assistant", "b2"), ("user", "three"))
+        owner_a.run(
+            "FULL3",
+            messages=third,
+            model="sonnet",
+            effort="low",
+            tools_digest="t1",
+            state_key=state_key,
+        )
+        assert calls_a[0]["session_id"] == sid1
+        assert "three" in calls_a[0]["prompt"]
+        assert "one" not in calls_a[0]["prompt"]
+
+    def test_production_request_factory_shares_session_and_aborts(self):
+        """Two-turn continuation through real _create_request_openai_client."""
+        from run_agent import AIAgent
+        from agent.claude_code_client import ClaudeCodeClient
+        from unittest.mock import patch as mock_patch
+
+        agent = AIAgent.__new__(AIAgent)
+        agent.provider = "claude-code"
+        agent.base_url = "acp://claude-code"
+        agent.api_key = "claude-code"
+        agent.model = "sonnet"
+        agent._client_kwargs = {
+            "api_key": "claude-code",
+            "base_url": "acp://claude-code",
+            "command": "claude",
+        }
+        agent._request_client_cache = {
+            "client": None,
+            "kwargs": None,
+            "poisoned": False,
+            "in_use": False,
+        }
+        agent._openai_client_lock = lambda: nullcontext()  # type: ignore
+        agent._request_client_cache_ref = lambda: agent._request_client_cache
+        agent._client_log_context = lambda: ""
+        agent._REQUEST_CLIENT_REUSE_REASONS = set()
+        agent._force_close_tcp_sockets = lambda client: 0  # type: ignore
+
+        primary = ClaudeCodeClient(command="/custom/claude", cwd="/tmp")
+        agent._client = primary
+        agent._ensure_primary_openai_client = lambda reason: primary  # type: ignore
+
+        def _create(request_kwargs, reason, shared):
+            return ClaudeCodeClient(
+                **{
+                    k: v
+                    for k, v in request_kwargs.items()
+                    if k in {"api_key", "base_url", "command", "cwd"}
+                }
+            )
+
+        agent._create_openai_client = _create  # type: ignore
+        agent._is_openai_client_closed = lambda client: False  # type: ignore
+        agent._close_openai_client = lambda client, reason, shared: None  # type: ignore
+        # base_url host matcher used in request factory; harmless stub.
+        import run_agent as ra
+        if not hasattr(agent, '_copilot_headers_for_request'):
+            agent._copilot_headers_for_request = lambda is_vision=False: {}  # type: ignore
+        agent._api_kwargs_have_image_parts = lambda api_kwargs: False  # type: ignore
+
+        calls: list[dict] = []
+        killpg_calls: list[tuple[int, int]] = []
+
+        def fake_execute(prompt_text, **kwargs):
+            calls.append({"prompt": prompt_text, **kwargs})
+            return "answer", "", f"12345678-1234-1234-1234-12345678900{len(calls)}"
+
+        primary._claude_session._execute = fake_execute  # type: ignore
+
+        c1 = AIAgent._create_request_openai_client(agent, reason="turn1")
+        assert isinstance(c1, ClaudeCodeClient)
+        assert c1._claude_session is primary._claude_session
+        assert c1._owns_claude_session is False
+        r1 = c1.chat.completions.create(
+            model="sonnet",
+            messages=[{"role": "user", "content": "first"}],
+            tools=[{"type": "function", "function": {"name": "t", "parameters": {}}}],
+        )
+        assert r1.choices[0].message.content == "answer"
+        assert calls[0]["session_id"] is None
+
+        aborted = {"n": 0}
+        primary._claude_session.abort = lambda: aborted.__setitem__("n", aborted["n"] + 1)  # type: ignore
+        AIAgent._close_request_openai_client(agent, c1, reason="turn1_done")
+        assert aborted["n"] == 0
+
+        c2 = AIAgent._create_request_openai_client(agent, reason="turn2")
+        assert c2._claude_session is primary._claude_session
+        r2 = c2.chat.completions.create(
+            model="sonnet",
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "second"},
+            ],
+            tools=[{"type": "function", "function": {"name": "t", "parameters": {}}}],
+        )
+        assert r2.choices[0].message.content == "answer"
+        assert calls[1]["session_id"] == "12345678-1234-1234-1234-123456789001"
+        assert "second" in calls[1]["prompt"]
+
+        class FakeProc:
+            pid = 9991
+
+            def poll(self):
+                return None
+
+        primary._claude_session._request_active = True
+        primary._claude_session._active_process = FakeProc()  # type: ignore
+        import agent.claude_code_session as ccs
+        from agent.claude_code_session import ClaudeCodeSession as CCS
+
+        def fake_killpg(pid, sig):
+            killpg_calls.append((pid, sig))
+
+        with mock_patch.object(ccs.os, "killpg", side_effect=fake_killpg):
+            primary._claude_session.abort = CCS.abort.__get__(primary._claude_session, CCS)
+            AIAgent._abort_request_openai_client(agent, c2, reason="interrupt")
+        assert killpg_calls and killpg_calls[0][0] == 9991
+        assert agent._request_client_cache["poisoned"] is True
