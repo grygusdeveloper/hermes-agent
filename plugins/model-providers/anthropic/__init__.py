@@ -43,7 +43,11 @@ class AnthropicProfile(ProviderProfile):
 
 anthropic = AnthropicProfile(
     name="anthropic",
-    aliases=("claude", "claude-oauth", "claude-code"),
+    # "claude-code" is intentionally NOT an alias here — it is a distinct
+    # external-process provider (stream-json Claude Code CLI) registered in
+    # hermes_cli.auth.PROVIDER_REGISTRY.  Historical "claude-code" → anthropic
+    # aliasing is broken by identity-mapping in resolve_provider.
+    aliases=("claude", "claude-oauth"),
     api_mode="anthropic_messages",
     env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
     base_url="https://api.anthropic.com",

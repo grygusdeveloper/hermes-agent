@@ -9736,6 +9736,38 @@ def _copilot_acp_status() -> Dict[str, Any]:
     }
 
 
+def _claude_code_status() -> Dict[str, Any]:
+    """Status for claude-code — credentials are owned by the Claude Code CLI.
+
+    Hermes never reads or stores Claude Code credentials.  Status is based
+    solely on whether the local ``claude`` binary is resolvable.
+    """
+    try:
+        from hermes_cli.auth import get_external_process_provider_status
+
+        status = get_external_process_provider_status("claude-code")
+        configured = bool(status.get("configured"))
+        return {
+            "logged_in": configured,
+            "source": "claude_code_cli",
+            "source_label": "Managed by the Claude Code CLI",
+            "token_preview": None,
+            "expires_at": None,
+            "has_refresh_token": False,
+            "command": status.get("resolved_command") or status.get("command"),
+            "base_url": status.get("base_url"),
+        }
+    except Exception:
+        return {
+            "logged_in": False,
+            "source": "claude_code_cli",
+            "source_label": "Managed by the Claude Code CLI",
+            "token_preview": None,
+            "expires_at": None,
+            "has_refresh_token": False,
+        }
+
+
 # Explicit, hand-tuned OAuth/account provider cards. These carry the bits that
 # can't be derived from the unified provider catalog: the OAuth ``flow`` shape,
 # the per-provider ``status_fn``, the ``cli_command`` fallback, and curated
@@ -9805,6 +9837,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "cli_command": "copilot /login",
         "docs_url": "https://docs.github.com/en/copilot",
         "status_fn": _copilot_acp_status,
+    },
+    {
+        "id": "claude-code",
+        "name": "Claude Code CLI",
+        "flow": "external",
+        "cli_command": "claude /login",
+        "docs_url": "https://docs.anthropic.com/en/docs/claude-code",
+        "status_fn": _claude_code_status,
     },
     # ── Anthropic / Claude entries sit at the bottom: the API-key path
     # first, then the subscription OAuth path (which only works with extra
