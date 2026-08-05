@@ -318,6 +318,26 @@ class TestClaudeCodeSession:
         assert captured["kwargs"]["stdin"] is not None
         assert captured["kwargs"]["start_new_session"] is True
 
+    def test_large_prompt_travels_on_stdin_not_rejected_as_flag(self, monkeypatch):
+        """Regression: prompt body must not hit argv MAX_ARG_STRLEN guard."""
+        session = ClaudeCodeSession()
+        big = "X" * 130_000
+        calls: list[dict] = []
+
+        def fake_execute(prompt_text, **kwargs):
+            calls.append({"prompt": prompt_text, **kwargs})
+            return "ok", "", "12345678-1234-1234-1234-123456789abc"
+
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        response, _ = session.run(
+            big,
+            messages=[{"role": "user", "content": "hi"}],
+            model="sonnet",
+        )
+        assert response == "ok"
+        assert calls[0]["prompt"] == big
+        assert len(calls[0]["prompt"]) == 130_000
+
 
 class TestClaudeCodeClient:
     def test_identity_marker(self):

@@ -476,8 +476,10 @@ class ClaudeCodeSession:
                             )
                         return response, reasoning
 
+            # Prompt body travels over stdin — do NOT apply argv flag-size
+            # limits to it.  Only short CLI flags are size-checked in _execute.
             response, reasoning, session_id = self._execute(
-                _validate_flag_size(prompt_text),
+                prompt_text,
                 session_id=None,
                 model=model,
                 effort=effort,
