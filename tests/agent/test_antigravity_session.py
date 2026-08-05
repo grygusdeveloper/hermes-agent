@@ -977,3 +977,115 @@ def test_abort_then_next_call_succeeds_normally(monkeypatch):
     assert len(calls) > 1
     assert response == "ok"
     assert conversation_id == f"cid-{len(calls)}"
+
+
+def test_status_error_with_valid_response_is_treated_as_success(monkeypatch):
+    """AGY sometimes returns status=ERROR even when the model produced valid
+    output (e.g. a tool-call block).  If the response field has content and a
+    valid conversation_id, treat it as success instead of killing the turn."""
+    conversation = AntigravityConversation()
+    payload = json.dumps(
+        {
+            "status": "ERROR",
+            "response": '<tool_call>\n{"name": "terminal", "arguments": {"command": "ls"}}\n</tool_call>',
+            "conversation_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "reasoning": "",
+        }
+    )
+    process = SimpleNamespace(
+        pid=12345,
+        returncode=0,
+        communicate=Mock(return_value=(payload, "")),
+    )
+    monkeypatch.setattr(
+        "agent.antigravity_session.subprocess.Popen", Mock(return_value=process)
+    )
+
+    response, reasoning, cid = conversation._execute(
+        "hello",
+        conversation_id=None,
+        model="gemini",
+        effort="high",
+        timeout_seconds=2,
+        cwd=None,
+        env=None,
+    )
+    assert "<tool_call>" in response
+    assert cid == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+
+def test_status_error_with_empty_response_still_fails(monkeypatch):
+    """If AGY returns status=ERROR with no response content, it must still
+    raise — we only salvage when there is actual model output."""
+    conversation = AntigravityConversation()
+    payload = json.dumps(
+        {"status": "ERROR", "response": "", "conversation_id": None}
+    )
+    process = SimpleNamespace(
+        pid=12345,
+        returncode=0,
+        communicate=Mock(return_value=(payload, "")),
+    )
+    monkeypatch.setattr(
+        "agent.antigravity_session.subprocess.Popen", Mock(return_value=process)
+    )
+
+    with pytest.raises(RuntimeError, match="status 'ERROR'"):
+        conversation._execute(
+            "hello",
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )
+
+
+def test_exit_nonzero_with_empty_stderr_captures_stdout(monkeypatch):
+    """When AGY exits non-zero with empty stderr, the error detail should
+    include stdout content instead of a bare 'exit 1'."""
+    conversation = AntigravityConversation()
+    process = SimpleNamespace(
+        pid=12345,
+        returncode=1,
+        communicate=Mock(return_value=('{"error": "auth expired"}', "")),
+    )
+    monkeypatch.setattr(
+        "agent.antigravity_session.subprocess.Popen", Mock(return_value=process)
+    )
+
+    with pytest.raises(RuntimeError, match="auth expired"):
+        conversation._execute(
+            "hello",
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )
+
+
+def test_exit_nonzero_with_stderr_uses_stderr(monkeypatch):
+    """When stderr has content, it should still be the primary detail source."""
+    conversation = AntigravityConversation()
+    process = SimpleNamespace(
+        pid=12345,
+        returncode=1,
+        communicate=Mock(return_value=('{"unused": true}', "Error: rate limited")),
+    )
+    monkeypatch.setattr(
+        "agent.antigravity_session.subprocess.Popen", Mock(return_value=process)
+    )
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        conversation._execute(
+            "hello",
+            conversation_id=None,
+            model="gemini",
+            effort="high",
+            timeout_seconds=2,
+            cwd=None,
+            env=None,
+        )

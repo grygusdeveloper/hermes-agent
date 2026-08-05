@@ -675,7 +675,12 @@ class AntigravityConversation:
             raise RuntimeError("AGY prompt timed out") from exc
 
         if process.returncode != 0:
-            detail = stderr.strip()[-1000:] if stderr else f"exit {process.returncode}"
+            detail = stderr.strip()[-1000:] if stderr else ""
+            if not detail:
+                # AGY sometimes exits non-zero with empty stderr but useful
+                # diagnostic text on stdout (e.g. JSON error envelope).
+                stdout_preview = stdout.strip()[-1000:] if stdout else ""
+                detail = stdout_preview or f"exit {process.returncode}"
             if conversation_id and _is_expired_conversation_error(detail):
                 raise AntigravityConversationExpired(f"AGY failed: {detail}")
             raise RuntimeError(f"AGY failed: {detail}")
@@ -686,7 +691,25 @@ class AntigravityConversation:
         if not isinstance(payload, dict):
             raise RuntimeError("AGY returned non-object JSON")
         if str(payload.get("status") or "") != "SUCCESS":
-            detail = str(payload.get("response") or "")[:300]
+            response_text = str(payload.get("response") or "").strip()
+            # AGY sometimes returns status=ERROR even when the model produced
+            # valid output (e.g. a tool-call block).  If the response field
+            # contains actual content, treat it as success rather than killing
+            # the turn — the model did answer.
+            if response_text and isinstance(
+                payload.get("conversation_id"), str
+            ):
+                response = response_text
+                reasoning = str(
+                    payload.get("reasoning")
+                    or payload.get("thinking")
+                    or ""
+                ).strip()
+                raw_conversation_id = payload.get("conversation_id")
+                conversation_id = str(raw_conversation_id).strip()
+                if _CONVERSATION_ID_RE.fullmatch(conversation_id):
+                    return response, reasoning, conversation_id
+            detail = response_text[:300] or str(payload)[:300]
             if conversation_id and _is_expired_conversation_error(detail):
                 raise AntigravityConversationExpired(
                     f"AGY returned status {payload.get('status')!r}: {detail}"
