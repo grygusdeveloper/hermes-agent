@@ -375,9 +375,60 @@ class ClaudeCodeSessionExpired(RuntimeError):
     """Claude Code positively identified a missing/invalid/expired session."""
 
 
+class ClaudeCodeSoftLimitNotice(RuntimeError):
+    """Claude Code returned a soft billing/limit notice as successful content.
+
+    This is a *warning*, not a hard transport failure. Callers should retry the
+    same turn rather than treating the notice text as the model answer.
+    """
+
+
+# Soft notices Claude Code may emit as a normal successful ``result`` string.
+# Observed live: "You've hit your monthly spend limit · raise it at
+# claude.ai/settings/usage" while rate_limit_info still reports allowed.
+_SOFT_LIMIT_MARKERS = (
+    "you've hit your monthly spend limit",
+    "hit your monthly spend limit",
+    "monthly spend limit",
+    "raise it at claude.ai/settings/usage",
+    "claude.ai/settings/usage",
+    "out of extra usage",
+    "you're out of extra usage",
+    "usage limit reached",
+    "hit your usage limit",
+    "rate limit reached",
+    "too many requests",
+)
+
+
 def _is_expired_session_error(detail: str) -> bool:
     normalized = detail.lower()
     return any(marker in normalized for marker in _EXPIRED_SESSION_MARKERS)
+
+
+def _is_soft_limit_notice(text: str) -> bool:
+    """Return True when CLI result text is a soft limit/billing notice.
+
+    Only match short, notice-like replies so normal answers that merely
+    *mention* usage settings are not treated as failures.
+    """
+
+    body = (text or "").strip()
+    if not body:
+        return False
+    # Real model answers are rarely pure one-line billing banners.
+    if len(body) > 600:
+        return False
+    normalized = body.lower()
+    if not any(marker in normalized for marker in _SOFT_LIMIT_MARKERS):
+        return False
+    # Prefer high-confidence patterns: short banner-like lines.
+    line_count = body.count("\n") + 1
+    if line_count <= 4:
+        return True
+    # Multi-line but almost entirely the notice (no substantial extra prose).
+    non_empty = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    return len(non_empty) <= 6
 
 
 def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -616,7 +667,7 @@ class ClaudeCodeSession:
                 incremental = _incremental_prompt(messages, previous_count)
                 if incremental:
                     try:
-                        response, reasoning, session_id = self._execute(
+                        response, reasoning, session_id = self._execute_with_soft_limit_retry(
                             incremental,
                             session_id=self._session_id,
                             model=model,
@@ -660,7 +711,7 @@ class ClaudeCodeSession:
 
             # Prompt body travels over stdin — do NOT apply argv flag-size
             # limits to it.  Only short CLI flags are size-checked in _execute.
-            response, reasoning, session_id = self._execute(
+            response, reasoning, session_id = self._execute_with_soft_limit_retry(
                 prompt_text,
                 session_id=None,
                 model=model,
@@ -689,6 +740,81 @@ class ClaudeCodeSession:
                     tools_digest=normalized_tools,
                 )
             return response, reasoning
+
+    def _execute_with_soft_limit_retry(
+        self,
+        prompt_text: str,
+        *,
+        session_id: str | None,
+        model: str,
+        effort: str | None,
+        timeout_seconds: float,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        command: str | None = None,
+        on_text_chunk: Any = None,
+        max_attempts: int = 3,
+    ) -> tuple[str, str, str]:
+        """Run one CLI request, retrying soft limit/billing notices.
+
+        Soft notices are *not* answers. Retry the same payload (same resume
+        session when provided) with short backoff. Only after retries exhaust
+        raise a clear provider error for Hermes to surface.
+
+        Streaming is deferred until a non-notice answer is confirmed so a
+        soft-limit banner can never become the live Discord answer.
+        """
+
+        last_notice = ""
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                response, reasoning, sid = self._execute(
+                    prompt_text,
+                    session_id=session_id,
+                    model=model,
+                    effort=effort,
+                    timeout_seconds=timeout_seconds,
+                    cwd=cwd,
+                    env=env,
+                    command=command,
+                    # Never live-stream until the attempt is validated.
+                    on_text_chunk=None,
+                )
+            except ClaudeCodeSoftLimitNotice as exc:
+                last_notice = str(exc)
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        "Claude Code CLI returned a soft usage/limit notice "
+                        f"after {attempts} attempts (not treated as an answer). "
+                        f"Detail: {last_notice[:400]}"
+                    ) from exc
+                time.sleep(min(2.0 * attempt, 6.0))
+                continue
+
+            if _is_soft_limit_notice(response):
+                last_notice = response.strip()
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        "Claude Code CLI returned a soft usage/limit notice "
+                        f"after {attempts} attempts (not treated as an answer). "
+                        f"Detail: {last_notice[:400]}"
+                    )
+                time.sleep(min(2.0 * attempt, 6.0))
+                continue
+
+            # Confirmed non-notice answer — emit once for stream consumers.
+            if on_text_chunk is not None and response:
+                try:
+                    on_text_chunk(response)
+                except Exception:
+                    pass
+            return response, reasoning, sid
+
+        raise RuntimeError(
+            "Claude Code CLI soft usage/limit notice after retries. "
+            f"Detail: {last_notice[:400]}"
+        )
 
     def _execute(
         self,

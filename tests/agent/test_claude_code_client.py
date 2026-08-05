@@ -1226,3 +1226,69 @@ class TestOpusDeepReviewFixes:
         a = ClaudeCodeClient(cwd="/tmp")
         b = ClaudeCodeClient(cwd="/tmp")
         assert a._claude_session is not b._claude_session
+
+
+class TestClaudeCodeSoftLimitRetry:
+    def test_is_soft_limit_notice_detects_banner(self):
+        from agent.claude_code_session import _is_soft_limit_notice
+
+        assert _is_soft_limit_notice(
+            "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
+        )
+        assert _is_soft_limit_notice("You're out of extra usage. Add more at claude.ai/settings/usage")
+        assert not _is_soft_limit_notice("LIMIT_PROBE_OK")
+        assert not _is_soft_limit_notice(
+            "Here is a long answer about budgeting and monthly spend limit strategies "
+            "for product teams that is clearly not a CLI banner. " * 5
+        )
+
+    def test_soft_limit_retries_then_succeeds(self, monkeypatch):
+        session = ClaudeCodeSession()
+        calls = {"n": 0}
+        notice = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
+
+        def fake_execute(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return notice, "", "12345678-1234-1234-1234-123456789abc"
+            return "real answer", "", "12345678-1234-1234-1234-123456789abc"
+
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
+        chunks = []
+        response, reasoning, sid = session._execute_with_soft_limit_retry(
+            "prompt",
+            session_id=None,
+            model="claude-opus-5",
+            effort="high",
+            timeout_seconds=30,
+            cwd="/tmp",
+            env={},
+            on_text_chunk=chunks.append,
+            max_attempts=3,
+        )
+        assert calls["n"] == 2
+        assert response == "real answer"
+        assert chunks == ["real answer"]
+        assert sid.endswith("789abc")
+
+    def test_soft_limit_exhausted_raises_visible_error(self, monkeypatch):
+        session = ClaudeCodeSession()
+        notice = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
+
+        def fake_execute(*args, **kwargs):
+            return notice, "", "12345678-1234-1234-1234-123456789abc"
+
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
+        with pytest.raises(RuntimeError, match="soft usage/limit notice"):
+            session._execute_with_soft_limit_retry(
+                "prompt",
+                session_id=None,
+                model="claude-opus-5",
+                effort="high",
+                timeout_seconds=30,
+                cwd="/tmp",
+                env={},
+                max_attempts=3,
+            )
