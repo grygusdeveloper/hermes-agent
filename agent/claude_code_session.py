@@ -1012,6 +1012,16 @@ class ClaudeCodeSession:
             # under Hermes logging, permissions, MCP, and approvals.
             "--tools",
             "",
+            # Suppress ALL MCP server connectors (claude.ai Gmail/Calendar/Drive,
+            # .mcp.json servers, etc.).  Without this, ``--tools ""`` only disables
+            # built-in tools — MCP servers still load and their tool schemas leak
+            # into the model's function-calling surface, causing the model to lose
+            # access to Hermes's own prompt-injected tools mid-session.
+            # ``--strict-mcp-config`` ensures ONLY ``--mcp-config`` is consulted,
+            # ignoring all other MCP configuration sources.
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
         ]
         if effort:
             argv += ["--effort", _validate_flag_size(str(effort))]
