@@ -60,6 +60,9 @@ def test_claude_code_prompt_requires_efficient_tool_only_turns():
     assert "Do not add narration before or after tool calls" in prompt
     assert "Independent calls may be emitted together" in prompt
     assert "every tool listed below remains available" in prompt
+    assert "natural, thoughtful collaborator" in prompt
+    assert "do not default to an audit-report voice" in prompt
+    assert "bold mini-heading" in prompt
 
 
 def test_progress_retry_continues_same_session_instead_of_replaying(monkeypatch):
@@ -107,3 +110,14 @@ def test_tool_digest_ignores_registry_order():
         "function": {"name": "beta", "parameters": {"type": "object"}},
     }
     assert _tools_digest([first, second]) == _tools_digest([second, first])
+
+
+def test_backend_system_prompt_replaces_coding_audit_persona():
+    from agent.claude_code_session import _HERMES_BACKEND_SYSTEM_PROMPT
+
+    assert "general-purpose" in _HERMES_BACKEND_SYSTEM_PROMPT
+    assert "personal\nassistant" in _HERMES_BACKEND_SYSTEM_PROMPT
+    assert "Match the user's" in _HERMES_BACKEND_SYSTEM_PROMPT
+    assert "not\na compliance form" in _HERMES_BACKEND_SYSTEM_PROMPT
+    assert "code-review template" in _HERMES_BACKEND_SYSTEM_PROMPT
+    assert "Hermes lists the tools available" in _HERMES_BACKEND_SYSTEM_PROMPT

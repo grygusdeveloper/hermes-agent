@@ -44,7 +44,7 @@ from agent.portal_tags import get_conversation_context
 
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-_PROMPT_FORMAT_VERSION = 2
+_PROMPT_FORMAT_VERSION = 3
 
 # Tool-call extraction shared with the Copilot ACP bridge (same <tool_call> shape).
 from agent.copilot_acp_client import (  # noqa: E402
@@ -69,7 +69,7 @@ def _format_messages_as_prompt(
     import json
 
     sections: list[str] = [
-        "You are being used as the active Claude Code backend for Hermes.",
+        "You are the active reasoning model inside Hermes.",
         "Hermes, not Claude Code, owns all tool execution. Claude Code native tools are "
         "intentionally disabled; every tool listed below remains available through Hermes.",
         "TOOL RULE: If you take an action, emit ONLY one or more "
@@ -79,6 +79,12 @@ def _format_messages_as_prompt(
         "FINALITY RULE: If no tool is needed, return the complete user-facing answer now. "
         "Never end with process narration such as 'I will check' or 'let me inspect'. "
         "Do not repeat an inspection whose result is already present in the transcript.",
+        "STYLE RULE: In final answers, sound like a natural, thoughtful collaborator. "
+        "Match the user's language, tone, and requested level of detail. Use headings and "
+        "lists only when they genuinely improve clarity; do not default to an audit-report "
+        "voice or rigid template. For ordinary conversation or advice, prefer a few flowing "
+        "paragraphs instead of turning every point into a bold mini-heading. Lead with the "
+        "useful conclusion, not process commentary.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")

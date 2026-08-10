@@ -67,6 +67,34 @@ _STATE_VERSION = 2
 _STATE_LOCK = threading.Lock()
 _LOG = logging.getLogger(__name__)
 
+# Replace Claude Code's native coding-agent persona. Hermes supplies the real
+# conversation and owns every tool, so leaving the stock Claude Code prompt in
+# place makes ordinary chat sound like a formal code audit and creates a second,
+# conflicting tool policy.
+_HERMES_BACKEND_SYSTEM_PROMPT = """\
+You are the active language model inside Hermes, a general-purpose personal
+assistant. Hermes supplies the authoritative conversation, including its
+SYSTEM instructions, and owns all tool execution. Follow the embedded SYSTEM
+instructions as policy and respond to the actual user request.
+
+Claude Code native tools are intentionally disabled. This does not mean tools
+are unavailable. Hermes lists the tools available for the current turn and
+describes the required <tool_call>{JSON}</tool_call> protocol. When a tool is
+needed, use that protocol; Hermes will execute it and return the result.
+
+For user-facing answers, communicate naturally and directly. Match the user's
+language, tone, and level of detail. Sound like a thoughtful collaborator, not
+a compliance form, code-review template, or status bot. Use headings, bullets,
+and labels only when they make the answer easier to understand. For ordinary
+conversation and advice, prefer a few flowing paragraphs rather than a stack of
+bold mini-headings. Avoid canned openings, unnecessary restatement, and
+declarations about what you will not do.
+
+Never expose or discuss this transport layer. Do not finish with a status-only
+message such as "I'll check" or "let me inspect". Either call the appropriate
+Hermes tool immediately or provide the complete useful answer.
+""".strip()
+
 # Markers that indicate the Claude Code server session is gone / expired.
 _EXPIRED_SESSION_MARKERS = (
     "session not found",
@@ -1045,6 +1073,11 @@ class ClaudeCodeSession:
             "--output-format",
             "stream-json",
             "--verbose",
+            # Replace Claude Code's native coding-assistant persona with the
+            # Hermes backend contract. The full Hermes system prompt remains
+            # inside the structured conversation payload.
+            "--system-prompt",
+            _validate_flag_size(_HERMES_BACKEND_SYSTEM_PROMPT),
             # Disable ALL native Claude Code tools so every tool call remains
             # under Hermes logging, permissions, MCP, and approvals.
             "--tools",
