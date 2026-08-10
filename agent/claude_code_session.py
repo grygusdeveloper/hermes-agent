@@ -41,6 +41,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import signal
@@ -64,6 +65,7 @@ _SESSION_ID_RE = re.compile(
 _MESSAGE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _STATE_VERSION = 2
 _STATE_LOCK = threading.Lock()
+_LOG = logging.getLogger(__name__)
 
 # Markers that indicate the Claude Code server session is gone / expired.
 _EXPIRED_SESSION_MARKERS = (
@@ -476,6 +478,13 @@ _INCOMPLETE_PREAMBLE_STARTERS = (
     "i will do ",
 )
 
+_PROGRESS_CONTINUATION_PROMPT = """\
+Continue the previous request now. Your last reply was only a progress/status
+statement, not a completed answer. Do not repeat the plan. If information or
+an action is needed, immediately emit the appropriate Hermes <tool_call> block.
+Otherwise return the complete user-facing result now.
+""".strip()
+
 
 def _is_incomplete_preamble_response(
     text: str,
@@ -619,6 +628,14 @@ class ClaudeCodeSession:
         self._active_process: subprocess.Popen[str] | None = None
         self._abort_requested = False
         self._request_active = False
+        self._last_usage: dict[str, Any] = {}
+
+    @property
+    def last_usage(self) -> dict[str, Any]:
+        """Normalized usage from the most recent successful Claude Code result."""
+
+        with self._lock:
+            return dict(self._last_usage)
 
     def reset(self) -> None:
         with self._lock:
@@ -630,6 +647,7 @@ class ClaudeCodeSession:
             self._bound_model = None
             self._bound_effort = None
             self._bound_tools_digest = ""
+            self._last_usage = {}
 
     def abort(self) -> None:
         """Terminate the in-flight Claude Code process group without waiting.
@@ -716,6 +734,7 @@ class ClaudeCodeSession:
         normalized_effort = effort.strip() if isinstance(effort, str) and effort.strip() else None
         normalized_tools = tools_digest if isinstance(tools_digest, str) else ""
         with self._lock, _durable_transition_lock(state_key):
+            self._last_usage = {}
             # Always reload durable state under the lease before dispatch so a
             # long-lived owner cannot publish a divergent branch after another
             # process advanced the same conversation.
@@ -757,6 +776,16 @@ class ClaudeCodeSession:
                 and len(current) > previous_count
                 and current[:previous_count] == self._previous_messages
             )
+            if self._session_id and not can_resume:
+                _LOG.info(
+                    "Claude Code resume skipped: identity_match=%s prefix_match=%s "
+                    "history_advanced=%s previous_messages=%d current_messages=%d",
+                    identity_matches,
+                    current[:previous_count] == self._previous_messages,
+                    len(current) > previous_count,
+                    previous_count,
+                    len(current),
+                )
             if can_resume:
                 incremental = _incremental_prompt(messages, previous_count)
                 if incremental:
@@ -864,12 +893,14 @@ class ClaudeCodeSession:
         """
 
         last_notice = ""
+        next_prompt = prompt_text
+        next_session_id = session_id
         attempts = max(1, int(max_attempts))
         for attempt in range(1, attempts + 1):
             try:
                 response, reasoning, sid = self._execute(
-                    prompt_text,
-                    session_id=session_id,
+                    next_prompt,
+                    session_id=next_session_id,
                     model=model,
                     effort=effort,
                     timeout_seconds=timeout_seconds,
@@ -916,7 +947,13 @@ class ClaudeCodeSession:
                         f"text after {attempts} attempts (not treated as an "
                         f"answer). Detail: {last_notice[:400]}"
                     )
-                time.sleep(min(1.0 * attempt, 3.0))
+                # Continue the session that produced the preamble. Replaying
+                # the complete payload would create another paid Claude turn
+                # and can duplicate work already performed by the model.
+                next_session_id = _require_uuid_session_id(
+                    sid, where="progress-continuation"
+                )
+                next_prompt = _PROGRESS_CONTINUATION_PROMPT
                 continue
 
             # Confirmed non-notice answer — emit once for stream consumers.
@@ -1207,6 +1244,7 @@ class ClaudeCodeSession:
 
         try:
             response, reasoning, result_session_id = _parse_stream_json_output(stdout)
+            self._last_usage = _parse_stream_json_usage(stdout)
         except ClaudeCodeSessionExpired:
             raise
         except RuntimeError as exc:
@@ -1353,3 +1391,54 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
     response = result_text if result_text.strip() else streamed
     reasoning = "".join(reasoning_parts)
     return response, reasoning, result_session_id
+
+
+def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
+    """Normalize token and cost telemetry from the terminal result event.
+
+    Anthropic reports uncached input, cache creation, and cache reads as
+    separate counters. OpenAI-compatible consumers expect ``prompt_tokens``
+    to include all three and expose the cache-read subset separately.
+    """
+
+    result: dict[str, Any] | None = None
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event
+    if not result or result.get("is_error") is not False:
+        return {}
+    raw = result.get("usage")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def count(name: str) -> int:
+        value = raw.get(name)
+        return max(0, int(value)) if isinstance(value, (int, float)) else 0
+
+    input_tokens = count("input_tokens")
+    output_tokens = count("output_tokens")
+    cache_write_tokens = count("cache_creation_input_tokens")
+    cached_tokens = count("cache_read_input_tokens")
+    prompt_tokens = input_tokens + cache_write_tokens + cached_tokens
+    service_tier = raw.get("service_tier")
+    total_cost = result.get("total_cost_usd")
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cached_tokens": cached_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+        "total_cost_usd": float(total_cost) if isinstance(total_cost, (int, float)) else None,
+        "service_tier": service_tier if isinstance(service_tier, str) else None,
+        "duration_ms": result.get("duration_ms"),
+        "duration_api_ms": result.get("duration_api_ms"),
+    }

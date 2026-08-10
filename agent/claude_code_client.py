@@ -44,6 +44,7 @@ from agent.portal_tags import get_conversation_context
 
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+_PROMPT_FORMAT_VERSION = 2
 
 # Tool-call extraction shared with the Copilot ACP bridge (same <tool_call> shape).
 from agent.copilot_acp_client import (  # noqa: E402
@@ -69,9 +70,15 @@ def _format_messages_as_prompt(
 
     sections: list[str] = [
         "You are being used as the active Claude Code backend for Hermes.",
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using "
-        "<tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
-        "If no tool is needed, answer normally.",
+        "Hermes, not Claude Code, owns all tool execution. Claude Code native tools are "
+        "intentionally disabled; every tool listed below remains available through Hermes.",
+        "TOOL RULE: If you take an action, emit ONLY one or more "
+        "<tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape. "
+        "Do not add narration before or after tool calls. Independent calls may be emitted "
+        "together to reduce round trips.",
+        "FINALITY RULE: If no tool is needed, return the complete user-facing answer now. "
+        "Never end with process narration such as 'I will check' or 'let me inspect'. "
+        "Do not repeat an inspection whose result is already present in the transcript.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
@@ -97,7 +104,7 @@ def _format_messages_as_prompt(
         if tool_specs:
             sections.append(
                 "Available tools (OpenAI function schema). "
-                "When using a tool, emit ONLY <tool_call>{...}</tool_call> with one JSON object "
+                "For each tool call, emit <tool_call>{...}</tool_call> with one JSON object "
                 "containing id/type/function{name,arguments}. arguments must be a JSON string.\n"
                 + json.dumps(tool_specs, ensure_ascii=False)
             )
@@ -308,12 +315,7 @@ class ClaudeCodeClient:
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = _completion_usage(self._claude_session.last_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -505,12 +507,7 @@ class ClaudeCodeClient:
             yield SimpleNamespace(
                 choices=[],
                 model=model,
-                usage=SimpleNamespace(
-                    prompt_tokens=0,
-                    completion_tokens=0,
-                    total_tokens=0,
-                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-                ),
+                usage=_completion_usage(self._claude_session.last_usage),
             )
         finally:
             thread.join(timeout=5)
@@ -558,13 +555,48 @@ def _tools_digest(
         if not isinstance(tool, dict):
             continue
         specs.append(_normalize(tool))
+    # Tool registry order can vary across gateway turns even when the actual
+    # capability set is identical. Order is not semantically meaningful, so
+    # canonicalize it to avoid throwing away a warm Claude session.
+    specs.sort(
+        key=lambda item: _json.dumps(
+            item, separators=(",", ":"), ensure_ascii=True, sort_keys=True
+        )
+    )
     payload = {
-        "format_version": 1,
+        "format_version": _PROMPT_FORMAT_VERSION,
         "tools": specs,
         "tool_choice": _normalize(tool_choice),
     }
     canonical = _json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _completion_usage(raw: dict[str, Any] | None) -> Any:
+    """Expose Claude Code result usage through the OpenAI-compatible facade."""
+
+    usage = raw or {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    cached_tokens = int(usage.get("cached_tokens") or 0)
+    cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=int(usage.get("total_tokens") or (prompt_tokens + completion_tokens)),
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+        ),
+        cache_read_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_read_input_tokens=cached_tokens,
+        cache_creation_input_tokens=cache_write_tokens,
+        input_tokens=int(usage.get("input_tokens") or 0),
+        output_tokens=int(usage.get("output_tokens") or completion_tokens),
+        total_cost_usd=usage.get("total_cost_usd"),
+        service_tier=usage.get("service_tier"),
+    )
 
 
 def _resolve_effort_from_kwargs(kwargs: dict[str, Any]) -> str | None:
