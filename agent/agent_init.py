@@ -2100,8 +2100,8 @@ def init_agent(
     # Native OpenAI Responses server-side compaction (opt-in). Only ever
     # engages for gpt-5.6-family models on api.openai.com or the ChatGPT
     # Codex backend — the per-request gate lives in agent/native_compaction.py.
-    codex_responses_native_compaction = bool(
-        _compression_cfg.get("codex_responses_native", False)
+    codex_responses_native_compaction = is_truthy_value(
+        _compression_cfg.get("codex_responses_native"), default=False
     )
     _native_threshold_raw = _compression_cfg.get(
         "codex_responses_compact_threshold", 200_000

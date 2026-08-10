@@ -90,6 +90,19 @@ class TestRequestGate:
         )
         assert payload is not None
 
+    def test_codex_backend_flag_cannot_override_incompatible_url(self):
+        for url in (
+            "https://openrouter.ai/api/v1",
+            "https://chatgpt.com/backend-api/not-codex",
+            "https://chatgpt.com.evil.example/backend-api/codex",
+            "http://chatgpt.com/backend-api/codex",
+        ):
+            payload = native_compaction_context_management(
+                _agent(base_url=url),
+                is_codex_backend=True,
+            )
+            assert payload is None, url
+
     def test_disabled_by_default_config_value(self):
         assert (
             native_compaction_context_management(
@@ -336,6 +349,43 @@ class TestResponseCapture:
 
 
 class TestAgentInitConfig:
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            (False, False),
+            ("false", False),
+            ("off", False),
+            ("0", False),
+            (True, True),
+            ("true", True),
+            ("on", True),
+            ("1", True),
+        ],
+    )
+    def test_native_compaction_config_uses_truthy_parser(
+        self, monkeypatch, configured, expected
+    ):
+        from hermes_cli import config as config_module
+        from run_agent import AIAgent
+
+        monkeypatch.setattr(
+            config_module,
+            "load_config_readonly",
+            lambda: {"compression": {"codex_responses_native": configured}},
+        )
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.openai.com/v1",
+            api_mode="codex_responses",
+            model="gpt-5.6",
+            provider="openai-api",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=[],
+        )
+        assert agent.codex_responses_native_compaction is expected
+
     def test_defaults_off_and_threshold(self, monkeypatch):
         from run_agent import AIAgent
 
@@ -397,6 +447,24 @@ class TestAgentInitConfig:
             api_mode="codex_responses",
             model="gpt-5.1",
             provider="openai-api",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=[],
+        )
+        agent.codex_responses_native_compaction = True
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "context_management" not in kwargs
+
+    def test_kwargs_omit_field_for_codex_label_on_incompatible_url(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="codex_responses",
+            model="gpt-5.6",
+            provider="openai-codex",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,

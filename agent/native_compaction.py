@@ -9,6 +9,9 @@ as an input item on later requests stands in for the pruned history, so the
 model keeps long-horizon recall without the client ever seeing a summary.
 Docs: https://developers.openai.com/api/docs/guides/compaction
 
+This is OpenAI's automatic in-request ``context_management`` mechanism, not
+the separate explicit ``responses.compact()`` / ``/responses/compact`` call.
+
 Hermes' support is deliberately narrow (live verification, Aug 2026):
 
 * **gpt-5.6 family only.** gpt-5.6 and its variants compact correctly.
@@ -63,13 +66,24 @@ def is_direct_openai_route(
     is_codex_backend: bool = False,
 ) -> bool:
     """True for api.openai.com or the ChatGPT Codex backend — nothing else."""
-    if is_codex_backend:
-        return True
     try:
-        hostname = (urlsplit(base_url or "").hostname or "").lower()
+        parsed = urlsplit(base_url or "")
     except ValueError:
         return False
-    return hostname == "api.openai.com"
+    if parsed.scheme.lower() != "https":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if hostname == "api.openai.com":
+        return True
+    codex_path = parsed.path.rstrip("/")
+    return bool(
+        is_codex_backend
+        and hostname == "chatgpt.com"
+        and (
+            codex_path == "/backend-api/codex"
+            or codex_path.startswith("/backend-api/codex/")
+        )
+    )
 
 
 def resolve_compact_threshold(
