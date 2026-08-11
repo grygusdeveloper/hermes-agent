@@ -1960,11 +1960,17 @@ class GatewaySlashCommandsMixin:
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
-                        if persist_global and result.reasoning_effort:
-                            return (
-                                "Reasoning model aliases are session presets. "
-                                "Choose one without `--global`."
-                            )
+                        _persist_selected = persist_global
+                        if result.reasoning_effort:
+                            if is_global_flag:
+                                return (
+                                    "Reasoning model aliases are session presets. "
+                                    "Choose one without `--global`."
+                                )
+                            # Legacy persist-by-default must not make a normal
+                            # alias pick fail or collapse the preset to a bare
+                            # model ID. Reasoning aliases are session-scoped.
+                            _persist_selected = False
 
                         try:
                             from hermes_cli.context_switch_guard import (
@@ -2084,10 +2090,10 @@ class GatewaySlashCommandsMixin:
                         # stale cache signature to trigger a rebuild.
                         _self._evict_cached_agent(_session_key)
 
-                        # Persist to config (default) unless --session opted out,
+                        # Persist unless explicitly or preset-policy session-scoped,
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
-                        if persist_global:
+                        if _persist_selected:
                             try:
                                 # Write-back round-trip: raw read is correct
                                 # (merged defaults must not be persisted).
@@ -2187,7 +2193,7 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if _persist_selected:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
@@ -2278,11 +2284,14 @@ class GatewaySlashCommandsMixin:
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
-        if persist_global and result.reasoning_effort:
-            return (
-                "Reasoning model aliases are session presets. "
-                "Choose one without `--global`."
-            )
+        _persist_selected = persist_global
+        if result.reasoning_effort:
+            if is_global_flag:
+                return (
+                    "Reasoning model aliases are session presets. "
+                    "Choose one without `--global`."
+                )
+            _persist_selected = False
 
         try:
             from hermes_cli.context_switch_guard import (
@@ -2420,8 +2429,8 @@ class GatewaySlashCommandsMixin:
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
 
-            # Persist to config (default) unless --session opted out
-            if persist_global:
+            # Persist unless explicitly or preset-policy session-scoped.
+            if _persist_selected:
                 try:
                     # Write-back round-trip: raw read is correct (merged
                     # defaults must not be persisted back to the user's file).
@@ -2532,7 +2541,7 @@ class GatewaySlashCommandsMixin:
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
-            if persist_global:
+            if _persist_selected:
                 lines.append(t("gateway.model.saved_global"))
             elif one_turn:
                 lines.append("    (next turn only — restores after one response)")

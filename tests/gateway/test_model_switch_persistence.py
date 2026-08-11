@@ -358,3 +358,36 @@ class TestOneTurnNeverPersisted:
         persisted = runner.async_session_store.set_model_override.await_args.args[1]
         assert persisted["reasoning_effort"] == "xhigh"
 
+    @pytest.mark.asyncio
+    async def test_plain_reasoning_alias_forces_session_scope_when_default_persists(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.model_switch import ModelSwitchResult
+
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.model_switch.resolve_persist_behavior",
+            lambda *args, **kwargs: True,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.model_switch.switch_model",
+            lambda **kw: ModelSwitchResult(
+                success=True,
+                new_model="gpt-5.6-sol",
+                target_provider="openai-codex",
+                reasoning_effort="xhigh",
+                provider_label="OpenAI Codex",
+            ),
+        )
+        config_path = tmp_path / ".hermes" / "config.yaml"
+        before = config_path.read_text()
+
+        result = await runner._handle_model_command(
+            self._event("/model sol-xhigh")
+        )
+
+        assert result is not None and "session" in result.lower()
+        assert config_path.read_text() == before
+        persisted = runner.async_session_store.set_model_override.await_args.args[1]
+        assert persisted["reasoning_effort"] == "xhigh"
+
