@@ -1788,7 +1788,13 @@ def switch_model(
                 api_mode = ""  # clear so determine_api_mode re-detects from URL
                 if not api_key:
                     api_key = "no-key-required"
-            if _da.reasoning_effort:
+            # A full model ID can reverse-resolve to one of multiple aliases
+            # targeting the same model. Apply a preset only for an exact alias
+            # input so configuration order cannot silently choose an effort.
+            _exact_alias_input = (
+                str(raw_input or "").strip().lower() == str(resolved_alias).lower()
+            )
+            if _exact_alias_input and _da.reasoning_effort:
                 from hermes_constants import parse_reasoning_effort
 
                 if parse_reasoning_effort(_da.reasoning_effort) is not None:

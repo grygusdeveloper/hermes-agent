@@ -344,6 +344,15 @@ def _model_command_choice_specs(
             raw_spec.get("reasoning_effort") or raw_spec.get("reasoning") or ""
         ).strip().lower()
         if alias_effort:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed_alias_effort = parse_reasoning_effort(alias_effort)
+            alias_effort = (
+                str(parsed_alias_effort.get("effort") or "").strip()
+                if parsed_alias_effort is not None
+                else ""
+            )
+        if alias_effort:
             label += f" · {alias_effort}"
         else:
             reasoning = resolve_reasoning_config(raw_config, model)

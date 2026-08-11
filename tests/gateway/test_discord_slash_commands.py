@@ -191,6 +191,23 @@ def test_model_command_choice_specs_prefers_alias_reasoning_effort():
     ]
 
 
+def test_model_command_invalid_alias_effort_is_not_advertised():
+    config = {
+        "model_aliases": {
+            "broken": {
+                "label": "Broken",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "xhgh",
+            }
+        }
+    }
+
+    assert _model_command_choice_specs(config, "broken") == [
+        ("Broken", "broken"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_model_slash_autocomplete_lists_configured_aliases(adapter):
     adapter._register_slash_commands()

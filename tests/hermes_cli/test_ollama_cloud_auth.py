@@ -162,6 +162,54 @@ class TestDirectAliases:
         assert result.new_model == "gpt-5.6-sol"
         assert result.reasoning_effort == "xhigh"
 
+    def test_full_model_id_does_not_inherit_duplicate_alias_effort(self, monkeypatch):
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(
+            ms,
+            "DIRECT_ALIASES",
+            {
+                "sol-high": ms.DirectAlias(
+                    "gpt-5.6-sol", "openai-codex",
+                    "https://chatgpt.com/backend-api/codex", "high",
+                ),
+                "sol-xhigh": ms.DirectAlias(
+                    "gpt-5.6-sol", "openai-codex",
+                    "https://chatgpt.com/backend-api/codex", "xhigh",
+                ),
+            },
+        )
+        with (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api_mode": "codex_responses",
+                },
+            ),
+            patch(
+                "hermes_cli.models.validate_requested_model",
+                return_value={
+                    "accepted": True, "persist": True,
+                    "recognized": True, "message": None,
+                },
+            ),
+            patch("hermes_cli.model_switch.get_model_info", return_value=None),
+            patch("hermes_cli.model_switch.get_model_capabilities", return_value=None),
+        ):
+            result = ms.switch_model(
+                raw_input="gpt-5.6-sol",
+                current_provider="openai-codex",
+                current_model="gpt-5.6-sol",
+                current_base_url="https://chatgpt.com/backend-api/codex",
+                current_api_key="test-key",
+            )
+
+        assert result.success
+        assert result.new_model == "gpt-5.6-sol"
+        assert not result.reasoning_effort
+
 
 # ---------------------------------------------------------------------------
 # /model command persistence

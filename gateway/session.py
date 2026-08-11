@@ -750,7 +750,12 @@ def build_session_context_prompt(
 # provider resolution) is intentionally excluded: credentials must NEVER be
 # written to sessions.json.  On rehydration after a gateway restart the
 # runner re-resolves credentials via the normal runtime provider resolution.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+PERSISTABLE_MODEL_OVERRIDE_KEYS = (
+    "model",
+    "provider",
+    "base_url",
+    "reasoning_effort",
+)
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -767,6 +772,11 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    if "reasoning_effort" in cleaned:
+        from hermes_constants import parse_reasoning_effort
+
+        if parse_reasoning_effort(cleaned["reasoning_effort"]) is None:
+            cleaned.pop("reasoning_effort", None)
     return cleaned or None
 
 

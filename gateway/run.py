@@ -8475,9 +8475,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session field write — the old lazy ``self._session_reasoning_overrides
         # = {}`` init replaced the WHOLE dict, racing concurrent sessions'
         # overrides; a SessionState field reset cannot cross sessions.
-        self._session_state(session_key).conversation.reasoning_override = (
+        conversation = self._session_state(session_key).conversation
+        conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+        # A direct /reasoning command owns this state. /model aliases claim
+        # ownership explicitly after using this common setter.
+        conversation.reasoning_override_owner = None
+
+    def _apply_model_alias_reasoning_override(
+        self, session_key: str, reasoning_effort: Optional[str]
+    ) -> None:
+        """Install or retire reasoning state owned by a /model alias."""
+        if not session_key:
+            return
+        conversation = self._session_state(session_key).conversation
+        if reasoning_effort:
+            from hermes_constants import parse_reasoning_effort
+
+            reasoning = parse_reasoning_effort(reasoning_effort)
+            if reasoning is not None:
+                self._set_session_reasoning_override(session_key, reasoning)
+                conversation.reasoning_override_owner = "model_alias"
+            return
+        if conversation.reasoning_override_owner == "model_alias":
+            self._set_session_reasoning_override(session_key, None)
 
     def _resolve_session_service_tier(
         self,
@@ -23441,6 +23463,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
+            "reasoning_effort": persisted.get("reasoning_effort"),
         }
         provider = persisted.get("provider")
         if provider:
@@ -23462,6 +23485,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider, exc_info=True,
                 )
         self._session_state(session_key).conversation.model_override = override
+        self._apply_model_alias_reasoning_override(
+            session_key, persisted.get("reasoning_effort")
+        )
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",
@@ -23504,6 +23530,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return {
             "had_override": override is not None,
             "override": dict(override) if override is not None else None,
+            "reasoning_override": (
+                dict(_snap_state.conversation.reasoning_override)
+                if _snap_state is not None
+                and _snap_state.conversation.reasoning_override is not None
+                else None
+            ),
+            "reasoning_override_owner": (
+                _snap_state.conversation.reasoning_override_owner
+                if _snap_state is not None
+                else None
+            ),
         }
 
     def _restore_session_model_override(self, session_key: str, snapshot: dict) -> None:
@@ -23518,6 +23555,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _rst_state = self._peek_session_state(session_key)
             if _rst_state is not None:
                 _rst_state.conversation.model_override = None
+        conversation = self._session_state(session_key).conversation
+        reasoning = snapshot.get("reasoning_override")
+        conversation.reasoning_override = (
+            dict(reasoning) if reasoning is not None else None
+        )
+        conversation.reasoning_override_owner = snapshot.get(
+            "reasoning_override_owner"
+        )
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
