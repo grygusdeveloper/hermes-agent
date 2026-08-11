@@ -13,6 +13,7 @@ import pytest
 from agent.claude_code_client import (
     CLAUDE_CODE_MARKER_BASE_URL,
     ClaudeCodeClient,
+    _format_messages_as_prompt,
 )
 from agent.claude_code_session import (
     ClaudeCodeSession,
@@ -60,6 +61,40 @@ class _FakeStream:
 
 def _messages(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     return [{"role": role, "content": content} for role, content in pairs]
+
+
+class TestClaudeCodePromptUX:
+    def test_substantive_answers_request_scannable_markdown(self):
+        prompt = _format_messages_as_prompt(
+            _messages(("user", "Compare several architecture options.")),
+            model="claude-opus-5",
+        )
+
+        assert "Avoid walls of text" in prompt
+        assert "short descriptive headings" in prompt
+        assert "bullets or numbered steps" in prompt
+        assert "Icons are optional" in prompt
+
+    def test_tool_turns_allow_one_safe_progress_sentence(self):
+        prompt = _format_messages_as_prompt(
+            _messages(("user", "Inspect the repository and run tests.")),
+            model="claude-opus-5",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "description": "Run a command",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+        assert "one short, concrete user-facing progress sentence" in prompt
+        assert "naming any skill you load" in prompt
+        assert "not private chain-of-thought" in prompt
+        assert "Do not add narration before or after tool calls" not in prompt
 
 
 def _stream_stdout(

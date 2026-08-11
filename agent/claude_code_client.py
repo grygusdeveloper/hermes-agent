@@ -44,7 +44,7 @@ from agent.portal_tags import get_conversation_context
 
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-_PROMPT_FORMAT_VERSION = 3
+_PROMPT_FORMAT_VERSION = 4
 
 # Tool-call extraction shared with the Copilot ACP bridge (same <tool_call> shape).
 from agent.copilot_acp_client import (  # noqa: E402
@@ -72,19 +72,24 @@ def _format_messages_as_prompt(
         "You are the active reasoning model inside Hermes.",
         "Hermes, not Claude Code, owns all tool execution. Claude Code native tools are "
         "intentionally disabled; every tool listed below remains available through Hermes.",
-        "TOOL RULE: If you take an action, emit ONLY one or more "
+        "TOOL RULE: If you take an action, emit one or more "
         "<tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape. "
-        "Do not add narration before or after tool calls. Independent calls may be emitted "
-        "together to reduce round trips.",
+        "For multi-step work, you may precede the first tool batch with one short, concrete "
+        "user-facing progress sentence saying what you are checking and naming any skill "
+        "you load. This is activity reporting, not private chain-of-thought. Do not narrate "
+        "every trivial call or append a final answer to a tool-call turn. Independent calls "
+        "may be emitted together to reduce round trips.",
         "FINALITY RULE: If no tool is needed, return the complete user-facing answer now. "
         "Never end with process narration such as 'I will check' or 'let me inspect'. "
         "Do not repeat an inspection whose result is already present in the transcript.",
         "STYLE RULE: In final answers, sound like a natural, thoughtful collaborator. "
-        "Match the user's language, tone, and requested level of detail. Use headings and "
-        "lists only when they genuinely improve clarity; do not default to an audit-report "
-        "voice or rigid template. For ordinary conversation or advice, prefer a few flowing "
-        "paragraphs instead of turning every point into a bold mini-heading. Lead with the "
-        "useful conclusion, not process commentary.",
+        "Match the user's language, tone, and requested level of detail. Avoid walls of text. "
+        "When an answer has several findings, decisions, comparisons, or steps, format it as "
+        "a readable Markdown document with short descriptive headings, compact paragraphs, "
+        "and bullets or numbered steps where useful. Use bold labels sparingly. Icons are "
+        "optional and should add a real visual cue, never decorate every line. Keep simple "
+        "conversation as natural prose rather than forcing a rigid report template. Lead "
+        "with the useful conclusion, not process commentary.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")

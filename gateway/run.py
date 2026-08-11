@@ -25944,7 +25944,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Config: agent.gateway_notify_interval in config.yaml, or
         # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
         # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
+        # Respect the documented config value; the environment variable remains
+        # an explicit deployment override. Previously this path read only the
+        # environment (defaulting to 180), so changing
+        # ``agent.gateway_notify_interval`` in config.yaml had no effect.
+        _notify_interval_default = 180.0
+        _configured_notify_interval = None
+        try:
+            _configured_notify_interval = cfg_get(
+                user_config, "agent", "gateway_notify_interval"
+            )
+            if _configured_notify_interval not in (None, ""):
+                _notify_interval_default = float(_configured_notify_interval)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid agent.gateway_notify_interval=%r; using 180 seconds",
+                _configured_notify_interval,
+            )
+            _notify_interval_default = 180.0
+        _NOTIFY_INTERVAL_RAW = _float_env(
+            "HERMES_AGENT_NOTIFY_INTERVAL", _notify_interval_default
+        )
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         _long_running_mode = _display_surface_mode(
             "long_running_notifications",
