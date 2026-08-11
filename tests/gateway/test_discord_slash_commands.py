@@ -166,6 +166,31 @@ def test_model_command_choice_specs_use_direct_aliases_and_reasoning():
     ]
 
 
+def test_model_command_choice_specs_prefers_alias_reasoning_effort():
+    config = {
+        "agent": {"reasoning_overrides": {"gpt-5.6-sol": "medium"}},
+        "model_aliases": {
+            "sol-high": {
+                "label": "Sol",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+            },
+            "sol-xhigh": {
+                "label": "Sol",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "xhigh",
+            },
+        },
+    }
+
+    assert _model_command_choice_specs(config, "sol") == [
+        ("Sol · high", "sol-high"),
+        ("Sol · xhigh", "sol-xhigh"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_model_slash_autocomplete_lists_configured_aliases(adapter):
     adapter._register_slash_commands()

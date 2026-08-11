@@ -365,6 +365,7 @@ class DirectAlias(NamedTuple):
     model: str
     provider: str
     base_url: str
+    reasoning_effort: str = ""
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
@@ -408,9 +409,15 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                 model = entry.get("model", "")
                 provider = entry.get("provider", "custom")
                 base_url = entry.get("base_url", "")
+                reasoning_effort = str(
+                    entry.get("reasoning_effort") or entry.get("reasoning") or ""
+                ).strip().lower()
                 if model:
                     merged[name.strip().lower()] = DirectAlias(
-                        model=model, provider=provider, base_url=base_url,
+                        model=model,
+                        provider=provider,
+                        base_url=base_url,
+                        reasoning_effort=reasoning_effort,
                     )
 
         # --- model.aliases (string-based format, from config set) ---
@@ -472,6 +479,7 @@ class ModelSwitchResult:
     warning_message: str = ""
     provider_label: str = ""
     resolved_via_alias: str = ""
+    reasoning_effort: str = ""
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
@@ -1341,6 +1349,7 @@ def switch_model(
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     resolved_alias = ""
+    alias_reasoning_effort = ""
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
@@ -1769,15 +1778,21 @@ def switch_model(
         except Exception:
             pass
 
-    # --- Direct alias override: use exact base_url from the alias if set ---
+    # --- Direct alias override: apply exact endpoint + optional reasoning preset ---
     if resolved_alias:
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
-        if _da is not None and _da.base_url:
-            base_url = _da.base_url
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
-            if not api_key:
-                api_key = "no-key-required"
+        if _da is not None:
+            if _da.base_url:
+                base_url = _da.base_url
+                api_mode = ""  # clear so determine_api_mode re-detects from URL
+                if not api_key:
+                    api_key = "no-key-required"
+            if _da.reasoning_effort:
+                from hermes_constants import parse_reasoning_effort
+
+                if parse_reasoning_effort(_da.reasoning_effort) is not None:
+                    alias_reasoning_effort = _da.reasoning_effort
 
     # --- Resolve api_mode from the final (provider, base_url) before validation ---
     # Two cases this closes, both surfaced when the switched model's reasoning
@@ -1936,6 +1951,7 @@ def switch_model(
         warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
+        reasoning_effort=alias_reasoning_effort,
         capabilities=capabilities,
         model_info=model_info,
         is_global=is_global,

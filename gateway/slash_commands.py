@@ -2055,6 +2055,14 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        if result.reasoning_effort:
+                            from hermes_constants import parse_reasoning_effort
+
+                            _reasoning = parse_reasoning_effort(result.reasoning_effort)
+                            if _reasoning is not None:
+                                getattr(_self, "_set_session_reasoning_override")(
+                                    _session_key, _reasoning
+                                )
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -2366,6 +2374,14 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            if result.reasoning_effort:
+                from hermes_constants import parse_reasoning_effort
+
+                reasoning = parse_reasoning_effort(result.reasoning_effort)
+                if reasoning is not None:
+                    getattr(self, "_set_session_reasoning_override")(
+                        session_key, reasoning
+                    )
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}

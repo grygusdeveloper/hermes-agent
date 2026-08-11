@@ -10,6 +10,7 @@ Covers:
 """
 
 import os
+from unittest.mock import patch
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,25 @@ class TestDirectAliases:
         assert aliases["mymodel"].provider == "custom"
         assert aliases["mymodel"].base_url == "https://example.com/v1"
 
+    def test_direct_alias_loads_reasoning_effort(self, monkeypatch):
+        mock_config = {
+            "model_aliases": {
+                "sol-xhigh": {
+                    "model": "gpt-5.6-sol",
+                    "provider": "openai-codex",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "reasoning_effort": "xhigh",
+                }
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: mock_config)
+
+        from hermes_cli.model_switch import _load_direct_aliases
+
+        aliases = _load_direct_aliases()
+
+        assert aliases["sol-xhigh"].reasoning_effort == "xhigh"
+
     def test_direct_alias_resolved_before_catalog(self, monkeypatch):
         """Direct aliases take priority over models.dev catalog lookup."""
         from hermes_cli.model_switch import DirectAlias, resolve_alias
@@ -93,6 +113,54 @@ class TestDirectAliases:
         assert model == "glm-4.7"
         assert provider == "custom"
         assert alias == "glm"
+
+    def test_direct_alias_reasoning_effort_reaches_switch_result(self, monkeypatch):
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(
+            ms,
+            "DIRECT_ALIASES",
+            {
+                "sol-xhigh": ms.DirectAlias(
+                    "gpt-5.6-sol",
+                    "openai-codex",
+                    "https://chatgpt.com/backend-api/codex",
+                    "xhigh",
+                )
+            },
+        )
+        with (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api_mode": "codex_responses",
+                },
+            ),
+            patch(
+                "hermes_cli.models.validate_requested_model",
+                return_value={
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": None,
+                },
+            ),
+            patch("hermes_cli.model_switch.get_model_info", return_value=None),
+            patch("hermes_cli.model_switch.get_model_capabilities", return_value=None),
+        ):
+            result = ms.switch_model(
+                raw_input="sol-xhigh",
+                current_provider="openai-codex",
+                current_model="gpt-5.6-sol",
+                current_base_url="https://chatgpt.com/backend-api/codex",
+                current_api_key="test-key",
+            )
+
+        assert result.success
+        assert result.new_model == "gpt-5.6-sol"
+        assert result.reasoning_effort == "xhigh"
 
 
 # ---------------------------------------------------------------------------

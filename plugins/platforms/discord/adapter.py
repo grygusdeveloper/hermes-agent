@@ -340,12 +340,18 @@ def _model_command_choice_specs(
         if provider and not model.casefold().startswith(f"{provider}/".casefold()):
             route = f"{provider}/{model}"
         label = str(raw_spec.get("label") or f"{alias} — {route}").strip()
-        reasoning = resolve_reasoning_config(raw_config, model)
-        if isinstance(reasoning, dict):
-            if reasoning.get("enabled") is False:
-                label += " · none"
-            elif reasoning.get("effort"):
-                label += f" · {reasoning['effort']}"
+        alias_effort = str(
+            raw_spec.get("reasoning_effort") or raw_spec.get("reasoning") or ""
+        ).strip().lower()
+        if alias_effort:
+            label += f" · {alias_effort}"
+        else:
+            reasoning = resolve_reasoning_config(raw_config, model)
+            if isinstance(reasoning, dict):
+                if reasoning.get("enabled") is False:
+                    label += " · none"
+                elif reasoning.get("effort"):
+                    label += f" · {reasoning['effort']}"
         if needle and all(
             needle not in candidate.casefold()
             for candidate in (alias, label, model, provider)
