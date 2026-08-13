@@ -146,6 +146,7 @@ class TestValidateSignature:
         secret = "webhook-secret-42"
         hostile = "ské-not-a-valid-signature"
         for header in (
+            "X-Todoist-Hmac-SHA256",
             "X-Hub-Signature-256",
             "X-Gitlab-Token",
             "X-Webhook-Signature",

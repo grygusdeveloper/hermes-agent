@@ -13,6 +13,7 @@ The correct order is:
 4. Process the webhook
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -51,6 +52,13 @@ def _github_signature(body: bytes, secret: str) -> str:
     return "sha256=" + hmac.new(
         secret.encode(), body, hashlib.sha256
     ).hexdigest()
+
+
+def _todoist_signature(body: bytes, secret: str) -> str:
+    """Compute Todoist's Base64 HMAC-SHA256 over the exact raw body bytes."""
+    return base64.b64encode(
+        hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    ).decode()
 
 
 SIMPLE_PAYLOAD = {"event": "test", "data": "hello"}
@@ -138,5 +146,119 @@ class TestSignatureBeforeRateLimit:
 
         # The valid event should have been captured
         assert len(captured_events) == 1
+
+
+class TestTodoistSignature:
+    """Exercise Todoist's provider-native signature through the HTTP handler."""
+
+    @pytest.mark.asyncio
+    async def test_accepts_exact_raw_body_base64_hmac(self):
+        secret = "todoist-client-secret"
+        route_name = "todoist"
+        adapter = _make_adapter(
+            {
+                route_name: {
+                    "secret": secret,
+                    "events": [],
+                    "prompt": "Todoist: {__raw__}",
+                    "deliver": "log",
+                }
+            }
+        )
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        # Deliberately non-canonical JSON proves validation uses the exact
+        # bytes Todoist sent rather than parsed/re-serialized JSON.
+        body = b'{"event_name": "item:updated", "event_data": {"id": "42"}}\n'
+        signature = _todoist_signature(body, secret)
+        # Independent fixed fixture for the 59-byte body above. This catches a
+        # test helper that accidentally changes encoding/digest representation
+        # in lockstep with the production implementation.
+        assert signature == "xP3BRKfMchmBDOzZNTo7XAPTtpi7HHuvgUFPFeTaXqA="
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.post(
+                f"/webhooks/{route_name}",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Todoist-Hmac-SHA256": signature,
+                    "X-Request-ID": "todoist-exact-bytes",
+                },
+            )
+
+            assert response.status == 202
+            assert (await response.json())["status"] == "accepted"
+
+        assert len(captured_events) == 1
+        assert captured_events[0].raw_message["event_data"]["id"] == "42"
+
+    @pytest.mark.asyncio
+    async def test_rejects_signature_for_different_json_bytes(self):
+        secret = "todoist-client-secret"
+        route_name = "todoist"
+        adapter = _make_adapter(
+            {
+                route_name: {
+                    "secret": secret,
+                    "events": [],
+                    "prompt": "Todoist: {__raw__}",
+                    "deliver": "log",
+                }
+            }
+        )
+        compact = b'{"event_name":"item:updated","event_data":{"id":"42"}}'
+        wire_body = b'{"event_name": "item:updated", "event_data": {"id": "42"}}'
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.post(
+                f"/webhooks/{route_name}",
+                data=wire_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Todoist-Hmac-SHA256": _todoist_signature(compact, secret),
+                },
+            )
+
+            assert response.status == 401
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("todoist_signature", ["invalid", ""])
+    async def test_invalid_todoist_header_cannot_fall_back_to_generic_hmac(
+        self, todoist_signature
+    ):
+        secret = "todoist-client-secret"
+        route_name = "todoist"
+        adapter = _make_adapter(
+            {
+                route_name: {
+                    "secret": secret,
+                    "events": [],
+                    "prompt": "Todoist: {__raw__}",
+                    "deliver": "log",
+                }
+            }
+        )
+        body = b'{"event_name":"item:updated","event_data":{"id":"42"}}'
+        generic_signature = hmac.new(
+            secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.post(
+                f"/webhooks/{route_name}",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Todoist-Hmac-SHA256": todoist_signature,
+                    "X-Webhook-Signature": generic_signature,
+                },
+            )
+
+            assert response.status == 401
 
 
