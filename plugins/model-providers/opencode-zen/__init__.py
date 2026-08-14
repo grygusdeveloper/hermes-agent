@@ -37,6 +37,12 @@ def _is_glm_5_2_model(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
 
 
+def _is_glm_5_3_model(model: str | None) -> bool:
+    """Detect GLM-5.3 across alias spellings (glm-5.3 / glm-5-3 / glm-5p3)."""
+    m = _flat_model_name(model)
+    return any(token in m for token in ("glm-5.3", "glm-5-3", "glm-5p3"))
+
+
 class OpenCodeGoProfile(ProviderProfile):
     """OpenCode Go - model-specific reasoning controls."""
 
@@ -60,6 +66,24 @@ class OpenCodeGoProfile(ProviderProfile):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
+
+        if _is_glm_5_3_model(model):
+            # GLM-5.3 supports low/high/max. Preserve low, map Hermes
+            # medium/high to high, and xhigh/max to max.
+            if not isinstance(reasoning_config, dict):
+                return extra_body, top_level
+            if reasoning_config.get("enabled") is False:
+                return extra_body, top_level
+            effort = (reasoning_config.get("effort") or "").strip().lower()
+            if not effort or effort == "none":
+                return extra_body, top_level
+            if effort in {"xhigh", "max", "ultra"}:
+                top_level["reasoning_effort"] = "max"
+            elif effort in {"minimal", "low"}:
+                top_level["reasoning_effort"] = "low"
+            else:
+                top_level["reasoning_effort"] = "high"
+            return extra_body, top_level
 
         if _is_glm_5_2_model(model):
             # GLM-5.2 on OpenCode Go uses its native OpenAI-compatible

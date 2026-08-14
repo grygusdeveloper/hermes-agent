@@ -136,6 +136,28 @@ class TestZaiGLM52ReasoningEffort:
         assert top_level == {}
 
 
+class TestZaiGLM53ReasoningEffort:
+    """GLM-5.3 exposes low/high/max and Hermes xhigh maps to max."""
+
+    @pytest.mark.parametrize("model", ["glm-5.3", "z-ai/glm-5-3", "glm-5p3"])
+    def test_alias_spellings_and_xhigh(self, zai_profile, model):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "xhigh"}, model=model
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "max"}
+
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [("minimal", "low"), ("low", "low"), ("medium", "high"), ("high", "high")],
+    )
+    def test_effort_mapping(self, zai_profile, requested, expected):
+        _, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": requested}, model="glm-5.3"
+        )
+        assert top_level == {"reasoning_effort": expected}
+
+
 class TestZaiModelGating:
     """GLM 4.5+ get thinking; earlier GLM models are left untouched."""
 
@@ -148,6 +170,7 @@ class TestZaiModelGating:
             "glm-4.6",
             "glm-5",
             "glm-5.2",
+            "glm-5.3",
             "GLM-5",  # case-insensitive
         ],
     )

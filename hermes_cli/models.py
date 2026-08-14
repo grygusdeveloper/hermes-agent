@@ -340,7 +340,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.1-flash-lite-preview",
     ],
     "zai": [
-        "glm-5.2",
+        "glm-5.3",
         "glm-5.1",
         "glm-5",
         "glm-5v-turbo",
@@ -513,7 +513,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
-        "glm-5.2",
+        "glm-5.3",
         "glm-5.1",
         "glm-5",
         "mimo-v2.5-pro",
