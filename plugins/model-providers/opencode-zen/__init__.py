@@ -69,13 +69,18 @@ class OpenCodeGoProfile(ProviderProfile):
 
         if _is_glm_5_3_model(model):
             # GLM-5.3 supports low/high/max. Preserve low, map Hermes
-            # medium/high to high, and xhigh/max to max.
+            # medium/high to high, and xhigh/max to max. GLM-5.3 cannot
+            # disable thinking, so explicit off/none clamps to low.
             if not isinstance(reasoning_config, dict):
                 return extra_body, top_level
             if reasoning_config.get("enabled") is False:
+                top_level["reasoning_effort"] = "low"
                 return extra_body, top_level
             effort = (reasoning_config.get("effort") or "").strip().lower()
-            if not effort or effort == "none":
+            if not effort:
+                return extra_body, top_level
+            if effort == "none":
+                top_level["reasoning_effort"] = "low"
                 return extra_body, top_level
             if effort in {"xhigh", "max", "ultra"}:
                 top_level["reasoning_effort"] = "max"

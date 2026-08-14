@@ -157,6 +157,17 @@ class TestZaiGLM53ReasoningEffort:
         )
         assert top_level == {"reasoning_effort": expected}
 
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [{"enabled": False}, {"enabled": True, "effort": "none"}],
+    )
+    def test_off_and_none_clamp_to_low_thinking(self, zai_profile, reasoning_config):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config=reasoning_config, model="glm-5.3"
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "low"}
+
 
 class TestZaiModelGating:
     """GLM 4.5+ get thinking; earlier GLM models are left untouched."""
@@ -170,7 +181,6 @@ class TestZaiModelGating:
             "glm-4.6",
             "glm-5",
             "glm-5.2",
-            "glm-5.3",
             "GLM-5",  # case-insensitive
         ],
     )

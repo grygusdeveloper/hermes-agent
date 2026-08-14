@@ -125,6 +125,17 @@ class TestOpenCodeGoGLM53Reasoning:
         )
         assert top_level == {"reasoning_effort": "max"}
 
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [{"enabled": False}, {"enabled": True, "effort": "none"}],
+    )
+    def test_off_and_none_clamp_to_low(self, opencode_go_profile, reasoning_config):
+        extra_body, top_level = opencode_go_profile.build_api_kwargs_extras(
+            reasoning_config=reasoning_config, model="glm-5.3"
+        )
+        assert extra_body == {}
+        assert top_level == {"reasoning_effort": "low"}
+
 
 class TestOpenCodeGoModelGating:
     """Other OpenCode Go models must not receive Kimi/DeepSeek/GLM controls."""

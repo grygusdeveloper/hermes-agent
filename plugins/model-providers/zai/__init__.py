@@ -93,10 +93,14 @@ def _glm_5_3_reasoning_effort(reasoning_config: dict | None) -> str | None:
     if not isinstance(reasoning_config, dict):
         return None
     if reasoning_config.get("enabled") is False:
-        return None
+        # GLM-5.3 is always a thinking model. Its API rejects an attempt to
+        # disable thinking, so clamp Hermes' off preference to its minimum.
+        return "low"
     effort = (reasoning_config.get("effort") or "").strip().lower()
-    if not effort or effort == "none":
+    if not effort:
         return None
+    if effort == "none":
+        return "low"
     if effort in {"xhigh", "max", "ultra"}:
         return "max"
     if effort in {"minimal", "low"}:
@@ -119,7 +123,9 @@ class ZaiProfile(ProviderProfile):
         # Only emit when the user expressed a preference; omitting the field
         # keeps the server default (enabled) exactly as before.
         if isinstance(reasoning_config, dict):
-            enabled = reasoning_config.get("enabled") is not False
+            # GLM-5.3 cannot disable thinking. Explicit off/none is mapped to
+            # reasoning_effort=low below while thinking remains enabled.
+            enabled = _is_glm_5_3(model) or reasoning_config.get("enabled") is not False
             extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
 
         if _is_glm_5_3(model):
