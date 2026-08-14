@@ -3583,7 +3583,12 @@ class GatewaySlashCommandsMixin:
             elif isinstance(mapped_model, dict):
                 model_override = {
                     key: str(mapped_model[key]).strip()
-                    for key in ("model", "provider", "base_url")
+                    for key in (
+                        "model",
+                        "provider",
+                        "base_url",
+                        "reasoning_effort",
+                    )
                     if mapped_model.get(key) not in (None, "")
                 }
                 mapped_profile = mapped_model.get("profile")

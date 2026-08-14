@@ -353,6 +353,7 @@ async def test_spawn_autocomplete_uses_configured_agents_and_models(adapter):
                             "luna": {
                                 "provider": "openai-codex",
                                 "model": "gpt-5.6-luna",
+                                "reasoning_effort": "high",
                             },
                             "terra": {
                                 "provider": "openai-codex",
@@ -380,7 +381,7 @@ async def test_spawn_autocomplete_uses_configured_agents_and_models(adapter):
         ("research — profile researcher", "research")
     ]
     labels = {choice.value: choice.name for choice in model_choices}
-    assert labels["luna"] == "luna — openai-codex/gpt-5.6-luna · xhigh"
+    assert labels["luna"] == "luna — openai-codex/gpt-5.6-luna · high"
     assert labels["terra"] == "terra — openai-codex/gpt-5.6-terra · xhigh"
     assert labels["shared"] == "shared — openrouter/shared/model · medium"
 

@@ -299,8 +299,24 @@ def _spawn_model_choice_specs(
         if provider and not model.casefold().startswith(f"{provider}/".casefold()):
             route = f"{provider}/{model}"
         label = f"{alias} — {route}"
+        alias_effort = ""
+        if isinstance(raw_spec, dict):
+            alias_effort = str(
+                raw_spec.get("reasoning_effort") or raw_spec.get("reasoning") or ""
+            ).strip().lower()
+            if alias_effort:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed_alias_effort = parse_reasoning_effort(alias_effort)
+                alias_effort = (
+                    str(parsed_alias_effort.get("effort") or "").strip()
+                    if parsed_alias_effort is not None
+                    else ""
+                )
         reasoning = resolve_reasoning_config(raw_config, model)
-        if isinstance(reasoning, dict):
+        if alias_effort:
+            label += f" · {alias_effort}"
+        elif isinstance(reasoning, dict):
             if reasoning.get("enabled") is False:
                 label += " · none"
             elif reasoning.get("effort"):

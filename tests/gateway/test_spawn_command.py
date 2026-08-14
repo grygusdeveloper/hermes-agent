@@ -138,7 +138,11 @@ async def test_spawn_creates_thread_and_persists_profile_and_model_alias():
                 "parent_channel_id": "parent-1",
                 "agents": {"research": {"profile": "researcher"}},
                 "models": {
-                    "glm52": {"model": "glm-5.2", "provider": "zai"}
+                    "glm52": {
+                        "model": "glm-5.2",
+                        "provider": "zai",
+                        "reasoning_effort": "high",
+                    }
                 },
             }
         }
@@ -170,7 +174,7 @@ async def test_spawn_creates_thread_and_persists_profile_and_model_alias():
     )
     store.set_model_override.assert_awaited_once_with(
         spawned_entry.session_key,
-        {"model": "glm-5.2", "provider": "zai"},
+        {"model": "glm-5.2", "provider": "zai", "reasoning_effort": "high"},
     )
     runner._handle_message.assert_not_awaited()
 
@@ -298,7 +302,11 @@ async def test_spawn_with_prompt_posts_and_dispatches_initial_task():
                 "parent_channel_id": "parent-1",
                 "agents": {"research": {"profile": "researcher"}},
                 "models": {
-                    "glm52": {"model": "glm-5.2", "provider": "zai"}
+                    "glm52": {
+                        "model": "glm-5.2",
+                        "provider": "zai",
+                        "reasoning_effort": "high",
+                    }
                 },
             }
         }
@@ -337,7 +345,7 @@ async def test_spawn_with_prompt_posts_and_dispatches_initial_task():
     )
     store.set_model_override.assert_awaited_once_with(
         spawned_entry.session_key,
-        {"model": "glm-5.2", "provider": "zai"},
+        {"model": "glm-5.2", "provider": "zai", "reasoning_effort": "high"},
     )
 
 
