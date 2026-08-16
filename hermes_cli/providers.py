@@ -89,7 +89,13 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_env_var="LM_BASE_URL",
     ),
     "copilot-acp": HermesOverlay(
-        transport="codex_responses",
+        # Chat Completions only: CopilotACPClient implements the
+        # chat.completions surface and has no .responses namespace. Pinning
+        # codex_responses here leaked into determine_api_mode() and crashed
+        # every ACP turn with AttributeError before fallback. The dedicated
+        # copilot-acp branch in runtime_provider.py returns
+        # chat_completions — the overlay transport must agree.
+        transport="openai_chat",
         auth_type="external_process",
         base_url_override="acp://copilot",
         base_url_env_var="COPILOT_ACP_BASE_URL",
