@@ -1491,6 +1491,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        self._forum_tag_locks: Dict[int, asyncio.Lock] = {}  # thread_id -> tag update lock
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -7850,6 +7851,109 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to rename Discord thread %s", self.name, thread_id, exc_info=True)
             return False
 
+    async def set_forum_thread_model_tag(
+        self,
+        thread_id: str,
+        model_alias: str,
+        *,
+        model_aliases: set[str],
+    ) -> bool:
+        """Replace one model tag while preserving a fresh non-model tag set.
+
+        Discord exposes forum tag changes as full-list channel edits. Serialize
+        Hermes updates per thread and fetch the channel immediately before the
+        edit so overlapping commands cannot finish out of order and stale cache
+        state is not used to overwrite unrelated tags.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        try:
+            channel_id = int(str(thread_id))
+        except (TypeError, ValueError):
+            return False
+
+        locks = getattr(self, "_forum_tag_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._forum_tag_locks = locks
+        lock = locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            try:
+                fetch_channel = getattr(self._client, "fetch_channel", None)
+                thread = (
+                    await fetch_channel(channel_id)
+                    if callable(fetch_channel)
+                    else self._client.get_channel(channel_id)
+                )
+                if thread is None:
+                    return False
+
+                parent = getattr(thread, "parent", None)
+                parent_id = getattr(thread, "parent_id", None)
+                if parent_id is None:
+                    parent_id = getattr(parent, "id", None)
+                if parent_id is not None and callable(fetch_channel):
+                    parent = await fetch_channel(int(parent_id))
+                elif parent is None and parent_id is not None:
+                    parent = self._client.get_channel(int(parent_id))
+
+                available = list(getattr(parent, "available_tags", None) or [])
+                by_id = {str(getattr(tag, "id", "")): tag for tag in available}
+                by_name = {
+                    str(getattr(tag, "name", "") or "").strip().casefold(): tag
+                    for tag in available
+                }
+                target = by_name.get(str(model_alias).strip().casefold())
+                if target is None:
+                    logger.warning(
+                        "[%s] Forum model tag %r is not available under thread %s",
+                        self.name,
+                        model_alias,
+                        thread_id,
+                    )
+                    return False
+                model_names = {str(name).strip().casefold() for name in model_aliases}
+                model_ids = {
+                    str(getattr(tag, "id", ""))
+                    for tag in available
+                    if str(getattr(tag, "name", "") or "").strip().casefold()
+                    in model_names
+                }
+                current_ids = [
+                    str(getattr(tag, "id", tag))
+                    for tag in list(getattr(thread, "applied_tags", None) or [])
+                ]
+                target_id = str(getattr(target, "id", ""))
+                desired_ids = [tag_id for tag_id in current_ids if tag_id not in model_ids]
+                if target_id not in desired_ids:
+                    desired_ids.append(target_id)
+                if desired_ids == current_ids:
+                    return True
+                desired_tags = [by_id[tag_id] for tag_id in desired_ids if tag_id in by_id]
+                if len(desired_tags) > 5:
+                    return False
+                edit = getattr(thread, "edit", None)
+                if not callable(edit):
+                    return False
+                await edit(
+                    applied_tags=desired_tags,
+                    reason="Hermes forum model synchronization",
+                )
+                logger.info(
+                    "[%s] Set Discord forum thread %s model tag to %s",
+                    self.name,
+                    thread_id,
+                    model_alias,
+                )
+                return True
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to set Discord forum model tag for %s",
+                    self.name,
+                    thread_id,
+                    exc_info=True,
+                )
+                return False
     async def create_handoff_thread(
         self,
         parent_chat_id: str,
@@ -7938,14 +8042,61 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         starter_content: str,
         owner_user_id: Optional[str] = None,
+        model_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a human-facing /spawn thread and seed its instructions."""
-        thread_id = await self.create_handoff_thread(
-            parent_chat_id,
-            name,
-            reason="Hermes /spawn workspace",
-            seed_prefix="🧵 Hermes workspace",
-        )
+        thread = None
+        starter_seeded = False
+        thread_id = None
+        # REQUIRE_TAG forum channels reject untagged posts. Keep /spawn as a
+        # compatible secondary entry path by using its exact model alias tag.
+        if self._client and model_alias:
+            try:
+                parent = self._client.get_channel(int(parent_chat_id))
+                if parent is None:
+                    parent = await self._client.fetch_channel(int(parent_chat_id))
+                forum_cls = getattr(discord, "ForumChannel", ())
+                if forum_cls and isinstance(parent, forum_cls):
+                    target = next(
+                        (
+                            tag
+                            for tag in list(getattr(parent, "available_tags", None) or [])
+                            if str(getattr(tag, "name", "") or "").strip().casefold()
+                            == str(model_alias).strip().casefold()
+                        ),
+                        None,
+                    )
+                    if target is None:
+                        return {
+                            "success": False,
+                            "error": f"forum model tag {model_alias!r} is unavailable",
+                        }
+                    created = await parent.create_thread(
+                        name=name,
+                        content=(starter_content or "🧵 Hermes workspace")[: self.MAX_MESSAGE_LENGTH],
+                        applied_tags=[target],
+                        auto_archive_duration=1440,
+                        reason="Hermes /spawn workspace",
+                    )
+                    thread = getattr(created, "thread", created)
+                    thread_id = str(getattr(thread, "id", "") or "") or None
+                    starter_seeded = True
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Tagged forum /spawn failed under %s: %s",
+                    self.name,
+                    parent_chat_id,
+                    exc,
+                )
+                return {"success": False, "error": str(exc)}
+
+        if not thread_id:
+            thread_id = await self.create_handoff_thread(
+                parent_chat_id,
+                name,
+                reason="Hermes /spawn workspace",
+                seed_prefix="🧵 Hermes workspace",
+            )
         if not thread_id:
             return {
                 "success": False,
@@ -7953,7 +8104,9 @@ class DiscordAdapter(BasePlatformAdapter):
             }
 
         try:
-            thread = self._client.get_channel(int(thread_id)) if self._client else None
+            thread = thread or (
+                self._client.get_channel(int(thread_id)) if self._client else None
+            )
             if thread is None and self._client:
                 thread = await self._client.fetch_channel(int(thread_id))
         except Exception as exc:
@@ -7984,7 +8137,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
         starter_error = None
-        if thread is not None and starter_content:
+        if thread is not None and starter_content and not starter_seeded:
             try:
                 await thread.send(str(starter_content)[: self.MAX_MESSAGE_LENGTH])
             except Exception as exc:

@@ -44,7 +44,14 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
+import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+
+# The optional adapter can be imported earlier in collection before this file
+# installs its comprehensive SDK double, leaving its cached module global at
+# None. Rebind it to the same test double used by this module.
+if discord_platform.discord is None:
+    discord_platform.discord = sys.modules["discord"]
 
 
 @pytest.mark.asyncio

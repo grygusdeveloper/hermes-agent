@@ -15062,6 +15062,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     return _paused_notice
 
+        # Discord forum posts are born with their starter message, so /spawn
+        # cannot serve as the creation UI there. Bind an exact /model alias
+        # selected through the forum's native model tags before the first agent
+        # turn. Existing bound topics return immediately from this fast path.
+        if not is_internal:
+            _forum_tag_error = await self._prepare_discord_forum_tag_session(event)
+            if _forum_tag_error is not None:
+                return _forum_tag_error
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via

@@ -15,6 +15,7 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
 from gateway.slash_commands import (
     GatewaySlashCommandsMixin,
+    _spawn_model_alias,
     _spawn_topic_essence,
     _spawn_topic_title,
 )
@@ -68,9 +69,67 @@ def test_spawn_topic_title_limits_essence_and_uses_friendly_model():
     assert " · " in long_title
 
 
+def test_spawn_model_alias_does_not_guess_shared_wire_model():
+    config = {
+        "gateway": {
+            "spawn": {
+                "models": {
+                    "sol-high": {"model": "gpt-5.6-sol"},
+                    "sol-xhigh": {"model": "gpt-5.6-sol"},
+                }
+            }
+        }
+    }
+    assert _spawn_model_alias(config, "sol-xhigh", "gpt-5.6-sol") == "sol-xhigh"
+    assert _spawn_model_alias(config, "gpt-5.6-sol", "gpt-5.6-sol") == ""
+
+
+@pytest.mark.asyncio
+async def test_bound_forum_rejects_persistent_model_without_unique_tag_alias():
+    store = SimpleNamespace(get_execution_profile=AsyncMock(return_value="default"))
+    runner = SpawnHarness(SimpleNamespace(), store)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+    )
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "models": {
+                    "sol-high": {"model": "gpt-5.6-sol"},
+                    "sol-xhigh": {"model": "gpt-5.6-sol"},
+                },
+            }
+        }
+    }
+
+    error = await runner._forum_topic_model_alias_error(
+        source,
+        raw_config=config,
+        requested_model="gpt-5.6-sol",
+        resolved_model="gpt-5.6-sol",
+    )
+    assert "no unique forum tag" in error
+
+    exact = await runner._forum_topic_model_alias_error(
+        source,
+        raw_config=config,
+        requested_model="sol-xhigh",
+        resolved_model="gpt-5.6-sol",
+    )
+    assert exact == ""
+
+
 @pytest.mark.asyncio
 async def test_spawn_topic_model_sync_preserves_essence_and_renames():
-    adapter = SimpleNamespace(rename_thread=AsyncMock(return_value={"success": True}))
+    adapter = SimpleNamespace(
+        rename_thread=AsyncMock(return_value={"success": True}),
+        set_forum_thread_model_tag=AsyncMock(return_value=True),
+    )
     store = SimpleNamespace(get_execution_profile=AsyncMock(return_value="default"))
     runner = SpawnHarness(adapter, store)
     source = SessionSource(
@@ -107,6 +166,181 @@ async def test_spawn_topic_model_sync_preserves_essence_and_renames():
         "Hermes config audit · Gemini 3.7 Flash High",
         only_if_current_name="Hermes config audit · Sol",
     )
+    adapter.set_forum_thread_model_tag.assert_awaited_once_with(
+        "thread-1",
+        "gemini",
+        model_aliases={"sol-high", "gemini"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_topic_model_sync_reports_tag_failure():
+    adapter = SimpleNamespace(
+        rename_thread=AsyncMock(return_value=True),
+        set_forum_thread_model_tag=AsyncMock(return_value=False),
+    )
+    store = SimpleNamespace(get_execution_profile=AsyncMock(return_value="default"))
+    runner = SpawnHarness(adapter, store)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_name="Audit · Sol",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+    )
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "models": {"sol": {"label": "Sol", "model": "sol-wire"}},
+            }
+        },
+        "model_aliases": {
+            "gemini": {"label": "Gemini", "model": "gemini-wire"}
+        },
+    }
+
+    warning = await runner._sync_spawn_topic_model_title(
+        source,
+        raw_config=config,
+        requested_model="gemini",
+        resolved_model="gemini-wire",
+    )
+
+    assert "model tag" in warning
+    adapter.set_forum_thread_model_tag.assert_awaited_once_with(
+        "thread-1",
+        "gemini",
+        model_aliases={"sol", "gemini"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_forum_model_tag_binds_before_first_turn():
+    channel = SimpleNamespace(
+        name="Audit my Hermes configuration",
+        applied_tags=[SimpleNamespace(name="sol-high")],
+    )
+    raw_message = SimpleNamespace(channel=channel)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_name="Guild / 🌐chats / Audit my Hermes configuration",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+        user_id="owner-1",
+    )
+    event = MessageEvent(
+        text="Analyze the current Hermes configuration.",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=raw_message,
+    )
+    entry = SimpleNamespace(session_key=build_session_key(source))
+    store = SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=entry),
+        get_execution_profile=AsyncMock(return_value=None),
+        set_execution_profile=AsyncMock(),
+        set_model_override=AsyncMock(),
+    )
+    adapter = SimpleNamespace(
+        rename_thread=AsyncMock(return_value=True),
+        _threads=SimpleNamespace(mark=MagicMock()),
+        _spawn_owners=SimpleNamespace(mark=MagicMock()),
+    )
+    runner = SpawnHarness(adapter, store)
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "default_agent": "main",
+                "models": {
+                    "sol-high": {
+                        "label": "Sol High",
+                        "model": "gpt-5.6-sol",
+                        "provider": "openai-codex",
+                        "reasoning_effort": "high",
+                    }
+                },
+            }
+        }
+    }
+
+    with patch("gateway.run._load_gateway_config", return_value=config), patch(
+        "hermes_cli.profiles.profile_exists", return_value=True
+    ):
+        result = await runner._prepare_discord_forum_tag_session(event)
+
+    assert result is None
+    store.set_execution_profile.assert_awaited_once_with(entry.session_key, "default")
+    store.set_model_override.assert_awaited_once_with(
+        entry.session_key,
+        {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "reasoning_effort": "high",
+        },
+    )
+    adapter._threads.mark.assert_called_once_with("thread-1")
+    adapter._spawn_owners.mark.assert_called_once_with("thread-1:owner-1")
+    adapter.rename_thread.assert_awaited_once_with(
+        "thread-1",
+        "Audit Hermes configuration · Sol High",
+        only_if_current_name="Audit my Hermes configuration",
+    )
+
+
+@pytest.mark.asyncio
+async def test_forum_model_tag_requires_exactly_one_model():
+    channel = SimpleNamespace(
+        name="Audit",
+        applied_tags=[
+            SimpleNamespace(name="sol-high"),
+            SimpleNamespace(name="gemini"),
+        ],
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+        user_id="owner-1",
+    )
+    event = MessageEvent(
+        text="Audit",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=SimpleNamespace(channel=channel),
+    )
+    entry = SimpleNamespace(session_key=build_session_key(source))
+    store = SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=entry),
+        get_execution_profile=AsyncMock(return_value=None),
+        set_execution_profile=AsyncMock(),
+        set_model_override=AsyncMock(),
+    )
+    runner = SpawnHarness(SimpleNamespace(), store)
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "models": {
+                    "sol-high": {"model": "sol"},
+                    "gemini": {"model": "gemini"},
+                },
+            }
+        }
+    }
+
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        result = await runner._prepare_discord_forum_tag_session(event)
+
+    assert result is not None and "exactly one model tag" in result
+    store.set_execution_profile.assert_not_awaited()
+    store.set_model_override.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -308,6 +542,7 @@ async def test_spawn_creates_thread_and_persists_profile_and_model_alias():
     assert create_kwargs["parent_chat_id"] == "parent-1"
     assert create_kwargs["name"] == "Research task · glm52"
     assert create_kwargs["owner_user_id"] == "owner-1"
+    assert create_kwargs["model_alias"] == "glm52"
 
     spawned_source = store.get_or_create_session.await_args.args[0]
     assert spawned_source.chat_id == "thread-9"
@@ -601,6 +836,54 @@ async def test_create_spawn_thread_adds_owner_without_member_cache():
     member = thread.add_user.await_args.args[0]
     assert str(member.id) == "210318156432932864"
     spawn_owner_mark.assert_called_once_with("12345:210318156432932864")
+
+
+@pytest.mark.asyncio
+async def test_create_spawn_thread_uses_selected_tag_in_required_tag_forum():
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    class FakeForumChannel:
+        def __init__(self):
+            self.available_tags = [SimpleNamespace(id=7, name="sol-high")]
+            self.create_thread = AsyncMock()
+
+    thread = SimpleNamespace(
+        id=12345,
+        name="Visible task · Sol High",
+        guild=SimpleNamespace(id=67890),
+        send=AsyncMock(),
+        add_user=AsyncMock(),
+    )
+    parent = FakeForumChannel()
+    parent.create_thread.return_value = SimpleNamespace(thread=thread)
+    adapter = DiscordAdapter.__new__(DiscordAdapter)
+    adapter._client = SimpleNamespace(
+        get_channel=lambda channel_id: parent if channel_id == 999 else thread,
+        fetch_channel=AsyncMock(),
+    )
+    object.__setattr__(adapter, "_threads", SimpleNamespace(mark=MagicMock()))
+    object.__setattr__(adapter, "_spawn_owners", SimpleNamespace(mark=MagicMock()))
+
+    with patch(
+        "plugins.platforms.discord.adapter.discord.ForumChannel", FakeForumChannel
+    ):
+        result = await DiscordAdapter.create_spawn_thread(
+            adapter,
+            parent_chat_id="999",
+            name="Visible task · Sol High",
+            starter_content="Workspace ready",
+            model_alias="sol-high",
+        )
+
+    assert result["success"] is True
+    parent.create_thread.assert_awaited_once_with(
+        name="Visible task · Sol High",
+        content="Workspace ready",
+        applied_tags=[parent.available_tags[0]],
+        auto_archive_duration=1440,
+        reason="Hermes /spawn workspace",
+    )
+    thread.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -128,6 +128,39 @@ def _spawn_model_label(raw_config: Any, requested: str, resolved: str = "") -> s
     return str(requested or resolved or "Default").strip() or "Default"
 
 
+def _spawn_model_alias(raw_config: Any, requested: str, resolved: str = "") -> str:
+    """Return the configured /model alias represented by a model selection."""
+    cfg = raw_config if isinstance(raw_config, dict) else {}
+    requested_key = str(requested or "").strip().casefold()
+    resolved_key = str(resolved or "").strip().casefold()
+    gateway_cfg = cfg.get("gateway")
+    spawn_cfg = gateway_cfg.get("spawn") if isinstance(gateway_cfg, dict) else None
+    sections = (
+        spawn_cfg.get("models") if isinstance(spawn_cfg, dict) else None,
+        cfg.get("model_aliases"),
+    )
+    resolved_matches: list[str] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        for raw_alias, raw_spec in section.items():
+            alias = str(raw_alias).strip()
+            model = (
+                str(raw_spec.get("model") or "").strip()
+                if isinstance(raw_spec, dict)
+                else str(raw_spec or "").strip()
+            )
+            if requested_key and requested_key == alias.casefold():
+                return alias
+            if resolved_key and model.casefold() == resolved_key:
+                resolved_matches.append(alias)
+    # Raw picker model IDs can be mapped back only when unambiguous. Several
+    # aliases may share a wire model but differ by reasoning (e.g. Sol High and
+    # Sol XHigh); guessing would put a misleading tag on the topic.
+    unique_matches = list(dict.fromkeys(resolved_matches))
+    return unique_matches[0] if len(unique_matches) == 1 else ""
+
+
 def _spawn_topic_title(essence_source: Any, model_label: Any) -> str:
     """Build ``≤4-word essence · friendly model`` within Discord's 80-unit limit."""
     essence = _spawn_topic_essence(essence_source, max_words=4)
@@ -188,6 +221,202 @@ class GatewaySlashCommandsMixin:
     _session_model_overrides: dict[str, dict[str, Any]]
     _pending_one_turn_model_restores: dict[str, dict[str, Any]]
 
+    async def _prepare_discord_forum_tag_session(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Bind a newly-created Discord forum post to its selected model tag.
+
+        Discord's native forum composer creates the thread and starter message
+        together, so /spawn cannot be the creation UI.  In the configured spawn
+        forum, exact /model aliases are forum tags; the first post selects one
+        tag and this hook persists the profile/model before the first agent turn.
+        """
+        source = event.source
+        if (
+            source.platform != Platform.DISCORD
+            or not source.thread_id
+            or event.raw_message is None
+        ):
+            return None
+        from gateway.run import _load_gateway_config
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
+
+        raw_config = _load_gateway_config() or {}
+        gateway_cfg = raw_config.get("gateway") if isinstance(raw_config, dict) else {}
+        gateway_cfg = gateway_cfg if isinstance(gateway_cfg, dict) else {}
+        spawn_cfg = gateway_cfg.get("spawn") or {}
+        spawn_cfg = spawn_cfg if isinstance(spawn_cfg, dict) else {}
+        parent_id = str(spawn_cfg.get("parent_channel_id") or "").strip()
+        if not parent_id or str(source.parent_chat_id or "") != parent_id:
+            return None
+
+        entry = await self.async_session_store.get_or_create_session(source)
+        existing_profile = await self.async_session_store.get_execution_profile(
+            entry.session_key
+        )
+        if existing_profile:
+            existing_override = await self.async_session_store.get_model_override(
+                entry.session_key
+            )
+            if isinstance(existing_override, dict) and existing_override.get("model"):
+                return None
+
+        models = spawn_cfg.get("models") or {}
+        models = models if isinstance(models, dict) else {}
+        channel = getattr(event.raw_message, "channel", None)
+        applied = list(getattr(channel, "applied_tags", None) or [])
+        selected: list[str] = []
+        for tag in applied:
+            tag_name = str(getattr(tag, "name", "") or "").strip().casefold()
+            for alias in models:
+                if tag_name == str(alias).strip().casefold():
+                    selected.append(str(alias).strip())
+                    break
+        selected = list(dict.fromkeys(selected))
+        if len(selected) != 1:
+            available = ", ".join(f"`{name}`" for name in models) or "none"
+            return (
+                "❌ Select exactly one model tag for this forum post before "
+                f"sending another message. Available: {available}"
+            )
+
+        alias = selected[0]
+        spec = models.get(alias)
+        if isinstance(spec, str):
+            model_override = {"model": spec.strip()}
+            mapped_profile = ""
+        elif isinstance(spec, dict):
+            model_override = {
+                key: str(spec[key]).strip()
+                for key in ("model", "provider", "base_url", "reasoning_effort")
+                if spec.get(key) not in (None, "")
+            }
+            mapped_profile = str(spec.get("profile") or "").strip()
+        else:
+            model_override = {}
+            mapped_profile = ""
+        if not model_override.get("model"):
+            return f"❌ Model tag `{alias}` has no configured model."
+
+        agents = spawn_cfg.get("agents") or {}
+        agents = agents if isinstance(agents, dict) else {}
+        default_agent = str(spawn_cfg.get("default_agent") or "main").strip().lower()
+        agent_spec = agents.get(default_agent)
+        if isinstance(agent_spec, str):
+            profile_name = agent_spec
+        elif isinstance(agent_spec, dict):
+            profile_name = str(agent_spec.get("profile") or default_agent)
+        else:
+            profile_name = "default" if default_agent in {"main", "default"} else default_agent
+        if mapped_profile:
+            profile_name = mapped_profile
+        try:
+            profile_name = normalize_profile_name(profile_name)
+            validate_profile_name(profile_name)
+        except ValueError as exc:
+            return f"❌ Model tag `{alias}` maps to an invalid profile: {exc}"
+        if not profile_exists(profile_name):
+            return f"❌ Model tag `{alias}` maps to missing profile `{profile_name}`."
+
+        # Persist the model first and use execution_profile as the completion
+        # marker. If either durable write fails, a retry can safely repair the
+        # same binding instead of treating a profile-only partial write as done.
+        await self.async_session_store.set_model_override(
+            entry.session_key, model_override
+        )
+        await self.async_session_store.set_execution_profile(
+            entry.session_key, profile_name
+        )
+        self._session_model_overrides.pop(entry.session_key, None)
+
+        adapter_resolver = getattr(self, "_adapter_for_source", None)
+        adapter = adapter_resolver(source) if callable(adapter_resolver) else None
+        thread_id = str(source.thread_id)
+        tracker = getattr(adapter, "_threads", None)
+        if tracker is not None and hasattr(tracker, "mark"):
+            tracker.mark(thread_id)
+        owners = getattr(adapter, "_spawn_owners", None)
+        if owners is not None and hasattr(owners, "mark") and source.user_id:
+            owners.mark(f"{thread_id}:{source.user_id}")
+
+        current_name = str(getattr(channel, "name", "") or "").strip()
+        rename_thread = getattr(adapter, "rename_thread", None)
+        if current_name and callable(rename_thread):
+            new_name = _spawn_topic_title(
+                current_name, _spawn_model_label(raw_config, alias, model_override["model"])
+            )
+            try:
+                result = rename_thread(
+                    thread_id,
+                    new_name,
+                    only_if_current_name=current_name,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is False or (
+                    isinstance(result, dict) and not result.get("success", False)
+                ):
+                    logger.warning(
+                        "Could not normalize tagged Discord topic %s title",
+                        thread_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not normalize tagged Discord topic %s title",
+                    thread_id,
+                    exc_info=True,
+                )
+        logger.info(
+            "Discord forum tag bound thread=%s profile=%s model_alias=%s user=%s",
+            thread_id,
+            profile_name,
+            alias,
+            source.user_id,
+        )
+        return None
+
+    async def _forum_topic_model_alias_error(
+        self,
+        source: SessionSource,
+        *,
+        raw_config: Any,
+        requested_model: str,
+        resolved_model: str,
+    ) -> str:
+        """Reject persistent bound-forum switches without one exact tag alias."""
+        if source.platform != Platform.DISCORD or not source.thread_id:
+            return ""
+        gateway_cfg = raw_config.get("gateway") if isinstance(raw_config, dict) else None
+        spawn_cfg = gateway_cfg.get("spawn") if isinstance(gateway_cfg, dict) else None
+        parent_channel_id = str(
+            spawn_cfg.get("parent_channel_id") if isinstance(spawn_cfg, dict) else ""
+        ).strip()
+        if not parent_channel_id or str(source.parent_chat_id or "") != parent_channel_id:
+            return ""
+        get_execution_profile = getattr(
+            getattr(self, "async_session_store", None),
+            "get_execution_profile",
+            None,
+        )
+        session_key_resolver = getattr(self, "_session_key_for_source", None)
+        if not callable(get_execution_profile) or not callable(session_key_resolver):
+            return ""
+        profile = get_execution_profile(session_key_resolver(source))
+        if inspect.isawaitable(profile):
+            profile = await profile
+        if not profile:
+            return ""
+        if _spawn_model_alias(raw_config, requested_model, resolved_model):
+            return ""
+        return (
+            "❌ This model has no unique forum tag. Choose an exact configured "
+            "`/model` alias for a persistent switch, or use `/model --once`."
+        )
+
     async def _sync_spawn_topic_model_title(
         self,
         source: SessionSource,
@@ -195,17 +424,23 @@ class GatewaySlashCommandsMixin:
         raw_config: Any,
         requested_model: str,
         resolved_model: str,
-    ) -> None:
-        """Keep a spawned Discord forum topic's title aligned to its model."""
+        current_thread_name: str = "",
+    ) -> str:
+        """Keep a spawned Discord forum topic's title aligned to its model.
+
+        Returns a user-visible warning when an attempted Discord metadata update
+        fails. The model switch remains authoritative, but callers must not
+        silently advertise metadata that they could not persist or synchronize.
+        """
         if source.platform != Platform.DISCORD or not source.thread_id:
-            return
+            return ""
         gateway_cfg = raw_config.get("gateway") if isinstance(raw_config, dict) else None
         spawn_cfg = gateway_cfg.get("spawn") if isinstance(gateway_cfg, dict) else None
         parent_channel_id = str(
             spawn_cfg.get("parent_channel_id") if isinstance(spawn_cfg, dict) else ""
         ).strip()
         if not parent_channel_id or str(source.parent_chat_id or "") != parent_channel_id:
-            return
+            return ""
         # A channel merely living under the configured forum is not necessarily
         # a /spawn workspace. Execution profile persistence is the durable marker
         # set by /spawn; fail closed so manual forum posts are never retitled.
@@ -215,18 +450,57 @@ class GatewaySlashCommandsMixin:
             None,
         )
         if not callable(get_execution_profile):
-            return
+            return ""
         session_key_resolver = getattr(self, "_session_key_for_source", None)
         if not callable(session_key_resolver):
-            return
+            return ""
         profile_result = get_execution_profile(session_key_resolver(source))
         if inspect.isawaitable(profile_result):
             profile_result = await profile_result
         if not profile_result:
-            return
-        current_name = str(source.chat_name or "").strip()
+            return ""
+        current_name = str(current_thread_name or "").strip()
+        if not current_name:
+            current_name = str(source.chat_name or "").rsplit(" / ", 1)[-1].strip()
+
+        adapter_resolver = getattr(self, "_adapter_for_source", None)
+        if not callable(adapter_resolver):
+            return ""
+        adapter = adapter_resolver(source)
+        failures: list[str] = []
+        model_alias = _spawn_model_alias(
+            raw_config, requested_model, resolved_model
+        )
+        if not model_alias:
+            failures.append("model tag: no unique configured alias")
+            return self._forum_topic_sync_warning(failures)
+        sync_tag = getattr(adapter, "set_forum_thread_model_tag", None)
+        if model_alias and callable(sync_tag):
+            model_names = set()
+            spawn_models = spawn_cfg.get("models") if isinstance(spawn_cfg, dict) else None
+            aliases = raw_config.get("model_aliases") if isinstance(raw_config, dict) else None
+            for section in (spawn_models, aliases):
+                if isinstance(section, dict):
+                    model_names.update(str(name) for name in section)
+            try:
+                tag_result = sync_tag(
+                    str(source.thread_id),
+                    model_alias,
+                    model_aliases=model_names,
+                )
+                if inspect.isawaitable(tag_result):
+                    tag_result = await tag_result
+                if tag_result is False:
+                    failures.append("model tag")
+            except Exception:
+                failures.append("model tag")
+                logger.warning(
+                    "Could not synchronize spawned Discord topic %s model tag",
+                    source.thread_id,
+                    exc_info=True,
+                )
         if _SPAWN_TOPIC_SEPARATOR not in current_name:
-            return
+            return self._forum_topic_sync_warning(failures)
         current_suffix = current_name.rsplit(_SPAWN_TOPIC_SEPARATOR, 1)[1].strip().casefold()
         known_labels: set[str] = set()
         aliases = raw_config.get("model_aliases") if isinstance(raw_config, dict) else None
@@ -245,14 +519,10 @@ class GatewaySlashCommandsMixin:
                     .casefold()
                 )
         if current_suffix not in known_labels:
-            return
-        adapter_resolver = getattr(self, "_adapter_for_source", None)
-        if not callable(adapter_resolver):
-            return
-        adapter = adapter_resolver(source)
+            return self._forum_topic_sync_warning(failures)
         rename_thread = getattr(adapter, "rename_thread", None)
         if not callable(rename_thread):
-            return
+            return self._forum_topic_sync_warning(failures)
         model_label = _spawn_model_label(raw_config, requested_model, resolved_model)
         new_name = _spawn_topic_title(current_name, model_label)
         try:
@@ -264,11 +534,13 @@ class GatewaySlashCommandsMixin:
             if inspect.isawaitable(result):
                 result = await result
             if result is False:
+                failures.append("title")
                 logger.warning(
                     "Could not synchronize spawned Discord topic %s title",
                     source.thread_id,
                 )
             if isinstance(result, dict) and not result.get("success", False):
+                failures.append("title")
                 logger.warning(
                     "Could not synchronize spawned Discord topic %s title: %s",
                     source.thread_id,
@@ -277,11 +549,23 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:
             # The model switch itself is authoritative; a cosmetic Discord rename
             # must never roll it back or make /model look unsuccessful.
+            failures.append("title")
             logger.warning(
                 "Could not synchronize spawned Discord topic %s title: %s",
                 source.thread_id,
                 exc,
             )
+        return self._forum_topic_sync_warning(failures)
+
+    @staticmethod
+    def _forum_topic_sync_warning(failures: list[str]) -> str:
+        failures = list(dict.fromkeys(failures))
+        if not failures:
+            return ""
+        return (
+            "⚠️ Model switched, but Discord topic metadata could not be fully "
+            f"synchronized ({', '.join(failures)})."
+        )
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -2172,6 +2456,16 @@ class GatewaySlashCommandsMixin:
                         except Exception as exc:
                             logger.debug("preflight-compression switch warning failed: %s", exc)
 
+                        if not one_turn:
+                            alias_error = await _self._forum_topic_model_alias_error(
+                                source,
+                                raw_config=cfg,
+                                requested_model=model_id,
+                                resolved_model=result.new_model,
+                            )
+                            if alias_error:
+                                return alias_error
+
                         # Update cached agent in-place
                         cached_entry = None
                         _cache_lock = getattr(_self, "_agent_cache_lock", None)
@@ -2268,7 +2562,9 @@ class GatewaySlashCommandsMixin:
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
-                        # (api_key is never persisted).
+                        # (api_key is never persisted). Topic metadata must not
+                        # advertise a durable route until this write succeeds.
+                        _topic_sync_warning = ""
                         if not one_turn:
                             try:
                                 await _self.async_session_store.set_model_override(
@@ -2276,17 +2572,29 @@ class GatewaySlashCommandsMixin:
                                     _self._session_model_overrides[_session_key],
                                 )
                             except Exception:
-                                logger.debug(
+                                logger.warning(
                                     "Failed to persist session model override",
                                     exc_info=True,
                                 )
-
-                            await _self._sync_spawn_topic_model_title(
-                                source,
-                                raw_config=cfg,
-                                requested_model=model_id,
-                                resolved_model=result.new_model,
-                            )
+                                _topic_sync_warning = (
+                                    "⚠️ Model switched in memory, but the session route could "
+                                    "not be persisted; Discord topic metadata was left unchanged."
+                                )
+                            else:
+                                _topic_sync_warning = await _self._sync_spawn_topic_model_title(
+                                    source,
+                                    raw_config=cfg,
+                                    requested_model=model_id,
+                                    resolved_model=result.new_model,
+                                    current_thread_name=str(
+                                        getattr(
+                                            getattr(event.raw_message, "channel", None),
+                                            "name",
+                                            "",
+                                        )
+                                        or ""
+                                    ),
+                                )
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
@@ -2396,6 +2704,8 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
+                        if _topic_sync_warning:
+                            lines.append(_topic_sync_warning)
                         if _persist_selected:
                             lines.append(t("gateway.model.saved_global"))
                         else:
@@ -2518,6 +2828,16 @@ class GatewaySlashCommandsMixin:
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
+            if not one_turn:
+                alias_error = await self._forum_topic_model_alias_error(
+                    source,
+                    raw_config=cfg,
+                    requested_model=model_input,
+                    resolved_model=result.new_model,
+                )
+                if alias_error:
+                    return alias_error
+
             # If there's a cached agent, update it in-place
             cached_entry = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -2619,6 +2939,7 @@ class GatewaySlashCommandsMixin:
             # the in-memory dict to. (#29923 review defect: the original
             # implementation wrote through, so a crash before the restore
             # rehydrated the once-model permanently.)
+            _topic_sync_warning = ""
             if not one_turn:
                 try:
                     await self.async_session_store.set_model_override(
@@ -2626,16 +2947,28 @@ class GatewaySlashCommandsMixin:
                         self._session_model_overrides[session_key],
                     )
                 except Exception:
-                    logger.debug(
+                    logger.warning(
                         "Failed to persist session model override", exc_info=True
                     )
-
-                await self._sync_spawn_topic_model_title(
-                    source,
-                    raw_config=cfg,
-                    requested_model=model_input,
-                    resolved_model=result.new_model,
-                )
+                    _topic_sync_warning = (
+                        "⚠️ Model switched in memory, but the session route could "
+                        "not be persisted; Discord topic metadata was left unchanged."
+                    )
+                else:
+                    _topic_sync_warning = await self._sync_spawn_topic_model_title(
+                        source,
+                        raw_config=cfg,
+                        requested_model=model_input,
+                        resolved_model=result.new_model,
+                        current_thread_name=str(
+                            getattr(
+                                getattr(event.raw_message, "channel", None),
+                                "name",
+                                "",
+                            )
+                            or ""
+                        ),
+                    )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -2752,6 +3085,8 @@ class GatewaySlashCommandsMixin:
 
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
+            if _topic_sync_warning:
+                lines.append(_topic_sync_warning)
 
             if _persist_selected:
                 lines.append(t("gateway.model.saved_global"))
@@ -3856,6 +4191,7 @@ class GatewaySlashCommandsMixin:
             name=title,
             starter_content=starter,
             owner_user_id=event.source.user_id,
+            model_alias=str(requested_model).strip().lower() or None,
         )
         if not isinstance(result, dict) or not result.get("success"):
             error = result.get("error") if isinstance(result, dict) else "unknown error"

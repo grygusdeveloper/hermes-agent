@@ -703,6 +703,35 @@ async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_set_forum_thread_model_tag_replaces_only_model_tag(adapter):
+    sol = SimpleNamespace(id=1, name="sol-high")
+    gemini = SimpleNamespace(id=2, name="gemini")
+    status = SimpleNamespace(id=3, name="review")
+    parent = SimpleNamespace(available_tags=[sol, gemini, status])
+    thread = SimpleNamespace(
+        id=999,
+        parent=parent,
+        applied_tags=[sol, status],
+        edit=AsyncMock(),
+    )
+    adapter._client.get_channel = lambda _id: thread
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    result = await adapter.set_forum_thread_model_tag(
+        "999",
+        "gemini",
+        model_aliases={"sol-high", "gemini"},
+    )
+
+    assert result is True
+    adapter._client.fetch_channel.assert_awaited_once_with(999)
+    thread.edit.assert_awaited_once_with(
+        applied_tags=[status, gemini],
+        reason="Hermes forum model synchronization",
+    )
+
+
 # ------------------------------------------------------------------
 # Auto-thread integration in _handle_message
 # ------------------------------------------------------------------
