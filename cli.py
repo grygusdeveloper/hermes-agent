@@ -9929,6 +9929,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             api_key=_reset_result.api_key,
                             base_url=_reset_result.base_url,
                             api_mode=_reset_result.api_mode,
+                            command=getattr(_reset_result, "command", None),
+                            args=list(getattr(_reset_result, "args", None) or []),
                         )
                     self.model = _reset_result.new_model
                     self.provider = _reset_result.target_provider
@@ -9941,6 +9943,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self.base_url = _reset_result.base_url
                     if _reset_result.api_mode:
                         self.api_mode = _reset_result.api_mode
+                    self.acp_command = getattr(_reset_result, "command", None) or None
+                    self.acp_args = list(getattr(_reset_result, "args", None) or [])
                     if not silent:
                         _cprint(
                             f"  (model reset to config default: "
@@ -11058,6 +11062,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "acp_command": getattr(self, "acp_command", None),
+            "acp_args": list(getattr(self, "acp_args", None) or []),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
@@ -11076,6 +11082,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key",
             "base_url",
             "api_mode",
+            "acp_command",
+            "acp_args",
         ):
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))
@@ -11103,6 +11111,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=snapshot.get("api_key", ""),
                     base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
+                    command=snapshot.get("acp_command"),
+                    args=list(snapshot.get("acp_args") or []),
                 )
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
@@ -11223,6 +11233,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "acp_command": getattr(self, "acp_command", None),
+            "acp_args": list(getattr(self, "acp_args", None) or []),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -11238,6 +11250,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        self.acp_command = getattr(result, "command", None) or None
+        self.acp_args = list(getattr(result, "args", None) or [])
 
         if self.agent is not None:
             try:
@@ -11247,6 +11261,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    command=getattr(result, "command", None),
+                    args=list(getattr(result, "args", None) or []),
                 )
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
@@ -11612,6 +11628,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "acp_command": getattr(self, "acp_command", None),
+            "acp_args": list(getattr(self, "acp_args", None) or []),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -11627,6 +11645,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        self.acp_command = getattr(result, "command", None) or None
+        self.acp_args = list(getattr(result, "args", None) or [])
 
         # Apply to running agent (in-place swap)
         if self.agent is not None:
@@ -11637,6 +11657,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    command=getattr(result, "command", None),
+                    args=list(getattr(result, "args", None) or []),
                 )
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a

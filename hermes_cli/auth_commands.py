@@ -114,6 +114,8 @@ def _normalize_provider(provider: str) -> str:
         return "openrouter"
     if normalized in {"grok-oauth", "xai-oauth", "x-ai-oauth", "xai-grok-oauth"}:
         return "xai-oauth"
+    if normalized in {"cursor-agent", "cursor-cli"}:
+        return "cursor"
     # Check if it matches a custom provider name
     custom_key = _resolve_custom_provider_input(normalized)
     if custom_key:
@@ -252,6 +254,29 @@ def auth_add_command(args) -> None:
         raise SystemExit(f"Unknown provider: {provider}")
     if configured_provider is not None:
         _migrate_legacy_custom_pool_key(provider, configured_provider["pool_key"])
+
+    if provider == "cursor":
+        requested = str(getattr(args, "auth_type", "") or "").strip().lower()
+        if requested in {AUTH_TYPE_API_KEY, "api-key"}:
+            raise SystemExit(
+                "Cursor API-key pooling is not supported yet. Use the supported "
+                "Cursor subscription/browser flow: `hermes auth add cursor`."
+            )
+        from hermes_cli.cursor_cli import CursorCLIError, get_cursor_auth_status, login_cursor
+
+        before = get_cursor_auth_status()
+        try:
+            status = login_cursor(
+                no_browser=bool(getattr(args, "no_browser", False)),
+                timeout_seconds=float(getattr(args, "timeout", None) or 600.0),
+            )
+        except CursorCLIError as exc:
+            raise SystemExit(str(exc)) from exc
+        if before.get("logged_in"):
+            print("Cursor Agent is already authenticated.")
+        elif status.get("logged_in"):
+            print("Cursor Agent login verified.")
+        return
 
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
     if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:
@@ -618,13 +643,23 @@ def auth_status_command(args) -> None:
         return
 
     print(f"{provider}: logged in")
-    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url"):
+    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url", "command"):
         value = status.get(key)
         if value:
             print(f"  {key}: {value}")
 
 
 def auth_logout_command(args) -> None:
+    provider = _normalize_provider(getattr(args, "provider", None) or "")
+    if provider == "cursor":
+        from hermes_cli.cursor_cli import CursorCLIError, logout_cursor
+
+        try:
+            logout_cursor()
+        except CursorCLIError as exc:
+            raise SystemExit(str(exc)) from exc
+        print("Logged out of Cursor Agent.")
+        return
     auth_mod.logout_command(SimpleNamespace(provider=getattr(args, "provider", None)))
 
 
@@ -772,6 +807,14 @@ def _interactive_add() -> None:
     configured_provider = _configured_provider_entry(provider)
     if not _is_known_provider(provider, configured_provider):
         raise SystemExit(f"Unknown provider: {provider}")
+
+    if provider == "cursor":
+        auth_add_command(SimpleNamespace(
+            provider=provider, auth_type="oauth", label=None, api_key=None,
+            portal_url=None, inference_url=None, client_id=None, scope=None,
+            no_browser=False, timeout=None, insecure=False, ca_bundle=None,
+        ))
+        return
 
     # For OAuth-capable providers, ask which type
     if provider in _OAUTH_CAPABLE_PROVIDERS:

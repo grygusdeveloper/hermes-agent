@@ -101,6 +101,13 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="acp://copilot",
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "cursor": HermesOverlay(
+        # Cursor Agent is a distinct product/provider. It shares the generic
+        # ACP stdio wire with Copilot but owns its own auth and model catalog.
+        transport="openai_chat",
+        auth_type="external_process",
+        base_url_override="acp://cursor",
+    ),
     "github-copilot": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
@@ -331,6 +338,8 @@ ALIASES: Dict[str, str] = {
     "copilot": "github-copilot",
     "github": "github-copilot",
     "github-copilot-acp": "copilot-acp",
+    "cursor-agent": "cursor",
+    "cursor-cli": "cursor",
 
     # vercel (models.dev ID for AI Gateway)
     "ai-gateway": "vercel",
@@ -432,6 +441,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "nous": "Nous Portal",
     "openai-codex": "ChatGPT or Codex Subscription",
     "copilot-acp": "GitHub Copilot ACP",
+    "cursor": "Cursor Agent",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",

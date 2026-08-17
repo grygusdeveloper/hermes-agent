@@ -134,6 +134,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CURSOR_BASE_URL = "acp://cursor"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 DEFAULT_ACTUAL_BASE_URL = "https://api.actual.inc/v1"
 DEFAULT_ACTUAL_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
@@ -304,6 +305,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "cursor": ProviderConfig(
+        id="cursor",
+        name="Cursor Agent",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CURSOR_BASE_URL,
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -2228,6 +2235,7 @@ def resolve_provider(
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "cursor-agent": "cursor", "cursor-cli": "cursor",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "free": "opencode-free", "opencode_free": "opencode-free",
@@ -7259,6 +7267,14 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
+    provider_id = (provider_id or "").strip().lower()
+    if provider_id:
+        try:
+            from hermes_cli.models import normalize_provider
+
+            provider_id = normalize_provider(provider_id)
+        except Exception:
+            pass
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
@@ -7270,6 +7286,16 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     )
     raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+
+    if provider_id == "cursor":
+        from hermes_cli.cursor_cli import get_cursor_auth_status
+
+        status = get_cursor_auth_status()
+        status.setdefault("name", pconfig.name)
+        status.setdefault("base_url", pconfig.inference_base_url)
+        status.setdefault("args", [])
+        return status
+
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
@@ -7292,6 +7318,12 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     target = (provider_id or get_active_provider() or "").strip().lower()
     if not target:
         return {"logged_in": False}
+    try:
+        from hermes_cli.models import normalize_provider
+
+        target = normalize_provider(target)
+    except Exception:
+        pass
     if target == "spotify":
         return get_spotify_auth_status()
     if target == "nous":
@@ -7304,7 +7336,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "cursor"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7480,8 +7512,20 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     }
 
 
-def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
+def resolve_external_process_provider_credentials(
+    provider_id: str,
+    *,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
+    provider_id = (provider_id or "").strip().lower()
+    if provider_id:
+        try:
+            from hermes_cli.models import normalize_provider
+
+            provider_id = normalize_provider(provider_id)
+        except Exception:
+            pass
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         raise AuthError(
@@ -7489,6 +7533,50 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             provider=provider_id,
             code="invalid_provider",
         )
+
+    if provider_id == "cursor":
+        from hermes_cli.cursor_cli import (
+            CursorCLIError,
+            cursor_acp_args,
+            get_cursor_auth_status,
+            resolve_cursor_command,
+        )
+
+        try:
+            configured_command, resolved_command = resolve_cursor_command(require=True)
+            status = get_cursor_auth_status(command=resolved_command)
+            if not status.get("logged_in"):
+                raise AuthError(
+                    status.get("error")
+                    or "Cursor Agent is not authenticated. Run 'hermes auth add cursor'.",
+                    provider=provider_id,
+                    code=str(status.get("error_code") or "cursor_not_authenticated"),
+                )
+            selected_model = str(target_model or "").strip()
+            if not selected_model:
+                try:
+                    from hermes_cli.config import load_config
+
+                    cfg = load_config()
+                    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+                    if isinstance(model_cfg, dict):
+                        selected_model = str(model_cfg.get("default") or "").strip()
+                except Exception:
+                    selected_model = ""
+            return {
+                "provider": provider_id,
+                "api_key": "cursor-agent",
+                "base_url": pconfig.inference_base_url,
+                "command": resolved_command or configured_command,
+                "args": cursor_acp_args(selected_model),
+                "source": "cursor-cli",
+            }
+        except CursorCLIError as exc:
+            raise AuthError(
+                str(exc),
+                provider=provider_id,
+                code=exc.code,
+            ) from exc
 
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:

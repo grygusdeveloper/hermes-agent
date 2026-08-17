@@ -25,7 +25,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, NamedTuple, Optional
 
 from hermes_cli.providers import (
@@ -627,6 +627,8 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    command: str = ""
+    args: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1851,6 +1853,9 @@ def switch_model(
     validation_headers: dict[str, str] = {}
     suppress_ollama_headers = False
 
+    command = ""
+    args: list[str] = []
+
     if provider_changed or explicit_provider:
         # User-config providers (providers.<name> in config.yaml) carry their
         # own base_url + transport + key reference. resolve_runtime_provider()
@@ -1892,6 +1897,9 @@ def switch_model(
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
                 validation_headers = runtime.get("extra_headers") or validation_headers
+
+                command = str(runtime.get("command") or "")
+                args = list(runtime.get("args") or [])
             except Exception:
                 api_key = _ukey
                 base_url = _user_pdef.base_url
@@ -1910,6 +1918,9 @@ def switch_model(
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
                 validation_headers = runtime.get("extra_headers") or validation_headers
+
+                command = str(runtime.get("command") or "")
+                args = list(runtime.get("args") or [])
             except Exception as e:
                 return ModelSwitchResult(
                     success=False,
@@ -1970,6 +1981,8 @@ def switch_model(
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
                 validation_headers = runtime.get("extra_headers") or validation_headers
+                command = str(runtime.get("command") or "")
+                args = list(runtime.get("args") or [])
             except Exception:
                 pass
 
@@ -2183,6 +2196,20 @@ def switch_model(
     if hermes_warn:
         warnings.append(hermes_warn)
 
+    from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+    synced = apply_cursor_runtime_model(
+        {
+            "provider": target_provider,
+            "base_url": base_url,
+            "command": command,
+            "args": list(args),
+        },
+        new_model,
+    )
+    command = str(synced.get("command") or command or "")
+    args = list(synced.get("args") or [])
+
     # --- Build result ---
     return ModelSwitchResult(
         success=True,
@@ -2198,6 +2225,8 @@ def switch_model(
         capabilities=capabilities,
         model_info=model_info,
         is_global=is_global,
+        command=command,
+        args=list(args),
     )
 
 
@@ -2954,6 +2983,14 @@ def list_authenticated_providers(
             has_creds = True
         elif overlay.auth_type == "aws_sdk":
             has_creds = _has_aws_sdk_creds_for_listing(hermes_slug)
+        elif overlay.auth_type == "external_process":
+            try:
+                from hermes_cli.auth import get_auth_status
+
+                status = get_auth_status(hermes_slug) or {}
+                has_creds = bool(status.get("logged_in"))
+            except Exception as exc:
+                logger.debug("External-process auth check failed for %s: %s", hermes_slug, exc)
         elif overlay.auth_type == "vertex":
             # Vertex authenticates via OAuth2 (service-account JSON / ADC),
             # not an API key — mirror the aws_sdk gate above, otherwise the
@@ -3034,7 +3071,7 @@ def list_authenticated_providers(
         if not has_creds:
             continue
 
-        if hermes_slug in {"openai-codex", "copilot", "copilot-acp"}:
+        if hermes_slug in {"openai-codex", "copilot", "copilot-acp", "cursor"}:
             # Use live OAuth-backed discovery so the gateway /model picker
             # matches what the user's authenticated Codex/Copilot backend
             # actually serves — including ChatGPT-Pro-only Codex slugs
