@@ -917,6 +917,26 @@ def test_apply_cursor_runtime_model_rewrites_stale_args():
     assert by_url["args"] == ["--model", "cursor-grok-4.6-xhigh", "acp"]
 
 
+def test_apply_cursor_runtime_model_repairs_missing_command(monkeypatch):
+    monkeypatch.setattr(
+        cursor_cli,
+        "resolve_cursor_command",
+        lambda **_kwargs: ("agent", "/opt/cursor/agent"),
+    )
+    synced = cursor_cli.apply_cursor_runtime_model(
+        {
+            "provider": "cursor",
+            "base_url": "acp://cursor",
+            "command": None,
+            "args": [],
+            "api_key": "cursor-agent",
+        },
+        "cursor-grok-4.6-high",
+    )
+    assert synced["command"] == "/opt/cursor/agent"
+    assert synced["args"] == ["--model", "cursor-grok-4.6-high", "acp"]
+
+
 def test_apply_cursor_runtime_model_leaves_copilot_and_xai_alone():
     copilot = {
         "provider": "copilot-acp",
@@ -959,6 +979,37 @@ def test_gateway_turn_config_refreshes_stale_cursor_args():
     assert route["model"] == "cursor-grok-4.6-xhigh"
     assert route["runtime"]["args"] == ["--model", "cursor-grok-4.6-xhigh", "acp"]
     assert route["signature"][6] == ("--model", "cursor-grok-4.6-xhigh", "acp")
+
+
+def test_gateway_turn_config_repairs_persisted_cursor_route_without_command(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr(
+        cursor_cli,
+        "resolve_cursor_command",
+        lambda **_kwargs: ("agent", "/opt/cursor/agent"),
+    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._service_tier = None
+    route = runner._resolve_turn_agent_config(
+        "hello",
+        "cursor-grok-4.6-high",
+        {
+            "provider": "cursor",
+            "api_key": "cursor-agent",
+            "base_url": "acp://cursor",
+            "api_mode": "chat_completions",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+            "max_tokens": None,
+        },
+    )
+    assert route["runtime"]["command"] == "/opt/cursor/agent"
+    assert route["runtime"]["args"] == ["--model", "cursor-grok-4.6-high", "acp"]
+    client = CopilotACPClient(**route["runtime"])
+    assert client._acp_command == "/opt/cursor/agent"
+    assert client._acp_args == ["--model", "cursor-grok-4.6-high", "acp"]
 
 
 def test_is_cursor_runtime_accepts_aliases_and_rejects_neighbors():

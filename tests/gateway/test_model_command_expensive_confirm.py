@@ -53,6 +53,8 @@ def _fake_switch_result():
         base_url="https://openrouter.ai/api/v1",
         api_mode="chat_completions",
         provider_label="OpenRouter",
+        command="/opt/cursor/agent",
+        args=["--model", "cursor-grok-4.6-high", "acp"],
     )
 
 
@@ -99,6 +101,19 @@ async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monke
     runner = _make_runner()
     runner._evict_cached_agent = lambda session_key: None
 
+    switched = {}
+
+    class _CachedAgent:
+        def switch_model(self, **kwargs):
+            switched.update(kwargs)
+
+    import threading
+    from collections import OrderedDict
+
+    session_key = runner._session_key_for_source(_make_event("/model x").source)
+    runner._agent_cache = OrderedDict({session_key: (_CachedAgent(), None)})
+    runner._agent_cache_lock = threading.Lock()
+
     captured = {}
 
     async def _fake_request_slash_confirm(**kwargs):
@@ -116,6 +131,8 @@ async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monke
     overrides = list(runner._session_model_overrides.values())
     assert len(overrides) == 1
     assert overrides[0]["model"] == "openai/gpt-5.5-pro"
+    assert switched["command"] == "/opt/cursor/agent"
+    assert switched["args"] == ["--model", "cursor-grok-4.6-high", "acp"]
 
 
 @pytest.mark.asyncio
@@ -133,12 +150,15 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     runner = _make_runner()
 
     # Working cached agent whose in-place swap fails (and rolls itself back).
+    switched = {}
+
     class _FailingAgent:
         def __init__(self):
             self.model = "old-model"
             self.provider = "openrouter"
 
         def switch_model(self, **kwargs):
+            switched.update(kwargs)
             # Mirrors agent_runtime_helpers.switch_model: the real method
             # restores old state then re-raises. We keep model unchanged.
             raise RuntimeError("connection refused: bad base_url")
@@ -166,3 +186,5 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     assert evicted == []
     # The agent stayed on its old model (rolled back).
     assert agent.model == "old-model"
+    assert switched["command"] == "/opt/cursor/agent"
+    assert switched["args"] == ["--model", "cursor-grok-4.6-high", "acp"]
