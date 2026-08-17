@@ -10,9 +10,14 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import utf16_len
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
-from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.slash_commands import (
+    GatewaySlashCommandsMixin,
+    _spawn_topic_essence,
+    _spawn_topic_title,
+)
 from hermes_cli.commands import ACTIVE_SESSION_BYPASS_COMMANDS, resolve_command
 
 
@@ -26,6 +31,9 @@ class SpawnHarness(GatewaySlashCommandsMixin):
 
     def _adapter_for_source(self, _source):
         return self._adapter
+
+    def _session_key_for_source(self, source):
+        return build_session_key(source)
 
 
 def _discord_dm_event(text: str) -> MessageEvent:
@@ -47,6 +55,144 @@ def test_spawn_is_gateway_command_with_busy_session_handler():
     assert command is not None
     assert command.gateway_only is True
     assert "spawn" in ACTIVE_SESSION_BYPASS_COMMANDS
+
+
+def test_spawn_topic_title_limits_essence_and_uses_friendly_model():
+    request = "Please analyze the current Discord gateway reliability settings"
+    assert _spawn_topic_essence(request) == "analyze Discord gateway reliability"
+    assert _spawn_topic_title(request, "Gemini 3.7 Flash High") == (
+        "analyze Discord gateway reliability · Gemini 3.7 Flash High"
+    )
+    long_title = _spawn_topic_title("😀 reliability audit settings", "X" * 96)
+    assert utf16_len(long_title) <= 80
+    assert " · " in long_title
+
+
+@pytest.mark.asyncio
+async def test_spawn_topic_model_sync_preserves_essence_and_renames():
+    adapter = SimpleNamespace(rename_thread=AsyncMock(return_value={"success": True}))
+    store = SimpleNamespace(get_execution_profile=AsyncMock(return_value="default"))
+    runner = SpawnHarness(adapter, store)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_name="Hermes config audit · Sol",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+    )
+    config = {
+        "gateway": {"spawn": {"parent_channel_id": "forum-1"}},
+        "model_aliases": {
+            "sol-high": {
+                "label": "Sol",
+                "model": "gpt-5.6-sol",
+            },
+            "gemini": {
+                "label": "Gemini 3.7 Flash High",
+                "model": "gemini-3.7-flash-high",
+            }
+        },
+    }
+
+    await runner._sync_spawn_topic_model_title(
+        source,
+        raw_config=config,
+        requested_model="gemini",
+        resolved_model="gemini-3.7-flash-high",
+    )
+
+    adapter.rename_thread.assert_awaited_once_with(
+        "thread-1",
+        "Hermes config audit · Gemini 3.7 Flash High",
+        only_if_current_name="Hermes config audit · Sol",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("execution_profile", "chat_name"),
+    [
+        (None, "Manual forum post · Sol"),
+        ("default", "Human custom title"),
+        ("default", "Human custom title · Personal"),
+    ],
+)
+async def test_spawn_topic_model_sync_does_not_clobber_manual_titles(
+    execution_profile, chat_name
+):
+    adapter = SimpleNamespace(rename_thread=AsyncMock(return_value=True))
+    store = SimpleNamespace(
+        get_execution_profile=AsyncMock(return_value=execution_profile)
+    )
+    runner = SpawnHarness(adapter, store)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_name=chat_name,
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+    )
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "models": {"sol-high": {"label": "Sol High", "model": "sol"}},
+            }
+        },
+        "model_aliases": {"sol-high": {"label": "Sol", "model": "sol"}},
+    }
+
+    await runner._sync_spawn_topic_model_title(
+        source,
+        raw_config=config,
+        requested_model="sol-high",
+        resolved_model="sol",
+    )
+
+    adapter.rename_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_spawn_topic_model_sync_recognizes_truncated_long_model_suffix():
+    old_label = "O" * 96
+    current_name = _spawn_topic_title("Audit", old_label)
+    adapter = SimpleNamespace(rename_thread=AsyncMock(return_value=True))
+    store = SimpleNamespace(get_execution_profile=AsyncMock(return_value="default"))
+    runner = SpawnHarness(adapter, store)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_name=current_name,
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+    )
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "models": {
+                    "old": {"label": old_label, "model": "old-wire"},
+                    "new": {"label": "New Model", "model": "new-wire"},
+                },
+            }
+        }
+    }
+
+    await runner._sync_spawn_topic_model_title(
+        source,
+        raw_config=config,
+        requested_model="new",
+        resolved_model="new-wire",
+    )
+
+    adapter.rename_thread.assert_awaited_once_with(
+        "thread-1",
+        "Au · New Model",
+        only_if_current_name=current_name,
+    )
 
 
 def test_session_entry_roundtrip_persists_execution_profile():
@@ -160,7 +306,7 @@ async def test_spawn_creates_thread_and_persists_profile_and_model_alias():
     adapter.create_spawn_thread.assert_awaited_once()
     create_kwargs = adapter.create_spawn_thread.await_args.kwargs
     assert create_kwargs["parent_chat_id"] == "parent-1"
-    assert create_kwargs["name"] == "Research task"
+    assert create_kwargs["name"] == "Research task · glm52"
     assert create_kwargs["owner_user_id"] == "owner-1"
 
     spawned_source = store.get_or_create_session.await_args.args[0]
@@ -177,6 +323,71 @@ async def test_spawn_creates_thread_and_persists_profile_and_model_alias():
         {"model": "glm-5.2", "provider": "zai", "reasoning_effort": "high"},
     )
     runner._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_spawn_uses_configured_default_model_and_specific_label():
+    adapter = SimpleNamespace(
+        create_spawn_thread=AsyncMock(
+            return_value={
+                "success": True,
+                "thread_id": "thread-default",
+                "thread_name": "Default choice · Sol High",
+                "guild_id": "guild-1",
+            }
+        )
+    )
+    spawned_entry = SimpleNamespace(session_key="spawn-default-key")
+    store = SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=spawned_entry),
+        set_execution_profile=AsyncMock(),
+        set_model_override=AsyncMock(),
+    )
+    runner = SpawnHarness(adapter, store)
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "parent-1",
+                "default_model": "sol-high",
+                "models": {
+                    "sol-high": {
+                        "label": "Sol High",
+                        "model": "gpt-5.6-sol",
+                        "provider": "openai-codex",
+                        "reasoning_effort": "high",
+                    }
+                },
+            }
+        },
+        "model_aliases": {
+            "sol-high": {
+                "label": "Sol",
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "reasoning_effort": "high",
+            }
+        },
+    }
+
+    with (
+        patch("gateway.run._load_gateway_config", return_value=config),
+        patch("hermes_cli.profiles.profile_exists", return_value=True),
+    ):
+        result = await runner._handle_spawn_command(
+            _discord_dm_event('/spawn --title "Default choice"')
+        )
+
+    assert "Model: `Sol High`" in result
+    create_kwargs = adapter.create_spawn_thread.await_args.kwargs
+    assert create_kwargs["name"] == "Default choice · Sol High"
+    store.set_model_override.assert_awaited_once_with(
+        spawned_entry.session_key,
+        {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "reasoning_effort": "high",
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -225,6 +436,8 @@ async def test_global_model_alias_can_bind_dedicated_execution_profile():
         )
 
     assert result.startswith("✅ Spawned <#thread-gemini>")
+    create_kwargs = adapter.create_spawn_thread.await_args.kwargs
+    assert create_kwargs["name"] == "Gemini task · gemini"
     store.set_execution_profile.assert_awaited_once_with(
         spawned_entry.session_key, "gemini"
     )
@@ -388,6 +601,29 @@ async def test_create_spawn_thread_adds_owner_without_member_cache():
     member = thread.add_user.await_args.args[0]
     assert str(member.id) == "210318156432932864"
     spawn_owner_mark.assert_called_once_with("12345:210318156432932864")
+
+
+@pytest.mark.asyncio
+async def test_rename_spawn_thread_updates_discord_name():
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    thread = SimpleNamespace(id=12345, name="Old · Sol", edit=AsyncMock())
+    adapter = DiscordAdapter.__new__(DiscordAdapter)
+    adapter.platform = Platform.DISCORD
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _channel_id: thread,
+        fetch_channel=AsyncMock(return_value=thread),
+    )
+
+    result = await DiscordAdapter.rename_thread(
+        adapter, "12345", "Audit configs · Gemini 3.7 Flash High"
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Audit configs · Gemini 3.7 Flash High",
+        reason="Hermes semantic session title",
+    )
 
 
 @pytest.mark.asyncio

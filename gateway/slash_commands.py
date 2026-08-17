@@ -33,7 +33,13 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
-from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.platforms.base import (
+    EphemeralReply,
+    MessageEvent,
+    MessageType,
+    _prefix_within_utf16_limit,
+    utf16_len,
+)
 from gateway.topic_links import sanitize_discord_topic_label
 from gateway.session import (
     AsyncSessionStore,
@@ -60,6 +66,82 @@ _RESET_CLEANUP_TIMEOUT_S = 30.0
 def _clean_str(value: Any) -> str:
     """Strip and return a non-empty string value, or empty string."""
     return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+_SPAWN_TOPIC_SEPARATOR = " · "
+_SPAWN_ESSENCE_STOPWORDS = {
+    "a", "an", "and", "can", "could", "for", "help", "me", "please",
+    "the", "to", "with", "would", "you", "current", "my",
+    "czy", "dla", "mi", "możesz", "pomóż", "proszę", "w", "z",
+}
+
+
+def _spawn_topic_essence(value: Any, *, max_words: int = 4) -> str:
+    """Return a compact, recognizable topic essence from a request/title.
+
+    The result is deterministic because /spawn must name the Discord topic
+    before its first model turn runs. Existing ``essence · model`` titles are
+    accepted so later /model switches can preserve the human-facing essence.
+    """
+    text = str(value or "").splitlines()[0].strip()
+    if _SPAWN_TOPIC_SEPARATOR in text:
+        text = text.split(_SPAWN_TOPIC_SEPARATOR, 1)[0].strip()
+    text = re.sub(r"https?://\S+", " ", text)
+    tokens = re.findall(r"[^\W_][\w+.#'/-]*", text, flags=re.UNICODE)
+    useful = [token for token in tokens if token.casefold() not in _SPAWN_ESSENCE_STOPWORDS]
+    chosen = (useful or tokens)[:max(1, max_words)]
+    essence = " ".join(chosen).strip(" .·-—_:;") or "New chat"
+    return essence[:60].strip() or "New chat"
+
+
+def _spawn_model_label(raw_config: Any, requested: str, resolved: str = "") -> str:
+    """Resolve a friendly /model alias label for a spawned Discord topic."""
+    cfg = raw_config if isinstance(raw_config, dict) else {}
+    requested_key = str(requested or "").strip().casefold()
+    resolved_key = str(resolved or "").strip().casefold()
+    sections: list[dict[str, Any]] = []
+    gateway_cfg = cfg.get("gateway")
+    spawn_cfg = gateway_cfg.get("spawn") if isinstance(gateway_cfg, dict) else None
+    spawn_models = spawn_cfg.get("models") if isinstance(spawn_cfg, dict) else None
+    if isinstance(spawn_models, dict):
+        sections.append(spawn_models)
+    # The spawn catalog may intentionally use a more specific display label
+    # than /model (for example Sol High vs Sol XHigh for the same wire model),
+    # so it wins while the canonical aliases remain the fallback.
+    aliases = cfg.get("model_aliases")
+    if isinstance(aliases, dict):
+        sections.append(aliases)
+
+    for section in sections:
+        for raw_alias, raw_spec in section.items():
+            alias = str(raw_alias).strip()
+            if isinstance(raw_spec, dict):
+                model = str(raw_spec.get("model") or "").strip()
+                label = str(raw_spec.get("label") or alias).strip()
+            else:
+                model = str(raw_spec or "").strip()
+                label = alias
+            if requested_key and requested_key == alias.casefold():
+                return label or alias
+            if resolved_key and model.casefold() == resolved_key:
+                return label or alias
+    return str(requested or resolved or "Default").strip() or "Default"
+
+
+def _spawn_topic_title(essence_source: Any, model_label: Any) -> str:
+    """Build ``≤4-word essence · friendly model`` within Discord's 80-unit limit."""
+    essence = _spawn_topic_essence(essence_source, max_words=4)
+    label = re.sub(r"\s+", " ", str(model_label or "Default")).strip()
+    suffix = f"{_SPAWN_TOPIC_SEPARATOR}{label or 'Default'}"
+    # Discord accepts longer names, but the adapter's established semantic-title
+    # contract caps names at 80 UTF-16 code units. Preserve the authoritative
+    # model suffix instead of letting the adapter's generic tail truncation cut it.
+    if utf16_len(suffix) >= 80:
+        label = _prefix_within_utf16_limit(label or "Default", 75).rstrip()
+        suffix = f"{_SPAWN_TOPIC_SEPARATOR}{label}"
+    essence_budget = max(1, 80 - utf16_len(suffix))
+    essence = _prefix_within_utf16_limit(essence, essence_budget).rstrip()
+    return f"{essence or 'N'}{suffix}"
 
 
 def _int_value(value: Any) -> int:
@@ -103,6 +185,103 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+    _session_model_overrides: dict[str, dict[str, Any]]
+    _pending_one_turn_model_restores: dict[str, dict[str, Any]]
+
+    async def _sync_spawn_topic_model_title(
+        self,
+        source: SessionSource,
+        *,
+        raw_config: Any,
+        requested_model: str,
+        resolved_model: str,
+    ) -> None:
+        """Keep a spawned Discord forum topic's title aligned to its model."""
+        if source.platform != Platform.DISCORD or not source.thread_id:
+            return
+        gateway_cfg = raw_config.get("gateway") if isinstance(raw_config, dict) else None
+        spawn_cfg = gateway_cfg.get("spawn") if isinstance(gateway_cfg, dict) else None
+        parent_channel_id = str(
+            spawn_cfg.get("parent_channel_id") if isinstance(spawn_cfg, dict) else ""
+        ).strip()
+        if not parent_channel_id or str(source.parent_chat_id or "") != parent_channel_id:
+            return
+        # A channel merely living under the configured forum is not necessarily
+        # a /spawn workspace. Execution profile persistence is the durable marker
+        # set by /spawn; fail closed so manual forum posts are never retitled.
+        get_execution_profile = getattr(
+            getattr(self, "async_session_store", None),
+            "get_execution_profile",
+            None,
+        )
+        if not callable(get_execution_profile):
+            return
+        session_key_resolver = getattr(self, "_session_key_for_source", None)
+        if not callable(session_key_resolver):
+            return
+        profile_result = get_execution_profile(session_key_resolver(source))
+        if inspect.isawaitable(profile_result):
+            profile_result = await profile_result
+        if not profile_result:
+            return
+        current_name = str(source.chat_name or "").strip()
+        if _SPAWN_TOPIC_SEPARATOR not in current_name:
+            return
+        current_suffix = current_name.rsplit(_SPAWN_TOPIC_SEPARATOR, 1)[1].strip().casefold()
+        known_labels: set[str] = set()
+        aliases = raw_config.get("model_aliases") if isinstance(raw_config, dict) else None
+        spawn_models = spawn_cfg.get("models") if isinstance(spawn_cfg, dict) else None
+        for section in (spawn_models, aliases):
+            if not isinstance(section, dict):
+                continue
+            for alias, spec in section.items():
+                label = spec.get("label") if isinstance(spec, dict) else alias
+                # Compare against the same normalized/truncated suffix emitted
+                # by _spawn_topic_title, including pathological long labels.
+                managed_title = _spawn_topic_title("N", label or alias)
+                known_labels.add(
+                    managed_title.rsplit(_SPAWN_TOPIC_SEPARATOR, 1)[1]
+                    .strip()
+                    .casefold()
+                )
+        if current_suffix not in known_labels:
+            return
+        adapter_resolver = getattr(self, "_adapter_for_source", None)
+        if not callable(adapter_resolver):
+            return
+        adapter = adapter_resolver(source)
+        rename_thread = getattr(adapter, "rename_thread", None)
+        if not callable(rename_thread):
+            return
+        model_label = _spawn_model_label(raw_config, requested_model, resolved_model)
+        new_name = _spawn_topic_title(current_name, model_label)
+        try:
+            result = rename_thread(
+                str(source.thread_id),
+                new_name,
+                only_if_current_name=current_name,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            if result is False:
+                logger.warning(
+                    "Could not synchronize spawned Discord topic %s title",
+                    source.thread_id,
+                )
+            if isinstance(result, dict) and not result.get("success", False):
+                logger.warning(
+                    "Could not synchronize spawned Discord topic %s title: %s",
+                    source.thread_id,
+                    result.get("error") or "unknown error",
+                )
+        except Exception as exc:
+            # The model switch itself is authoritative; a cosmetic Discord rename
+            # must never roll it back or make /model look unsuccessful.
+            logger.warning(
+                "Could not synchronize spawned Discord topic %s title: %s",
+                source.thread_id,
+                exc,
+            )
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -1858,6 +2037,7 @@ class GatewaySlashCommandsMixin:
         user_provs = None
         custom_provs = None
         excluded_provs = []
+        cfg: dict[str, Any] = {}
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
             cfg = _load_gateway_config()
@@ -2030,9 +2210,11 @@ class GatewaySlashCommandsMixin:
                                 )
 
                         # Persist the new model to the session DB so the
-                        # dashboard shows the updated model (#34850).
+                        # dashboard shows the updated model (#34850). A picker
+                        # invoked via /model --once must remain crash-safe and
+                        # leave every durable store at the pre-switch model.
                         _sess_db = getattr(_self, "_session_db", None)
-                        if _sess_db is not None:
+                        if _sess_db is not None and not one_turn:
                             try:
                                 _sess_entry = await _self.async_session_store.get_or_create_session(
                                     event.source
@@ -2057,6 +2239,7 @@ class GatewaySlashCommandsMixin:
                         _self._pending_model_notes[_session_key] = (
                             f"[Note: model was just switched from {_display_cur} to {_display_new} "
                             f"via {result.provider_label or result.target_provider}. "
+                            f"{'This override applies to the next turn only. ' if one_turn else ''}"
                             f"Adjust your self-identification accordingly.]"
                         )
                         _self._session_model_overrides[_session_key] = {
@@ -2071,18 +2254,36 @@ class GatewaySlashCommandsMixin:
                             _session_key, result.reasoning_effort
                         )
 
+                        if one_turn:
+                            if not hasattr(_self, "_pending_one_turn_model_restores"):
+                                _self._pending_one_turn_model_restores = {}
+                            _self._pending_one_turn_model_restores[_session_key] = (
+                                restore_snapshot
+                                or {"had_override": False, "override": None}
+                            )
+                        elif hasattr(_self, "_pending_one_turn_model_restores"):
+                            _self._pending_one_turn_model_restores.pop(_session_key, None)
+
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
                         # (api_key is never persisted).
-                        try:
-                            await _self.async_session_store.set_model_override(
-                                _session_key,
-                                _self._session_model_overrides[_session_key],
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to persist session model override",
-                                exc_info=True,
+                        if not one_turn:
+                            try:
+                                await _self.async_session_store.set_model_override(
+                                    _session_key,
+                                    _self._session_model_overrides[_session_key],
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Failed to persist session model override",
+                                    exc_info=True,
+                                )
+
+                            await _self._sync_spawn_topic_model_title(
+                                source,
+                                raw_config=cfg,
+                                requested_model=model_id,
+                                resolved_model=result.new_model,
                             )
 
                         # Evict cached agent so the next turn creates a fresh
@@ -2425,6 +2626,13 @@ class GatewaySlashCommandsMixin:
                         "Failed to persist session model override", exc_info=True
                     )
 
+                await self._sync_spawn_topic_model_title(
+                    source,
+                    raw_config=cfg,
+                    requested_model=model_input,
+                    resolved_model=result.new_model,
+                )
+
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
@@ -2435,22 +2643,22 @@ class GatewaySlashCommandsMixin:
                     # Write-back round-trip: raw read is correct (merged
                     # defaults must not be persisted back to the user's file).
                     from hermes_cli.config import read_user_config_raw
-                    cfg = read_user_config_raw(config_path)
+                    persist_cfg = read_user_config_raw(config_path)
                     # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
+                    # otherwise ``persist_cfg.setdefault("model", {})`` returns the existing
                     # scalar and the next assignment raises
                     # ``TypeError: 'str' object does not support item assignment``.
                     # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
                     # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
+                    raw_model = persist_cfg.get("model")
                     if isinstance(raw_model, dict):
                         model_cfg = raw_model
                     elif isinstance(raw_model, str) and raw_model.strip():
                         model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
+                        persist_cfg["model"] = model_cfg
                     else:
                         model_cfg = {}
-                        cfg["model"] = model_cfg
+                        persist_cfg["model"] = model_cfg
                     try:
                         from hermes_cli.route_identity import should_clear_context_pin_async
 
@@ -2482,7 +2690,7 @@ class GatewaySlashCommandsMixin:
                     else:
                         clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
                     from hermes_cli.config import save_config
-                    save_config(cfg)
+                    save_config(persist_cfg)
                 except Exception as e:
                     logger.warning("Failed to persist model switch: %s", e)
 
@@ -3555,7 +3763,9 @@ class GatewaySlashCommandsMixin:
                 "`gateway.spawn.parent_channel_id` in `config.yaml`."
             )
 
-        requested_model = values["model"].strip()
+        requested_model = (
+            values["model"] or str(spawn_cfg.get("default_model") or "")
+        ).strip()
         model_override: dict[str, str] | None = None
         model_aliases: dict[str, Any] = {}
         global_models = spawn_cfg.get("models")
@@ -3609,21 +3819,20 @@ class GatewaySlashCommandsMixin:
                 return f"❌ Model alias `{requested_model}` has no model configured."
 
         prompt = values["prompt"].strip()
-        title = values["title"].strip()
-        if not title:
-            if prompt:
-                title = prompt.splitlines()[0]
-            else:
-                model_label = requested_model or "default-model"
-                title = f"{requested_agent} · {model_label}"
-        title = re.sub(r"\s+", " ", title).strip()[:80] or "Hermes task"
+        essence_source = values["title"].strip() or prompt or requested_agent
+        model_label = _spawn_model_label(
+            raw_config,
+            requested_model,
+            model_override.get("model", "") if model_override else "",
+        )
+        title = _spawn_topic_title(essence_source, model_label)
 
         adapter = self._adapter_for_source(event.source)
         create_spawn_thread = getattr(adapter, "create_spawn_thread", None)
         if adapter is None or not callable(create_spawn_thread):
             return "❌ The active Discord adapter does not support `/spawn`."
 
-        model_display = requested_model or "profile default"
+        model_display = model_label
         if prompt:
             next_step = "The initial task is queued below and will run immediately."
         else:
