@@ -430,9 +430,13 @@ def apply_cursor_runtime_model(
     runtime: Mapping[str, Any],
     model: str,
 ) -> dict[str, Any]:
-    """Rewrite Cursor ACP argv so a later model override cannot keep a stale ``--model``.
+    """Complete Cursor ACP argv so model overrides remain directly launchable.
 
-    Copilot ACP args are not model-specific and are left unchanged.
+    Cursor deliberately refuses the process-global Copilot ACP environment
+    overrides.  Session model overrides can outlive their in-memory runtime
+    details, so repair a missing executable from Cursor's own configuration in
+    addition to rewriting the model-specific args.  Copilot ACP runtimes are
+    left unchanged.
     """
     result = dict(runtime)
     if not is_cursor_runtime(
@@ -443,5 +447,8 @@ def apply_cursor_runtime_model(
     selected = str(model or "").strip()
     if not selected:
         return result
+    if not str(result.get("command") or "").strip():
+        configured, resolved = resolve_cursor_command(require=True)
+        result["command"] = resolved or configured
     result["args"] = cursor_acp_args(selected)
     return result
