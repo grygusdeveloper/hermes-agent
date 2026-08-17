@@ -4545,8 +4545,10 @@ class TurnRunner:
                         source, session_id, title,
                     )
                 )
-            elif self._runner._is_discord_auto_thread_lane(source) or (
-                self._runner._is_relay_discord_channel_lane(source)
+            elif (
+                self._runner._is_discord_auto_thread_lane(source)
+                or self._runner._is_relay_discord_channel_lane(source)
+                or self._runner._is_discord_spawn_forum_lane(source)
             ):
                 # Relay note: the second predicate is shape-only (relay
                 # Discord channel event). Whether the connector actually
@@ -14604,6 +14606,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "spawn": self._handle_spawn_command,
                 "topics": self._handle_topics_command,
                 "favorites": self._handle_favorites_command,
+                "heart": self._handle_heart_command,
+                "fav": self._handle_heart_command,
             }.get(name)
             if plain is not None:
                 return await plain(event)
@@ -15656,6 +15660,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "favorites":
             return await self._handle_favorites_command(event)
+
+        if canonical in {"heart", "fav"}:
+            return await self._handle_heart_command(event)
 
         if canonical == "profile":
             return await self._handle_profile_command(event)
@@ -20553,6 +20560,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cleaned = cleaned[:117].rstrip() + "..."
         return cleaned
 
+    def _is_discord_spawn_forum_lane(self, source: SessionSource) -> bool:
+        """Return True for messages inside the configured Discord spawn forum."""
+        if source.platform != Platform.DISCORD or not source.thread_id:
+            return False
+        from gateway.run import _load_gateway_config
+        raw_config = _load_gateway_config() or {}
+        gateway_cfg = raw_config.get("gateway") if isinstance(raw_config, dict) else {}
+        spawn_cfg = gateway_cfg.get("spawn") if isinstance(gateway_cfg, dict) else {}
+        parent_id = str(spawn_cfg.get("parent_channel_id") or "").strip()
+        return bool(parent_id and str(source.parent_chat_id or "") == parent_id)
+
     def _is_discord_auto_thread_lane(self, source: SessionSource) -> bool:
         """Return True only for Discord threads Hermes just auto-created."""
         return (
@@ -20681,9 +20699,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         markers (see _relay_auto_thread_info). When absent, the native
         marker-based lane supplies thread identity from the source itself.
         """
+        is_spawn_forum = await asyncio.to_thread(
+            self._is_discord_spawn_forum_lane, source
+        )
         if relay_info is None and not await asyncio.to_thread(
             self._is_discord_auto_thread_lane, source
-        ):
+        ) and not is_spawn_forum:
             # Relay title turn with no feedback captured at schedule time: the
             # title comes off the user's opening message, so it beats the
             # delivery that produces the connector's send-result feedback
@@ -20715,7 +20736,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if use_connector_guard
             else getattr(source, "auto_thread_initial_name", None)
         )
-        thread_name = self._sanitize_discord_thread_title(title)
+        if is_spawn_forum:
+            from gateway.slash_commands import (
+                _is_spawn_topic_placeholder,
+                _spawn_model_label,
+                _spawn_topic_title,
+            )
+            fetch_fn = getattr(getattr(adapter, "_client", None), "fetch_channel", None)
+            current_thread = None
+            try:
+                if callable(fetch_fn):
+                    current_thread = await fetch_fn(int(target_thread_id))
+            except Exception:
+                pass
+            current_name = str(getattr(current_thread, "name", "") or "").strip()
+            if current_name and not _is_spawn_topic_placeholder(current_name):
+                return
+            raw_config = _load_gateway_config() or {}
+            key = self._session_key_for_source(source)
+            override = None
+            try:
+                override = await self.async_session_store.get_model_override(key)
+            except Exception:
+                pass
+            model_name = override.get("model", "") if isinstance(override, dict) else ""
+            model_label = _spawn_model_label(raw_config, "", model_name)
+            prefix = "❤️ " if (current_name.startswith("❤️") or current_name.startswith("❤")) else ""
+            thread_name = f"{prefix}{_spawn_topic_title(title, model_label)}"
+        else:
+            thread_name = self._sanitize_discord_thread_title(title)
         # Relay lane only: the connector's egress guard resolves the owning
         # tenant from the outbound metadata's scope_id (guild) / user_id
         # (author). Those discriminator caches are keyed by the PARENT channel
@@ -20772,8 +20821,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # whenever the SHAPE matches; the async rename lane polls the
             # cache (with a bounded wait) and no-ops on a true miss.
             relay_info = self._relay_auto_thread_info(source)
-            if relay_info is None and not self._is_relay_discord_channel_lane(
-                source
+            if (
+                relay_info is None
+                and not self._is_relay_discord_channel_lane(source)
+                and not self._is_discord_spawn_forum_lane(source)
             ):
                 return
         try:

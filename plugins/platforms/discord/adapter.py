@@ -7954,6 +7954,108 @@ class DiscordAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 return False
+
+    async def toggle_forum_thread_heart(
+        self,
+        thread_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Toggle a favorite heart (❤️) marker in the thread name and tags."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+        try:
+            channel_id = int(str(thread_id))
+        except (TypeError, ValueError):
+            return None
+
+        locks = getattr(self, "_forum_tag_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._forum_tag_locks = locks
+        lock = locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            try:
+                fetch_channel = getattr(self._client, "fetch_channel", None)
+                thread = (
+                    await fetch_channel(channel_id)
+                    if callable(fetch_channel)
+                    else self._client.get_channel(channel_id)
+                )
+                if thread is None:
+                    return None
+
+                current_name = str(getattr(thread, "name", "") or "").strip()
+                parent = getattr(thread, "parent", None)
+                parent_id = getattr(thread, "parent_id", None)
+                if parent_id is None:
+                    parent_id = getattr(parent, "id", None)
+                if parent_id is not None and callable(fetch_channel):
+                    parent = await fetch_channel(int(parent_id))
+                elif parent is None and parent_id is not None:
+                    parent = self._client.get_channel(int(parent_id))
+
+                available = list(getattr(parent, "available_tags", None) or [])
+                by_id = {str(getattr(tag, "id", "")): tag for tag in available}
+                heart_tags = [
+                    tag for tag in available
+                    if str(getattr(tag, "name", "") or "").strip() in {"❤️", "❤", "favorite", "heart"}
+                ]
+                heart_tag_ids = {str(getattr(tag, "id", "")) for tag in heart_tags}
+
+                current_tag_ids = [
+                    str(getattr(tag, "id", tag))
+                    for tag in list(getattr(thread, "applied_tags", None) or [])
+                ]
+
+                is_currently_hearted = (
+                    current_name.startswith("❤️ ") or current_name.startswith("❤️") or current_name.startswith("❤ ") or current_name.startswith("❤") or
+                    any(tid in heart_tag_ids for tid in current_tag_ids)
+                )
+
+                if is_currently_hearted:
+                    new_name = current_name
+                    if new_name.startswith("❤️ "):
+                        new_name = new_name[3:].strip()
+                    elif new_name.startswith("❤️"):
+                        new_name = new_name[2:].strip()
+                    elif new_name.startswith("❤ "):
+                        new_name = new_name[2:].strip()
+                    elif new_name.startswith("❤"):
+                        new_name = new_name[1:].strip()
+                    desired_tag_ids = [tid for tid in current_tag_ids if tid not in heart_tag_ids]
+                    hearted = False
+                else:
+                    from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
+                    new_name = f"❤️ {current_name}"
+                    if utf16_len(new_name) > 80:
+                        new_name = _prefix_within_utf16_limit(new_name, 77).rstrip() + "..."
+                    desired_tag_ids = list(current_tag_ids)
+                    if heart_tags:
+                        target_heart_id = str(getattr(heart_tags[0], "id", ""))
+                        if target_heart_id and target_heart_id not in desired_tag_ids:
+                            desired_tag_ids.append(target_heart_id)
+                    hearted = True
+
+                desired_tags = [by_id[tid] for tid in desired_tag_ids if tid in by_id]
+                edit_kwargs: dict[str, Any] = {}
+                if new_name != current_name:
+                    edit_kwargs["name"] = new_name
+                if desired_tag_ids != current_tag_ids:
+                    edit_kwargs["applied_tags"] = desired_tags
+
+                if edit_kwargs:
+                    edit = getattr(thread, "edit", None)
+                    if callable(edit):
+                        await edit(**edit_kwargs, reason="Hermes topic heart toggle")
+                        logger.info(
+                            "[%s] Toggled heart for thread %s -> %s (title=%r)",
+                            self.name, thread_id, hearted, new_name,
+                        )
+
+                return {"hearted": hearted, "title": new_name}
+            except Exception:
+                logger.warning("[%s] Failed to toggle heart for thread %s", self.name, thread_id, exc_info=True)
+                return None
+
     async def create_handoff_thread(
         self,
         parent_chat_id: str,

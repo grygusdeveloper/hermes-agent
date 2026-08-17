@@ -885,3 +885,47 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_toggle_forum_thread_heart(adapter):
+    fake_parent = MagicMock()
+    heart_tag = SimpleNamespace(id=999, name="❤️")
+    other_tag = SimpleNamespace(id=111, name="gemini")
+    fake_parent.available_tags = [heart_tag, other_tag]
+
+    fake_thread = MagicMock()
+    fake_thread.name = "test · Gemini 3.7 Flash High"
+    fake_thread.parent = fake_parent
+    fake_thread.parent_id = 555
+    fake_thread.applied_tags = [other_tag]
+    fake_thread.edit = AsyncMock()
+
+    async def mock_fetch(cid):
+        if cid == 555:
+            return fake_parent
+        return fake_thread
+    adapter._client.fetch_channel = AsyncMock(side_effect=mock_fetch)
+    adapter._client.get_channel = MagicMock(side_effect=mock_fetch)
+
+    # Toggle on
+    res = await adapter.toggle_forum_thread_heart("12345")
+    assert res == {"hearted": True, "title": "❤️ test · Gemini 3.7 Flash High"}
+    fake_thread.edit.assert_awaited_once_with(
+        name="❤️ test · Gemini 3.7 Flash High",
+        applied_tags=[other_tag, heart_tag],
+        reason="Hermes topic heart toggle",
+    )
+
+    # Toggle off
+    fake_thread.name = "❤️ test · Gemini 3.7 Flash High"
+    fake_thread.applied_tags = [other_tag, heart_tag]
+    fake_thread.edit.reset_mock()
+
+    res2 = await adapter.toggle_forum_thread_heart("12345")
+    assert res2 == {"hearted": False, "title": "test · Gemini 3.7 Flash High"}
+    fake_thread.edit.assert_awaited_once_with(
+        name="test · Gemini 3.7 Flash High",
+        applied_tags=[other_tag],
+        reason="Hermes topic heart toggle",
+    )
+
+

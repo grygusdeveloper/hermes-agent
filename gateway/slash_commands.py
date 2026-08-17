@@ -76,6 +76,17 @@ _SPAWN_ESSENCE_STOPWORDS = {
 }
 
 
+def _is_spawn_topic_placeholder(value: Any) -> bool:
+    """Return True if the title essence is empty or a bare placeholder."""
+    text = str(value or "").strip()
+    if _SPAWN_TOPIC_SEPARATOR in text:
+        text = text.split(_SPAWN_TOPIC_SEPARATOR, 1)[0].strip()
+    if text.startswith("❤️ ") or text.startswith("❤️") or text.startswith("❤ ") or text.startswith("❤"):
+        text = text.lstrip("❤️❤ ").strip()
+    cleaned = text.strip(" .·-—_:;")
+    return not cleaned or cleaned.casefold() in {"new chat", "chat", "untitled", "test"}
+
+
 def _spawn_topic_essence(value: Any, *, max_words: int = 4) -> str:
     """Return a compact, recognizable topic essence from a request/title.
 
@@ -83,7 +94,15 @@ def _spawn_topic_essence(value: Any, *, max_words: int = 4) -> str:
     before its first model turn runs. Existing ``essence · model`` titles are
     accepted so later /model switches can preserve the human-facing essence.
     """
-    text = str(value or "").splitlines()[0].strip()
+    raw_text = str(value or "").splitlines()[0].strip()
+    heart = ""
+    if raw_text.startswith("❤️ ") or raw_text.startswith("❤️"):
+        heart = "❤️ "
+        raw_text = raw_text.lstrip("❤️").strip()
+    elif raw_text.startswith("❤ ") or raw_text.startswith("❤"):
+        heart = "❤️ "
+        raw_text = raw_text.lstrip("❤").strip()
+    text = raw_text
     if _SPAWN_TOPIC_SEPARATOR in text:
         text = text.split(_SPAWN_TOPIC_SEPARATOR, 1)[0].strip()
     text = re.sub(r"https?://\S+", " ", text)
@@ -91,7 +110,10 @@ def _spawn_topic_essence(value: Any, *, max_words: int = 4) -> str:
     useful = [token for token in tokens if token.casefold() not in _SPAWN_ESSENCE_STOPWORDS]
     chosen = (useful or tokens)[:max(1, max_words)]
     essence = " ".join(chosen).strip(" .·-—_:;") or "New chat"
-    return essence[:60].strip() or "New chat"
+    res = essence[:60].strip() or "New chat"
+    if heart:
+        return f"{heart}{res}"
+    return res
 
 
 def _spawn_model_label(raw_config: Any, requested: str, resolved: str = "") -> str:
@@ -2256,6 +2278,32 @@ class GatewaySlashCommandsMixin:
             ["", f"Newest first · showing {len(favorites)} · `/favorites [1–25]`"]
         )
         return "\n".join(lines)
+
+    async def _handle_heart_command(self, event: MessageEvent) -> str:
+        """Handle /heart or /fav — toggle favorite heart (❤️) marker and tag on the current Discord topic."""
+        source = getattr(event, "source", None)
+        if source is None or source.platform != Platform.DISCORD or not source.thread_id:
+            return "`/heart` is available inside Discord forum topics and threads."
+
+        adapter_resolver = getattr(self, "_adapter_for_source", None)
+        adapter = adapter_resolver(source) if callable(adapter_resolver) else getattr(self, "adapters", {}).get(Platform.DISCORD)
+        toggler = getattr(adapter, "toggle_forum_thread_heart", None)
+        if toggler is None:
+            return "Topic heart toggle is unavailable until the gateway is reloaded."
+
+        try:
+            res = await toggler(str(source.thread_id))
+        except Exception:
+            logger.warning("Discord /heart toggle failed", exc_info=True)
+            return "❌ Could not toggle heart on this topic right now."
+
+        if not res:
+            return "❌ Could not toggle heart on this topic."
+
+        if res.get("hearted"):
+            return f"❤️ Marked topic as favorite: `{res.get('title', '')}`"
+        else:
+            return f"🤍 Removed topic from favorites: `{res.get('title', '')}`"
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.

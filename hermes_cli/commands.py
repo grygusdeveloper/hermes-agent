@@ -323,6 +323,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[count]", busy_policy="dispatch"),
     CommandDef("favorites", "List your saved favorite responses with Discord links", "Info",
                gateway_only=True, args_hint="[count]", busy_policy="dispatch"),
+    CommandDef("heart", "Toggle favorite heart (❤️) marker on the current Discord topic", "Session",
+               gateway_only=True, aliases=("fav", "favorite_topic", "pin_topic"), busy_policy="dispatch"),
     CommandDef("help", "Show available commands", "Info", busy_policy="dispatch",
                execute="gateway_help"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
