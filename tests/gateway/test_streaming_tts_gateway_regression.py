@@ -117,7 +117,7 @@ def _setup_monkeypatches(monkeypatch, tmp_path):
     monkeypatch.setattr(
         gateway_run,
         "_resolve_runtime_agent_kwargs",
-        lambda: {
+        lambda **_kwargs: {
             "provider": "openrouter",
             "api_mode": "chat_completions",
             "base_url": "https://openrouter.ai/api/v1",
