@@ -2038,6 +2038,22 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if provider == "cursor":
+        creds = resolve_external_process_provider_credentials(
+            provider,
+            target_model=target_model,
+        )
+        return {
+            "provider": "cursor",
+            "api_mode": "chat_completions",
+            "base_url": creds.get("base_url", "").rstrip("/"),
+            "api_key": creds.get("api_key", ""),
+            "command": creds.get("command", ""),
+            "args": list(creds.get("args") or []),
+            "source": creds.get("source", "cursor-cli"),
+            "requested_provider": requested_provider,
+        }
+
     if provider == "claude-code":
         creds = resolve_external_process_provider_credentials(provider)
         return {

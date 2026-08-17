@@ -18,6 +18,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
 | **GitHub Copilot** | `hermes model` (OAuth device code flow, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`) |
 | **GitHub Copilot ACP** | `hermes model` (spawns local `copilot --acp --stdio`) |
+| **Cursor Agent** | `hermes auth add cursor`, then `hermes model` (Cursor subscription/browser login; official Cursor ACP stdio) — [guide](../guides/cursor-agent.md) |
 | **Anthropic** | `hermes model` (Claude Max + extra usage credits via OAuth; also supports Anthropic API key or manual setup-token — see note below) |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **Fireworks AI** | `FIREWORKS_API_KEY` in `~/.hermes/.env` (provider: `fireworks`; aliases: `fireworks-ai`, `fw`) |
@@ -224,6 +225,26 @@ Some older community proxies use `api.github.com/copilot_internal/v2/token` exch
 hermes chat --provider copilot-acp --model copilot-acp
 # Requires the GitHub Copilot CLI in PATH and an existing `copilot login` session
 ```
+
+**`cursor` — Cursor Agent ACP backend**. Distinct from Copilot and from direct xAI. Cursor owns subscription/browser login; Hermes verifies status, discovers models with `agent models`, and launches Cursor's ACP stdio transport. See the [Cursor Agent guide](../guides/cursor-agent.md).
+
+```bash
+hermes auth add cursor
+hermes chat --provider cursor --model cursor-grok-4.6-high
+```
+
+```yaml
+model:
+  provider: "cursor"
+  default: "cursor-grok-4.6-high"
+  base_url: "acp://cursor"
+  api_mode: "chat_completions"
+cursor:
+  command: /absolute/path/to/agent   # only if `agent` is not on PATH
+# equivalently: providers.cursor.command
+```
+
+Hermes does not copy Cursor tokens into `~/.hermes/auth.json` or process arguments. `HERMES_COPILOT_ACP_COMMAND` is Copilot-only and is not a Cursor fallback.
 
 **Permanent config:**
 ```yaml

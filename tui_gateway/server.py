@@ -4446,6 +4446,8 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
+        "command": getattr(agent, "acp_command", None),
+        "args": list(getattr(agent, "acp_args", []) or []),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
     }
 
@@ -4471,6 +4473,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
+            command=snapshot.get("command"),
+            args=list(snapshot.get("args") or []),
         )
 
 
@@ -4631,6 +4635,8 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                command=getattr(result, "command", None),
+                args=list(getattr(result, "args", None) or []),
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -4677,6 +4683,8 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
+            "command": getattr(result, "command", None),
+            "args": list(getattr(result, "args", None) or []),
         }
     if persist_global:
         _persist_model_switch(result)
@@ -6115,15 +6123,27 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    model = getattr(agent, "model", None) or _resolve_model()
+    from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+    runtime = apply_cursor_runtime_model(
+        {
+            "provider": getattr(agent, "provider", None) or None,
+            "base_url": getattr(agent, "base_url", None) or None,
+            "command": getattr(agent, "acp_command", None) or None,
+            "args": list(getattr(agent, "acp_args", None) or []),
+        },
+        model,
+    )
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
         "provider": getattr(agent, "provider", None) or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
-        "acp_command": getattr(agent, "acp_command", None) or None,
-        "acp_args": getattr(agent, "acp_args", None) or None,
-        "model": getattr(agent, "model", None) or _resolve_model(),
+        "acp_command": runtime.get("command"),
+        "acp_args": runtime.get("args"),
+        "model": model,
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
         # Detached background tasks declare platform="tui" below: they have no
@@ -6584,6 +6604,10 @@ def _make_agent(
                 runtime["api_key"] = override_api_key
             if override_api_mode:
                 runtime["api_mode"] = override_api_mode
+            if model_override.get("command"):
+                runtime["command"] = model_override.get("command")
+            if model_override.get("args") is not None:
+                runtime["args"] = list(model_override.get("args") or [])
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
@@ -6600,6 +6624,9 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+    runtime = apply_cursor_runtime_model(runtime, model)
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),

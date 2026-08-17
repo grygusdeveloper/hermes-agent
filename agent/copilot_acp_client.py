@@ -33,6 +33,7 @@ from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
+CURSOR_MARKER_BASE_URL = "acp://cursor"
 ANTIGRAVITY_MARKER_BASE_URL = "acp://antigravity"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
@@ -102,15 +103,103 @@ def _resolve_home_dir() -> str:
     return "/tmp"
 
 
-def _build_subprocess_env() -> dict[str, str]:
-    # Copilot ACP is a model-driving CLI executor: it legitimately needs LLM
-    # provider credentials. Route through the central helper so Tier-1 secrets
-    # (gateway bot tokens, GitHub auth, infra) are still stripped (#29157).
-    env = hermes_subprocess_env(inherit_credentials=True)
+_ACP_STDIO_PROVIDERS = frozenset({
+    "copilot-acp",
+    "github-copilot-acp",
+    "copilot-acp-agent",
+    "cursor",
+    "cursor-agent",
+    "cursor-cli",
+})
+
+
+def _is_cursor_base_url(base_url: str = "") -> bool:
+    url = str(base_url or "").strip().rstrip("/").lower()
+    return url == CURSOR_MARKER_BASE_URL or url.startswith(CURSOR_MARKER_BASE_URL + "/")
+
+
+def _is_copilot_base_url(base_url: str = "") -> bool:
+    url = str(base_url or "").strip().rstrip("/").lower()
+    return url == ACP_MARKER_BASE_URL or url.startswith(ACP_MARKER_BASE_URL + "/")
+
+
+def is_acp_stdio_runtime(*, provider: str = "", base_url: str = "") -> bool:
+    """True when the runtime is Copilot/Cursor ACP stdio (or ACP-over-TCP).
+
+    Those clients return a plain SimpleNamespace and do not implement the
+    Responses API surface, so Hermes must skip streaming and Responses upgrade.
+    Claude Code is intentionally excluded: it has its own live stream-json path.
+    """
+    name = str(provider or "").strip().lower()
+    url = str(base_url or "").strip().lower()
+    return (
+        name in _ACP_STDIO_PROVIDERS
+        or _is_copilot_base_url(base_url)
+        or _is_cursor_base_url(base_url)
+        or url.startswith("acp+tcp://")
+    )
+
+
+def _safe_acp_error_text(text: Any) -> str:
+    """Redact secrets from ACP stderr / JSON-RPC errors before raising."""
+    cleaned = redact_sensitive_text(str(text or ""), force=True).strip()
+    return cleaned[:500]
+
+
+def _copilot_deprecation_error_message(stderr_text: str, *, base_url: str = "") -> str | None:
+    """Return Copilot-only deprecation guidance, never for Cursor Agent."""
+    if _is_cursor_base_url(base_url) or not _is_gh_copilot_deprecation_message(stderr_text):
+        return None
+    return (
+        "Hermes ACP mode requires the NEW GitHub Copilot CLI "
+        "(github.com/github/copilot-cli), but the binary it just "
+        "spawned is the deprecated `gh copilot` extension.\n\n"
+        "Install the new CLI:\n"
+        "  npm install -g @github/copilot\n"
+        "  # then verify with: copilot --help\n\n"
+        "If `copilot` already resolves to the new CLI but you still see this,\n"
+        "point Hermes at it explicitly:\n"
+        "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
+        "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
+        "directly with a Copilot subscription token) via `hermes setup`.\n\n"
+        f"Original error:\n{stderr_text}"
+    )
+
+
+def _first_nonempty(*values: str | None) -> str | None:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _build_subprocess_env(base_url: str = "") -> dict[str, str]:
+    # Copilot/Antigravity may legitimately need provider credentials. Cursor's
+    # supported login owns credentials in Cursor's store, so its child receives
+    # the stripped environment instead of unrelated Hermes provider keys.
+    is_cursor = _is_cursor_base_url(base_url)
+    env = hermes_subprocess_env(inherit_credentials=not is_cursor)
     home = _resolve_home_dir()
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+    if is_cursor:
+        for key in (
+            "HERMES_COPILOT_ACP_COMMAND",
+            "HERMES_COPILOT_ACP_ARGS",
+            "COPILOT_CLI_PATH",
+            "COPILOT_ACP_BASE_URL",
+        ):
+            env.pop(key, None)
+        # Cursor stores subscription login under the OS user home. Do not
+        # remap HOME to a Hermes profile directory or the ACP child will
+        # miss the session that `agent status` / `agent login` just used.
+        from hermes_constants import get_real_home
+
+        real_home = get_real_home(env)
+        if real_home:
+            env["HOME"] = real_home
     return env
 
 
@@ -412,11 +501,35 @@ class CopilotACPClient:
         args: list[str] | None = None,
         **_: Any,
     ):
-        self.api_key = api_key or "copilot-acp"
-        self.base_url = base_url or ACP_MARKER_BASE_URL
+        raw_url = str(base_url or "").strip()
+        raw_key = str(api_key or "").strip()
+        # Cursor identity is the marker URL. The dedicated api_key sentinel is
+        # a second signal so a caller that omits base_url cannot fall through
+        # to Copilot's default URL and process-env overrides.
+        is_cursor = _is_cursor_base_url(raw_url) or (
+            raw_key == "cursor-agent" and not _is_copilot_base_url(raw_url)
+        )
+        self.api_key = api_key or ("cursor-agent" if is_cursor else "copilot-acp")
+        self.base_url = raw_url or (CURSOR_MARKER_BASE_URL if is_cursor else ACP_MARKER_BASE_URL)
         self._default_headers = dict(default_headers or {})
-        self._acp_command = acp_command or command or _resolve_command()
-        self._acp_args = list(acp_args or args or _resolve_args())
+        if is_cursor:
+            selected_command = _first_nonempty(acp_command, command)
+            if acp_args is not None:
+                selected_args = list(acp_args)
+            elif args is not None:
+                selected_args = list(args)
+            else:
+                selected_args = None
+            if not selected_command or not selected_args:
+                raise ValueError(
+                    "Cursor ACP requires an explicit command and args; "
+                    "refusing to fall back to Copilot ACP environment overrides."
+                )
+            self._acp_command = selected_command
+            self._acp_args = selected_args
+        else:
+            self._acp_command = _first_nonempty(acp_command, command) or _resolve_command()
+            self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
@@ -430,6 +543,13 @@ class CopilotACPClient:
 
     def _is_antigravity(self) -> bool:
         return str(self.base_url or "").rstrip("/") == ANTIGRAVITY_MARKER_BASE_URL
+
+    def _backend_label(self) -> str:
+        if _is_cursor_base_url(self.base_url):
+            return "Cursor Agent"
+        if self._is_antigravity():
+            return "Antigravity"
+        return "Copilot ACP"
 
     def close(self) -> None:
         if self._owns_antigravity_conversation:
@@ -495,7 +615,7 @@ class CopilotACPClient:
                 effort="high",
                 timeout_seconds=_effective_timeout,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=_build_subprocess_env(self.base_url),
                 state_key=state_key,
             )
         else:
@@ -524,7 +644,7 @@ class CopilotACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=model or self.api_key,
         )
         if stream:
             return _completion_to_stream_chunks(completion)
@@ -544,10 +664,15 @@ class CopilotACPClient:
                 text=True, encoding='utf-8', errors='replace',
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=_build_subprocess_env(self.base_url),
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
+            if _is_cursor_base_url(self.base_url):
+                raise RuntimeError(
+                    f"Could not start Cursor Agent command '{self._acp_command}'. "
+                    "Install Cursor Agent or set cursor.command in config.yaml."
+                ) from exc
             raise RuntimeError(
                 f"Could not start Copilot ACP command '{self._acp_command}'. "
                 "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
@@ -555,7 +680,9 @@ class CopilotACPClient:
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(
+                f"{self._backend_label()} process did not expose stdin/stdout pipes."
+            )
 
         self.is_closed = False
         with self._active_process_lock:
@@ -622,29 +749,24 @@ class CopilotACPClient:
                 if "error" in msg:
                     err = msg.get("error") or {}
                     raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
+                        f"{self._backend_label()} {method} failed: "
+                        f"{_safe_acp_error_text(err.get('message') or err)}"
                     )
                 return msg.get("result")
 
-            stderr_text = "\n".join(stderr_tail).strip()
+            stderr_text = _safe_acp_error_text("\n".join(stderr_tail))
             if proc.poll() is not None and stderr_text:
-                if _is_gh_copilot_deprecation_message(stderr_text):
-                    raise RuntimeError(
-                        "Hermes ACP mode requires the NEW GitHub Copilot CLI "
-                        "(github.com/github/copilot-cli), but the binary it just "
-                        "spawned is the deprecated `gh copilot` extension.\n\n"
-                        "Install the new CLI:\n"
-                        "  npm install -g @github/copilot\n"
-                        "  # then verify with: copilot --help\n\n"
-                        "If `copilot` already resolves to the new CLI but you still see this,\n"
-                        "point Hermes at it explicitly:\n"
-                        "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
-                        "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
-                        "directly with a Copilot subscription token) via `hermes setup`.\n\n"
-                        f"Original error:\n{stderr_text}"
-                    )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                deprecation = _copilot_deprecation_error_message(
+                    stderr_text, base_url=self.base_url
+                )
+                if deprecation:
+                    raise RuntimeError(deprecation)
+                raise RuntimeError(
+                    f"{self._backend_label()} process exited early: {stderr_text}"
+                )
+            raise TimeoutError(
+                f"Timed out waiting for {self._backend_label()} response to {method}."
+            )
 
         try:
             _request(
@@ -673,7 +795,7 @@ class CopilotACPClient:
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+                raise RuntimeError(f"{self._backend_label()} did not return a sessionId.")
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []

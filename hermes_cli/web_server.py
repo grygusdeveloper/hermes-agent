@@ -9736,6 +9736,33 @@ def _copilot_acp_status() -> Dict[str, Any]:
     }
 
 
+def _cursor_status() -> Dict[str, Any]:
+    """Secret-free live status from the Cursor Agent CLI."""
+    try:
+        from hermes_cli.cursor_cli import get_cursor_auth_status
+
+        status = get_cursor_auth_status()
+        return {
+            "logged_in": bool(status.get("logged_in")),
+            "source": "cursor_cli",
+            "source_label": "Managed by the Cursor Agent CLI",
+            "token_preview": None,
+            "expires_at": None,
+            "has_refresh_token": False,
+            "command": status.get("resolved_command") or status.get("command"),
+            "error": status.get("error"),
+        }
+    except Exception:
+        return {
+            "logged_in": False,
+            "source": "cursor_cli",
+            "source_label": "Managed by the Cursor Agent CLI",
+            "token_preview": None,
+            "expires_at": None,
+            "has_refresh_token": False,
+        }
+
+
 def _claude_code_status() -> Dict[str, Any]:
     """Status for claude-code — credentials are owned by the Claude Code CLI.
 
@@ -9837,6 +9864,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "cli_command": "copilot /login",
         "docs_url": "https://docs.github.com/en/copilot",
         "status_fn": _copilot_acp_status,
+    },
+    {
+        "id": "cursor",
+        "name": "Cursor Agent",
+        "flow": "external",
+        "cli_command": "hermes auth add cursor",
+        "docs_url": "https://hermes-agent.nousresearch.com/docs/guides/cursor-agent",
+        "status_fn": _cursor_status,
     },
     {
         "id": "claude-code",

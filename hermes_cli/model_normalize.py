@@ -87,8 +87,11 @@ _STRIP_VENDOR_ONLY_PROVIDERS: frozenset[str] = frozenset({
 })
 
 # Providers whose native naming is authoritative -- pass through unchanged.
+# Cursor Agent model IDs are account-specific exact strings from `agent models`
+# and must not be rewritten (no vendor-prefix stripping or alias folding).
 _AUTHORITATIVE_NATIVE_PROVIDERS: frozenset[str] = frozenset({
     "huggingface",
+    "cursor",
 })
 
 # Direct providers that accept bare native names but should repair a matching

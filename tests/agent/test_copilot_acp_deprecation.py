@@ -2,7 +2,10 @@
 
 import pytest
 
-from agent.copilot_acp_client import _is_gh_copilot_deprecation_message
+from agent.copilot_acp_client import (
+    _copilot_deprecation_error_message,
+    _is_gh_copilot_deprecation_message,
+)
 
 
 class TestDeprecationPatternDetection:
@@ -53,6 +56,19 @@ class TestDeprecationPatternDetection:
     )
     def test_does_not_false_positive(self, stderr_text: str):
         assert not _is_gh_copilot_deprecation_message(stderr_text)
+
+    def test_cursor_backend_does_not_get_copilot_install_guidance(self):
+        assert (
+            _copilot_deprecation_error_message(
+                self._REAL_DEPRECATION_STDERR, base_url="acp://cursor"
+            )
+            is None
+        )
+        message = _copilot_deprecation_error_message(
+            self._REAL_DEPRECATION_STDERR, base_url="acp://copilot"
+        )
+        assert message is not None
+        assert "HERMES_COPILOT_ACP_COMMAND" in message
 
 
 class TestGitHubModelsAzureUrl:

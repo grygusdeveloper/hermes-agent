@@ -2592,7 +2592,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(*, target_model: str | None = None) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
     Provider is read from ``config.yaml`` ``model.provider`` (the single
@@ -2604,6 +2604,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
     If the primary provider fails with an authentication error, attempt to
     resolve credentials using the fallback provider chain from config.yaml
     before giving up.
+
+    ``target_model`` is required for Cursor so ACP argv cannot keep a stale
+    ``--model`` from a later config/env default load.
     """
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
@@ -2612,8 +2615,12 @@ def _resolve_runtime_agent_kwargs() -> dict:
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
+    model_cfg = _get_model_config()
+    if not target_model and isinstance(model_cfg, dict):
+        target_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip() or None
+
     try:
-        runtime = resolve_runtime_provider()
+        runtime = resolve_runtime_provider(target_model=target_model)
     except AuthError as auth_exc:
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
@@ -2625,12 +2632,15 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
         fb_config = _try_resolve_fallback_provider()
         if fb_config is not None:
-            return fb_config
+            from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+            return apply_cursor_runtime_model(
+                fb_config, str(fb_config.get("model") or target_model or "")
+            )
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    model_cfg = _get_model_config()
     max_tokens = None
     _env_mt = os.environ.get("HERMES_MAX_TOKENS")
     if _env_mt:
@@ -2650,39 +2660,53 @@ def _resolve_runtime_agent_kwargs() -> dict:
         if isinstance(_runtime_mot, int) and _runtime_mot > 0:
             max_tokens = _runtime_mot
 
-    return {
-        "api_key": runtime.get("api_key"),
-        "base_url": runtime.get("base_url"),
-        "provider": runtime.get("provider"),
-        "requested_provider": runtime.get("requested_provider"),
-        "api_mode": runtime.get("api_mode"),
-        "command": runtime.get("command"),
-        "args": list(runtime.get("args") or []),
-        "credential_pool": runtime.get("credential_pool"),
-        "max_tokens": max_tokens,
-    }
+    from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+    return apply_cursor_runtime_model(
+        {
+            "api_key": runtime.get("api_key"),
+            "base_url": runtime.get("base_url"),
+            "provider": runtime.get("provider"),
+            "requested_provider": runtime.get("requested_provider"),
+            "api_mode": runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+            "max_tokens": max_tokens,
+        },
+        target_model or "",
+    )
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(
+    provider: str, *, target_model: str | None = None
+) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
+    from hermes_cli.cursor_cli import apply_cursor_runtime_model
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = resolve_runtime_provider(
+            requested=provider,
+            target_model=target_model,
+        )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
-    return {
-        "api_key": runtime.get("api_key"),
-        "base_url": runtime.get("base_url"),
-        "provider": runtime.get("provider"),
-        "requested_provider": runtime.get("requested_provider"),
-        "api_mode": runtime.get("api_mode"),
-        "command": runtime.get("command"),
-        "args": list(runtime.get("args") or []),
-        "credential_pool": runtime.get("credential_pool"),
-    }
+    return apply_cursor_runtime_model(
+        {
+            "api_key": runtime.get("api_key"),
+            "base_url": runtime.get("base_url"),
+            "provider": runtime.get("provider"),
+            "requested_provider": runtime.get("requested_provider"),
+            "api_mode": runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+        },
+        target_model or "",
+    )
 
 
 def _credential_pool_for_provider(provider: Optional[str]):
@@ -2721,6 +2745,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     requested=entry.get("provider"),
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=resolve_entry_api_key(entry),
+                    target_model=entry.get("model"),
                 )
                 # Log the literal `provider` key from config, not the resolved
                 # runtime category — an Ollama fallback resolves through the
@@ -7182,7 +7207,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ][:5] or "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_kwargs = _resolve_runtime_agent_kwargs(target_model=model or None)
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -7215,7 +7240,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model = ch.model
                 if ch.provider:
                     runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        ch.provider
+                        ch.provider,
+                        target_model=ch.model or None,
                     )
                     ch_runtime_model = runtime_kwargs.pop("model", None)
                     # Only adopt the provider's bundled model when the override
@@ -7279,7 +7305,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
 
-        return model, runtime_kwargs
+        from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+        return model, apply_cursor_runtime_model(runtime_kwargs, model)
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -7290,6 +7318,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         accordingly.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+        runtime_kwargs = apply_cursor_runtime_model(runtime_kwargs, model)
 
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -19017,7 +19048,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Resolve runtime credentials for probing
         try:
-            runtime = _resolve_runtime_agent_kwargs()
+            runtime = _resolve_runtime_agent_kwargs(
+                target_model=str(configured_model or model or "").strip() or None
+            )
             provider = runtime.get("provider") or provider
             base_url = runtime.get("base_url") or base_url
             api_key = runtime.get("api_key")
@@ -23472,10 +23505,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # credential-less override — _resolve_session_agent_runtime falls
             # back to env-based resolution and applies model/provider on top.
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    provider,
+                    target_model=persisted.get("model"),
+                )
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")
+                override["command"] = runtime.get("command")
+                override["args"] = list(runtime.get("args") or [])
                 if not override.get("base_url"):
                     override["base_url"] = runtime.get("base_url")
             except Exception:
@@ -23509,10 +23547,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool", "command"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        if override.get("args") is not None:
+            runtime_kwargs["args"] = list(override.get("args") or [])
         if (
             runtime_kwargs.get("api_key")
             and runtime_kwargs.get("credential_pool") is None

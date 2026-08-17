@@ -456,6 +456,24 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _copy_acp_runtime_from_client(client, client_kwargs: dict, agent) -> None:
+    """Keep Copilot/Cursor ACP command+args when rebuilding from a routed client.
+
+    ``resolve_provider_client`` already constructed the ACP subprocess argv.
+    Dropping it here would force Cursor to refuse Copilot env fallbacks and
+    leave Copilot ACP depending on process-global overrides.
+    """
+    command = getattr(client, "_acp_command", None)
+    args = getattr(client, "_acp_args", None)
+    if isinstance(command, str) and command.strip():
+        client_kwargs["command"] = command
+        agent.acp_command = command
+    if isinstance(args, list) and args:
+        copied = list(args)
+        client_kwargs["args"] = copied
+        agent.acp_args = copied
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -634,6 +652,17 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
+    try:
+        from hermes_cli.cursor_cli import is_cursor_runtime
+        from agent.copilot_acp_client import CURSOR_MARKER_BASE_URL
+
+        if is_cursor_runtime(
+            provider=agent.provider, base_url=agent.base_url
+        ) and not str(agent.base_url or "").strip():
+            agent.base_url = CURSOR_MARKER_BASE_URL
+            base_url = CURSOR_MARKER_BASE_URL
+    except Exception:
+        pass
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
@@ -710,6 +739,20 @@ def init_agent(
     except Exception:
         pass
 
+    from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+    synced = apply_cursor_runtime_model(
+        {
+            "provider": agent.provider,
+            "base_url": agent.base_url,
+            "command": agent.acp_command,
+            "args": list(agent.acp_args or []),
+        },
+        agent.model,
+    )
+    agent.acp_command = synced.get("command") or agent.acp_command
+    agent.acp_args = list(synced.get("args") or [])
+
     # GPT-5.x models usually require the Responses API path, but some
     # providers have exceptions (for example Copilot's gpt-5-mini still
     # uses chat completions). Also auto-upgrade for direct OpenAI URLs
@@ -722,14 +765,14 @@ def init_agent(
     # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
     # does NOT support the Responses API — skip the upgrade for Azure
     # (openai.azure.com), even though it looks OpenAI-compatible.
+    from agent.copilot_acp_client import is_acp_stdio_runtime
+
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
         and agent.provider != "claude-code"
-        and not str(agent.base_url or "").lower().startswith("acp://copilot")
+        and not is_acp_stdio_runtime(provider=agent.provider, base_url=agent.base_url)
         and not str(agent.base_url or "").lower().startswith("acp://claude-code")
-        and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
             agent._is_direct_openai_url()
@@ -1190,7 +1233,9 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            from agent.copilot_acp_client import is_acp_stdio_runtime
+
+            if is_acp_stdio_runtime(provider=agent.provider, base_url=base_url):
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             elif agent.provider == "claude-code":
@@ -1258,6 +1303,7 @@ def init_agent(
                     _routed_headers = getattr(_routed_client, "_default_headers", None)
                 if _routed_headers:
                     client_kwargs["default_headers"] = dict(_routed_headers)
+                _copy_acp_runtime_from_client(_routed_client, client_kwargs, agent)
             else:
                 # When the user explicitly chose a non-OpenRouter provider
                 # but no credentials were found, fail fast with a clear
@@ -1317,6 +1363,7 @@ def init_agent(
                                 _fb_headers = getattr(_fb_client, "_default_headers", None)
                             if _fb_headers:
                                 client_kwargs["default_headers"] = dict(_fb_headers)
+                            _copy_acp_runtime_from_client(_fb_client, client_kwargs, agent)
                             _fb_resolved = True
                             break
                     if not _fb_resolved:

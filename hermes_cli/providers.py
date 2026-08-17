@@ -100,6 +100,13 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="acp://copilot",
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "cursor": HermesOverlay(
+        # Cursor Agent is a distinct product/provider. It shares the generic
+        # ACP stdio wire with Copilot but owns its own auth and model catalog.
+        transport="openai_chat",
+        auth_type="external_process",
+        base_url_override="acp://cursor",
+    ),
     "claude-code": HermesOverlay(
         transport="openai_chat",
         auth_type="external_process",
@@ -329,6 +336,8 @@ ALIASES: Dict[str, str] = {
     "copilot": "github-copilot",
     "github": "github-copilot",
     "github-copilot-acp": "copilot-acp",
+    "cursor-agent": "cursor",
+    "cursor-cli": "cursor",
 
     # claude-code is a first-class provider id (not an alias of anthropic).
     # Bare "claude" stays aliased to "anthropic" above to avoid breaking
@@ -433,6 +442,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "nous": "Nous Portal",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
+    "cursor": "Cursor Agent",
     "claude-code": "Claude Code CLI",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",

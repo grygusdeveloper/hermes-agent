@@ -2024,6 +2024,88 @@ def _model_flow_copilot_acp(config, current_model=""):
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
 
+def _model_flow_cursor(config, current_model="", *, args=None):
+    """Cursor Agent flow using Cursor-owned auth and ACP stdio inference."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+    )
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.cursor_cli import (
+        DEFAULT_CURSOR_MODELS,
+        CursorCLIError,
+        discover_cursor_models,
+        get_cursor_auth_status,
+        login_cursor,
+    )
+
+    del config
+    provider_id = "cursor"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    status = get_cursor_auth_status()
+    if not status.get("logged_in"):
+        print("  Cursor Agent is not authenticated; starting Cursor login.")
+        try:
+            status = login_cursor(
+                no_browser=bool(getattr(args, "no_browser", False)),
+                timeout_seconds=float(getattr(args, "timeout", None) or 600.0),
+            )
+        except CursorCLIError as exc:
+            print(f"  ⚠ {exc}")
+            print("  Run `hermes auth add cursor` after installing Cursor Agent.")
+            return
+
+    command = status.get("resolved_command") or status.get("command") or "agent"
+    print("  Cursor Agent delegates Hermes turns through Cursor's ACP stdio server.")
+    print("  Cursor owns subscription credentials; Hermes verifies login and model access.")
+    print(f"  Command: {command}")
+    print(f"  Backend marker: {pconfig.inference_base_url}")
+    print()
+
+    discovered = True
+    try:
+        model_list = discover_cursor_models(command=str(command))
+        print(f"  Found {len(model_list)} model(s) from the authenticated Cursor account.")
+    except CursorCLIError as exc:
+        discovered = False
+        model_list = list(DEFAULT_CURSOR_MODELS)
+        print(f"  ⚠ {exc}")
+        print("  Showing conservative Cursor model defaults; availability is verified at runtime.")
+
+    selected = _prompt_model_selection(
+        model_list,
+        current_model=current_model,
+        confirm_provider=provider_id,
+        confirm_base_url=pconfig.inference_base_url,
+        confirm_api_key="",
+    )
+    if not selected:
+        print("No change.")
+        return
+    if discovered and selected not in model_list:
+        print(
+            "  ⚠ That model was not present in the authenticated Cursor catalog. "
+            "No change was made."
+        )
+        return
+
+    _save_model_choice(selected)
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = pconfig.inference_base_url
+    model["api_mode"] = "chat_completions"
+    clear_model_endpoint_credentials(model, clear_api_mode=False)
+    save_config(cfg)
+    deactivate_provider()
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
+
 def _model_flow_claude_code(config, current_model=""):
     """Claude Code CLI flow using the local authenticated `claude` binary."""
     from hermes_cli.auth import (

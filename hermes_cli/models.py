@@ -301,6 +301,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    "cursor": [
+        "cursor-grok-4.6-high",
+        "cursor-grok-4.6-xhigh",
+        "cursor-grok-4.6-high-fast",
+        "cursor-grok-4.6-xhigh-fast",
+        "cursor-grok-4.6-medium",
+        "cursor-grok-4.6-low",
+    ],
     "claude-code": [
         # Latest generation (Claude Code 2.1.183 accepts these exact IDs).
         "claude-opus-5",
@@ -1143,6 +1151,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("cursor",         "Cursor Agent",             "Cursor Agent (Cursor subscription login; ACP stdio transport)"),
     ProviderEntry("claude-code",    "Claude Code CLI",          "Claude Code CLI (stream-json stdin; tools disabled; native session resume)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
@@ -1307,6 +1316,8 @@ _PROVIDER_ALIASES = {
     "github-model": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "cursor-agent": "cursor",
+    "cursor-cli": "cursor",
     "claudecode": "claude-code",
     "claude_code": "claude-code",
     "cc": "claude-code",
@@ -2902,6 +2913,13 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
+    if normalized == "cursor":
+        try:
+            from hermes_cli.cursor_cli import discover_cursor_models
+
+            return discover_cursor_models()
+        except Exception:
+            return list(_PROVIDER_MODELS.get("cursor", []))
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())

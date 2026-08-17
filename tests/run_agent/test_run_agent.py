@@ -5363,6 +5363,122 @@ def test_aiagent_uses_copilot_acp_client():
     assert mock_acp_client.call_args.kwargs["args"] == ["--acp", "--stdio"]
 
 
+def test_aiagent_uses_cursor_acp_client_with_runtime_command_and_args():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+        patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
+    ):
+        acp_client = MagicMock()
+        mock_acp_client.return_value = acp_client
+
+        agent = AIAgent(
+            api_key="cursor-agent",
+            base_url="acp://cursor",
+            provider="cursor",
+            api_mode="chat_completions",
+            model="cursor-grok-4.6-high",
+            acp_command="/opt/cursor/agent",
+            acp_args=["--model", "cursor-grok-4.6-high", "acp"],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent.client is acp_client
+    mock_openai.assert_not_called()
+    mock_acp_client.assert_called_once()
+    assert mock_acp_client.call_args.kwargs["base_url"] == "acp://cursor"
+    assert mock_acp_client.call_args.kwargs["api_key"] == "cursor-agent"
+    assert mock_acp_client.call_args.kwargs["command"] == "/opt/cursor/agent"
+    assert mock_acp_client.call_args.kwargs["args"] == [
+        "--model",
+        "cursor-grok-4.6-high",
+        "acp",
+    ]
+
+
+def test_aiagent_forwards_cursor_command_args_for_custom_acp_url():
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+        patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
+    ):
+        acp_client = MagicMock()
+        mock_acp_client.return_value = acp_client
+        agent = AIAgent(
+            api_key="cursor-agent",
+            base_url="acp://cursor",
+            provider="custom",
+            api_mode="chat_completions",
+            model="cursor-grok-4.6-high",
+            acp_command="/opt/cursor/agent",
+            acp_args=["--model", "cursor-grok-4.6-high", "acp"],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent.client is acp_client
+    mock_openai.assert_not_called()
+    assert mock_acp_client.call_args.kwargs["command"] == "/opt/cursor/agent"
+    assert mock_acp_client.call_args.kwargs["args"] == [
+        "--model",
+        "cursor-grok-4.6-high",
+        "acp",
+    ]
+
+
+def test_aiagent_copies_cursor_acp_runtime_from_routed_client():
+    routed = SimpleNamespace(
+        api_key="cursor-agent",
+        base_url="acp://cursor",
+        _acp_command="/opt/cursor/agent",
+        _acp_args=["--model", "cursor-grok-4.6-high", "acp"],
+        _custom_headers=None,
+        default_headers=None,
+        _default_headers=None,
+    )
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+        patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(routed, "cursor-grok-4.6-high"),
+        ),
+    ):
+        acp_client = MagicMock()
+        mock_acp_client.return_value = acp_client
+        agent = AIAgent(
+            provider="cursor",
+            model="cursor-grok-4.6-high",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent.client is acp_client
+    mock_openai.assert_not_called()
+    assert mock_acp_client.call_args.kwargs["command"] == "/opt/cursor/agent"
+    assert mock_acp_client.call_args.kwargs["args"] == [
+        "--model",
+        "cursor-grok-4.6-high",
+        "acp",
+    ]
+    assert agent.acp_command == "/opt/cursor/agent"
+    assert agent.acp_args == [
+        "--model",
+        "cursor-grok-4.6-high",
+        "acp",
+    ]
+
+
 def test_quiet_spinner_allowed_with_explicit_print_fn(agent):
     agent._print_fn = lambda *_a, **_kw: None
     with patch.object(run_agent.sys.stdout, "isatty", return_value=False):

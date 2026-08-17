@@ -430,12 +430,17 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
+        from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+        runtime = apply_cursor_runtime_model(runtime, effective_model)
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
+            acp_command=runtime.get("command"),
+            acp_args=runtime.get("args"),
             model=effective_model,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,

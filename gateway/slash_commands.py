@@ -2249,6 +2249,8 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                             "reasoning_effort": result.reasoning_effort,
+                            "command": getattr(result, "command", None),
+                            "args": list(getattr(result, "args", None) or []),
                         }
                         getattr(_self, "_apply_model_alias_reasoning_override")(
                             _session_key, result.reasoning_effort
@@ -2590,6 +2592,8 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
                 "reasoning_effort": result.reasoning_effort,
+                "command": getattr(result, "command", None),
+                "args": list(getattr(result, "args", None) or []),
             }
             getattr(self, "_apply_model_alias_reasoning_override")(
                 session_key, result.reasoning_effort

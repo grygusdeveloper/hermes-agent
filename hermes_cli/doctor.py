@@ -1272,6 +1272,11 @@ def run_doctor(args):
                 "lmstudio",
                 "nous",
                 "nvidia",
+                # Cursor Agent IDs are account-specific exact strings from
+                # `agent models` and may contain `/` (for example x-ai/...).
+                "cursor",
+                "cursor-agent",
+                "cursor-cli",
                 # Fireworks' native model IDs are slash-form
                 # (accounts/fireworks/models/... and .../routers/...), so a "/"
                 # is expected, not an aggregator vendor prefix.
@@ -1309,6 +1314,7 @@ def run_doctor(args):
             # which would produce false positives.
             if runtime_provider and runtime_provider not in ("auto", "custom"):
                 try:
+                    cursor_auth_error = ""
                     if runtime_provider == "openrouter":
                         from hermes_cli.config import get_env_value
 
@@ -1321,6 +1327,7 @@ def run_doctor(args):
 
                         pconfig = PROVIDER_REGISTRY.get(runtime_provider)
                         configured = True
+                        cursor_auth_error = ""
                         if pconfig and getattr(pconfig, "auth_type", "") == "api_key":
                             status = get_auth_status(runtime_provider) or {}
                             configured = bool(
@@ -1328,17 +1335,33 @@ def run_doctor(args):
                                 or status.get("logged_in")
                                 or status.get("api_key")
                             )
+                        elif runtime_provider == "cursor":
+                            status = get_auth_status("cursor") or {}
+                            configured = bool(status.get("logged_in"))
+                            cursor_auth_error = str(status.get("error") or "").strip()
                     if not configured:
-                        _fail_and_issue(
-                            f"model.provider '{runtime_provider}' is set but no API key is configured",
-                            "(check ~/.hermes/.env or run 'hermes setup')",
-                            (
-                                f"No credentials found for provider '{runtime_provider}'. "
-                                f"Run 'hermes setup' or set the provider's API key in {_DHH}/.env, "
-                                f"or switch providers with 'hermes config set model.provider <name>'"
-                            ),
-                            issues,
-                        )
+                        if runtime_provider == "cursor":
+                            _fail_and_issue(
+                                "model.provider 'cursor' is set but Cursor Agent is not authenticated",
+                                "(run 'hermes auth add cursor')",
+                                (
+                                    "No authenticated Cursor Agent session found. "
+                                    + (cursor_auth_error + " " if cursor_auth_error else "")
+                                    + "Run 'hermes auth add cursor', then 'hermes auth status cursor'."
+                                ).strip(),
+                                issues,
+                            )
+                        else:
+                            _fail_and_issue(
+                                f"model.provider '{runtime_provider}' is set but no API key is configured",
+                                "(check ~/.hermes/.env or run 'hermes setup')",
+                                (
+                                    f"No credentials found for provider '{runtime_provider}'. "
+                                    f"Run 'hermes setup' or set the provider's API key in {_DHH}/.env, "
+                                    f"or switch providers with 'hermes config set model.provider <name>'"
+                                ),
+                                issues,
+                            )
                 except Exception:
                     pass
 

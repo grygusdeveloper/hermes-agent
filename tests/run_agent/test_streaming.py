@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.copilot_acp_client import is_acp_stdio_runtime
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1316,14 +1318,13 @@ class TestCopilotACPStreamingDecision:
             patch.object(agent, "_interruptible_streaming_api_call") as mock_stream,
         ):
             # Verify the decision logic correctly disables streaming
-            _use_streaming = True
+            assert is_acp_stdio_runtime(
+                provider=agent.provider, base_url=agent.base_url
+            )
+            _use_streaming = not is_acp_stdio_runtime(
+                provider=agent.provider, base_url=agent.base_url
+            )
             if getattr(agent, "_disable_streaming", False):
-                _use_streaming = False
-            elif (
-                agent.provider == "copilot-acp"
-                or str(agent.base_url or "").lower().startswith("acp://copilot")
-                or str(agent.base_url or "").lower().startswith("acp+tcp://")
-            ):
                 _use_streaming = False
 
             assert _use_streaming is False
@@ -1342,14 +1343,31 @@ class TestCopilotACPStreamingDecision:
         agent = _make_acp_agent(provider="custom", base_url="acp://copilot")
         agent.provider = "custom"
 
-        _use_streaming = True
-        if (
-            agent.provider == "copilot-acp"
-            or str(agent.base_url or "").lower().startswith("acp://copilot")
-            or str(agent.base_url or "").lower().startswith("acp+tcp://")
-        ):
-            _use_streaming = False
+        _use_streaming = not is_acp_stdio_runtime(
+            provider=agent.provider, base_url=agent.base_url
+        )
 
+        assert _use_streaming is False
+
+    @patch("run_agent.get_tool_definitions", return_value=[])
+    @patch("run_agent.check_toolset_requirements", return_value={})
+    @patch("agent.copilot_acp_client.CopilotACPClient")
+    def test_cursor_provider_and_base_url_trigger_non_streaming(
+        self, mock_acp_cls, _mock_check, _mock_tools
+    ):
+        mock_acp_cls.return_value = MagicMock()
+        by_provider = _make_acp_agent(provider="cursor", base_url="acp://cursor")
+        by_url = _make_acp_agent(provider="custom", base_url="acp://cursor")
+        by_url.provider = "custom"
+        assert is_acp_stdio_runtime(provider=by_provider.provider, base_url=by_provider.base_url)
+        assert is_acp_stdio_runtime(provider=by_url.provider, base_url=by_url.base_url)
+        assert is_acp_stdio_runtime(provider="cursor-agent", base_url="")
+        assert is_acp_stdio_runtime(provider="cursor-cli", base_url="")
+        assert not is_acp_stdio_runtime(provider="custom", base_url="acp://cursor-evil")
+        assert not is_acp_stdio_runtime(provider="claude-code", base_url="acp://claude-code")
+        _use_streaming = not is_acp_stdio_runtime(
+            provider=by_provider.provider, base_url=by_provider.base_url
+        )
         assert _use_streaming is False
 
 
@@ -1368,14 +1386,10 @@ class TestCopilotACPStreamingDecision:
         )
         agent.api_mode = "chat_completions"
 
-        _use_streaming = True
+        _use_streaming = not is_acp_stdio_runtime(
+            provider=agent.provider, base_url=agent.base_url
+        )
         if getattr(agent, "_disable_streaming", False):
-            _use_streaming = False
-        elif (
-            agent.provider == "copilot-acp"
-            or str(agent.base_url or "").lower().startswith("acp://copilot")
-            or str(agent.base_url or "").lower().startswith("acp+tcp://")
-        ):
             _use_streaming = False
 
         assert _use_streaming is True

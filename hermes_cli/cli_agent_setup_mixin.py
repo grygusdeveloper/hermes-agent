@@ -42,6 +42,7 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                target_model=getattr(self, "model", None) or None,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -59,7 +60,7 @@ class CLIAgentSetupMixin:
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key
 
-                        _fb_kwargs = {"requested": _fb_provider}
+                        _fb_kwargs = {"requested": _fb_provider, "target_model": _fb_model}
                         if _fb.get("base_url"):
                             _fb_kwargs["explicit_base_url"] = _fb["base_url"]
                         _fb_api_key = resolve_entry_api_key(_fb)
@@ -176,6 +177,22 @@ class CLIAgentSetupMixin:
         # models when provider is openai-codex).  Fixes #651.
         model_changed = self._normalize_model_for_provider(resolved_provider)
 
+        from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+        synced_runtime = apply_cursor_runtime_model(
+            {
+                "provider": resolved_provider,
+                "base_url": self.base_url,
+                "command": self.acp_command,
+                "args": list(self.acp_args or []),
+            },
+            self.model,
+        )
+        synced_args = list(synced_runtime.get("args") or [])
+        if synced_args != list(self.acp_args or []):
+            routing_changed = True
+            self.acp_args = synced_args
+
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
         # routing, or the effective model changed.
         if (credentials_changed or routing_changed or model_changed) and self.agent is not None:
@@ -291,19 +308,23 @@ class CLIAgentSetupMixin:
         API call is marked accordingly.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.cursor_cli import apply_cursor_runtime_model
 
-        runtime = {
-            "api_key": self.api_key,
-            "base_url": self.base_url,
-            "provider": self.provider,
-            "requested_provider": getattr(
-                self, "requested_provider", self.provider
-            ),
-            "api_mode": self.api_mode,
-            "command": self.acp_command,
-            "args": list(self.acp_args or []),
-            "credential_pool": getattr(self, "_credential_pool", None),
-        }
+        runtime = apply_cursor_runtime_model(
+            {
+                "api_key": self.api_key,
+                "base_url": self.base_url,
+                "provider": self.provider,
+                "requested_provider": getattr(
+                    self, "requested_provider", self.provider
+                ),
+                "api_mode": self.api_mode,
+                "command": self.acp_command,
+                "args": list(self.acp_args or []),
+                "credential_pool": getattr(self, "_credential_pool", None),
+            },
+            self.model,
+        )
         route = {
             "model": self.model,
             "runtime": runtime,
@@ -480,6 +501,9 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+            runtime = apply_cursor_runtime_model(runtime, effective_model)
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),

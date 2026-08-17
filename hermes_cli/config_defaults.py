@@ -7,6 +7,12 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Non-secret Cursor Agent CLI path. Empty means look up `agent` on PATH.
+    # Cursor owns subscription credentials in its own store; Hermes never
+    # stores Cursor tokens here.
+    "cursor": {
+        "command": "",
+    },
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],

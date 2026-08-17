@@ -1540,10 +1540,35 @@ def _build_child_agent(
         effective_acp_args = []
 
     if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
-        effective_api_mode = "chat_completions"
+        from hermes_cli.cursor_cli import is_cursor_runtime
+
+        # Cursor ACP reuses CopilotACPClient, but it is a dedicated provider.
+        # Do not relabel a Cursor child as copilot-acp. Legacy command-only
+        # ACP overrides still pin copilot-acp so run_agent initializes the
+        # CopilotACPClient.
+        if is_cursor_runtime(
+            provider=str(effective_provider or ""),
+            base_url=str(effective_base_url or ""),
+        ):
+            effective_provider = "cursor"
+            effective_api_mode = "chat_completions"
+        else:
+            effective_provider = "copilot-acp"
+            effective_api_mode = "chat_completions"
+
+    from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+    _cursor_runtime = apply_cursor_runtime_model(
+        {
+            "provider": effective_provider,
+            "base_url": effective_base_url,
+            "command": effective_acp_command,
+            "args": list(effective_acp_args or []),
+        },
+        effective_model,
+    )
+    effective_acp_command = _cursor_runtime.get("command") or effective_acp_command
+    effective_acp_args = list(_cursor_runtime.get("args") or [])
 
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)

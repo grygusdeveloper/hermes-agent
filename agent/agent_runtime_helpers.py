@@ -2265,12 +2265,16 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+    acp_base_url = str(client_kwargs.get("base_url", ""))
+    from agent.copilot_acp_client import is_acp_stdio_runtime
+
+    if is_acp_stdio_runtime(provider=agent.provider, base_url=acp_base_url):
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
         _ra().logger.info(
-            "Copilot ACP client created (%s, shared=%s) %s",
+            "ACP subprocess client created for %s (%s, shared=%s) %s",
+            agent.provider,
             reason,
             shared,
             agent._client_log_context(),
@@ -2379,7 +2383,18 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(
+    agent,
+    new_model,
+    new_provider,
+    api_key='',
+    base_url='',
+    api_mode='',
+    command=None,
+    args=None,
+    acp_command=None,
+    acp_args=None,
+):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2445,6 +2460,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
+            "acp_command",
+            "acp_args",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -2552,6 +2569,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.api_key = api_key or "moa-virtual-provider"
             agent.base_url = "moa://local"
             agent._client_kwargs = {}
+            agent.acp_command = None
+            agent.acp_args = []
             agent.client = build_moa_facade(agent, agent.model)
         elif api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
@@ -2590,6 +2609,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
             agent._client_kwargs = {}
+            agent.acp_command = None
+            agent.acp_args = []
         else:
             effective_key = api_key or agent.api_key
             effective_base = base_url or agent.base_url
@@ -2623,6 +2644,38 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # scratch.  Without this, model switches clear attribution headers
             # and OpenRouter logs show "Unknown" for subsequent requests.
             agent._apply_client_headers_for_base_url(effective_base)
+            from agent.copilot_acp_client import is_acp_stdio_runtime
+
+            selected_command = acp_command or command
+            if acp_args is not None:
+                selected_args = list(acp_args)
+            elif args is not None:
+                selected_args = list(args)
+            else:
+                selected_args = None
+            if is_acp_stdio_runtime(provider=new_provider, base_url=effective_base):
+                from hermes_cli.cursor_cli import apply_cursor_runtime_model
+
+                synced = apply_cursor_runtime_model(
+                    {
+                        "provider": new_provider,
+                        "base_url": effective_base,
+                        "command": selected_command,
+                        "args": list(selected_args or []),
+                    },
+                    new_model,
+                )
+                selected_command = synced.get("command") or selected_command
+                selected_args = list(synced.get("args") or [])
+                agent.acp_command = selected_command
+                agent.acp_args = list(selected_args or [])
+                if selected_command:
+                    agent._client_kwargs["command"] = selected_command
+                if selected_args:
+                    agent._client_kwargs["args"] = list(selected_args)
+            else:
+                agent.acp_command = None
+                agent.acp_args = []
             agent.client = agent._create_openai_client(
                 dict(agent._client_kwargs),
                 reason="switch_model",
