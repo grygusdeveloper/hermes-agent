@@ -5178,6 +5178,14 @@ class AIAgent:
                 primary_client._antigravity_conversation
             )
             client._owns_antigravity_conversation = False
+        if (
+            isinstance(primary_client, CopilotACPClient)
+            and isinstance(client, CopilotACPClient)
+            and primary_client._is_prime()
+            and client._is_prime()
+        ):
+            client._prime_conversation = primary_client._prime_conversation
+            client._owns_prime_conversation = False
         if isinstance(primary_client, ClaudeCodeClient) and isinstance(
             client, ClaudeCodeClient
         ):
@@ -5274,6 +5282,16 @@ class AIAgent:
                 client._antigravity_conversation.abort()
                 logger.info(
                     "Antigravity request aborted (%s, shared=False) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+                return
+            if isinstance(client, CopilotACPClient) and client._is_prime():
+                from agent.portal_tags import get_conversation_context
+
+                client._prime_conversation.abort(get_conversation_context())
+                logger.info(
+                    "Prime ACP request aborted (%s, shared=False) %s",
                     reason,
                     self._client_log_context(),
                 )

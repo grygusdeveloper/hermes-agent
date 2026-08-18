@@ -7046,6 +7046,10 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
+    is_prime_acp = (
+        base_url.rstrip("/").lower() == "acp://prime"
+        or base_url.lower().startswith("acp://prime/")
+    )
 
     if provider_id == "claude-code":
         command = (
@@ -7055,6 +7059,12 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
             or "claude"
         )
         args: list[str] = []
+    elif is_prime_acp:
+        # Prime is a distinct ACP runtime, not another name for Copilot. Its
+        # marker must never inherit the Copilot executable or default argv.
+        command = os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
     else:
         command = (
             os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
@@ -7065,15 +7075,18 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
 
     resolved_command = shutil.which(command) if command else None
+    configured = bool(resolved_command or base_url.startswith("acp+tcp://"))
+    if is_prime_acp:
+        configured = bool(resolved_command and args)
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": configured,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": configured,
     }
 
 
@@ -7347,6 +7360,10 @@ def resolve_external_process_provider_credentials(
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
+    is_prime_acp = (
+        base_url.rstrip("/").lower() == "acp://prime"
+        or base_url.lower().startswith("acp://prime/")
+    )
 
     if provider_id == "claude-code":
         command = (
@@ -7370,6 +7387,33 @@ def resolve_external_process_provider_credentials(
             "command": resolved_command or command,
             "args": [],
             "source": "process",
+        }
+
+    if is_prime_acp:
+        command = os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        if not command or not args:
+            raise AuthError(
+                "Prime ACP requires explicit HERMES_COPILOT_ACP_COMMAND and "
+                "HERMES_COPILOT_ACP_ARGS values; refusing Copilot defaults.",
+                provider=provider_id,
+                code="missing_prime_acp_runtime",
+            )
+        resolved_command = shutil.which(command)
+        if not resolved_command:
+            raise AuthError(
+                f"Could not find the explicit Prime ACP command '{command}'.",
+                provider=provider_id,
+                code="missing_prime_acp_command",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": "prime-acp",
+            "base_url": base_url.rstrip("/"),
+            "command": resolved_command,
+            "args": args,
+            "source": "prime-process",
         }
 
     command = (

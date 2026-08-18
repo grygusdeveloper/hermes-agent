@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,7 +36,9 @@ from tools.environments.local import hermes_subprocess_env
 ACP_MARKER_BASE_URL = "acp://copilot"
 CURSOR_MARKER_BASE_URL = "acp://cursor"
 ANTIGRAVITY_MARKER_BASE_URL = "acp://antigravity"
+PRIME_MARKER_BASE_URL = "acp://prime"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+_PRIME_CLOSE_TIMEOUT_SECONDS = 2.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
@@ -123,6 +126,11 @@ def _is_copilot_base_url(base_url: str = "") -> bool:
     return url == ACP_MARKER_BASE_URL or url.startswith(ACP_MARKER_BASE_URL + "/")
 
 
+def _is_prime_base_url(base_url: str = "") -> bool:
+    url = str(base_url or "").strip().rstrip("/").lower()
+    return url == PRIME_MARKER_BASE_URL or url.startswith(PRIME_MARKER_BASE_URL + "/")
+
+
 def is_acp_stdio_runtime(*, provider: str = "", base_url: str = "") -> bool:
     """True when the runtime is Copilot/Cursor ACP stdio (or ACP-over-TCP).
 
@@ -136,6 +144,7 @@ def is_acp_stdio_runtime(*, provider: str = "", base_url: str = "") -> bool:
         name in _ACP_STDIO_PROVIDERS
         or _is_copilot_base_url(base_url)
         or _is_cursor_base_url(base_url)
+        or _is_prime_base_url(base_url)
         or url.startswith("acp+tcp://")
     )
 
@@ -325,6 +334,273 @@ def _render_message_content(content: Any) -> str:
     return str(content).strip()
 
 
+def _latest_user_request(messages: list[dict[str, Any]]) -> str:
+    """Return only the newest user message's visible text.
+
+    Prime is an agent in its own right.  Hermes is deliberately only its
+    transport, so system messages, prior turns, model hints, and Hermes tool
+    schemas must never cross this boundary.
+    """
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _render_message_content(message.get("content"))
+        if text:
+            return text
+    raise ValueError("Prime ACP requires a non-empty newest user request.")
+
+
+@dataclass
+class _PrimeACPState:
+    key: str
+    process: subprocess.Popen[str] | None = None
+    session_id: str | None = None
+    inbox: queue.Queue[dict[str, Any]] = field(default_factory=queue.Queue)
+    stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=40))
+    next_id: int = 0
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+class PrimeACPConversation:
+    """Durable Prime ACP processes, keyed by the ambient Hermes conversation.
+
+    A primary ``CopilotACPClient`` owns this object and request-local clients
+    borrow it.  Each key gets exactly one serialized ACP session and process;
+    different Discord DMs/threads therefore cannot share Prime runtime state.
+    """
+
+    def __init__(self) -> None:
+        self._states: dict[str, _PrimeACPState] = {}
+        self._states_lock = threading.Lock()
+        self._closed = False
+
+    def run(
+        self,
+        prompt_text: str,
+        *,
+        state_key: str | None,
+        timeout_seconds: float,
+        client: "CopilotACPClient",
+    ) -> tuple[str, str]:
+        key = str(state_key or "").strip()
+        if not key:
+            raise RuntimeError(
+                "Prime ACP requires a Hermes conversation context; refusing to "
+                "create an unkeyed session that could mix conversations."
+            )
+        with self._states_lock:
+            if self._closed:
+                raise RuntimeError("Prime ACP conversation owner is closed.")
+            state = self._states.setdefault(key, _PrimeACPState(key=key))
+        with state.lock:
+            if state.process is None or state.process.poll() is not None:
+                self._start_state(state, timeout_seconds=timeout_seconds, client=client)
+            text_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            self._request(
+                state,
+                "session/prompt",
+                {
+                    "sessionId": state.session_id,
+                    "prompt": [{"type": "text", "text": prompt_text}],
+                },
+                timeout_seconds=timeout_seconds,
+                client=client,
+                text_parts=text_parts,
+                reasoning_parts=reasoning_parts,
+            )
+            return "".join(text_parts), "".join(reasoning_parts)
+
+    def _start_state(
+        self,
+        state: _PrimeACPState,
+        *,
+        timeout_seconds: float,
+        client: "CopilotACPClient",
+    ) -> None:
+        old_session_id = state.session_id
+        proc = client._spawn_acp_process()
+        state.process = proc
+        state.inbox = queue.Queue()
+        state.stderr_tail.clear()
+        state.next_id = 0
+
+        def _stdout_reader() -> None:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                try:
+                    state.inbox.put(json.loads(line))
+                except Exception:
+                    state.inbox.put({"raw": line.rstrip("\n")})
+
+        def _stderr_reader() -> None:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                state.stderr_tail.append(line.rstrip("\n"))
+
+        threading.Thread(target=_stdout_reader, daemon=True).start()
+        threading.Thread(target=_stderr_reader, daemon=True).start()
+        try:
+            initialized = self._request(
+                state,
+                "initialize",
+                client._initialize_params(),
+                timeout_seconds=timeout_seconds,
+                client=client,
+            ) or {}
+            if old_session_id:
+                capabilities = initialized.get("agentCapabilities") or {}
+                if not capabilities.get("loadSession"):
+                    raise RuntimeError(
+                        "Prime ACP process was recreated but it does not advertise "
+                        "session/load; refusing to start a new session and silently "
+                        f"lose or mix saved session {old_session_id!r}."
+                    )
+                loaded = self._request(
+                    state,
+                    "session/load",
+                    {
+                        "sessionId": old_session_id,
+                        "cwd": client._acp_cwd,
+                        "mcpServers": [],
+                    },
+                    timeout_seconds=timeout_seconds,
+                    client=client,
+                ) or {}
+                returned_id = str(loaded.get("sessionId") or old_session_id).strip()
+                if returned_id != old_session_id:
+                    raise RuntimeError(
+                        "Prime ACP session/load returned a different session id; "
+                        "refusing to mix conversation state."
+                    )
+                state.session_id = old_session_id
+                return
+
+            session = self._request(
+                state,
+                "session/new",
+                {"cwd": client._acp_cwd, "mcpServers": []},
+                timeout_seconds=timeout_seconds,
+                client=client,
+            ) or {}
+            session_id = str(session.get("sessionId") or "").strip()
+            if not session_id:
+                raise RuntimeError("Prime ACP did not return a sessionId.")
+            state.session_id = session_id
+        except Exception:
+            self._close_process(state)
+            state.session_id = old_session_id
+            raise
+
+    def _request(
+        self,
+        state: _PrimeACPState,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout_seconds: float,
+        client: "CopilotACPClient",
+        text_parts: list[str] | None = None,
+        reasoning_parts: list[str] | None = None,
+    ) -> Any:
+        proc = state.process
+        if proc is None or proc.stdin is None:
+            raise RuntimeError("Prime ACP process does not expose stdin.")
+        state.next_id += 1
+        request_id = state.next_id
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }) + "\n")
+        proc.stdin.flush()
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                msg = state.inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if client._handle_server_message(
+                msg,
+                process=proc,
+                cwd=client._acp_cwd,
+                text_parts=text_parts,
+                reasoning_parts=reasoning_parts,
+            ):
+                continue
+            if msg.get("id") != request_id:
+                continue
+            if "error" in msg:
+                err = msg.get("error") or {}
+                raise RuntimeError(
+                    f"Prime ACP {method} failed: "
+                    f"{_safe_acp_error_text(err.get('message') or err)}"
+                )
+            return msg.get("result")
+
+        stderr_text = _safe_acp_error_text("\n".join(state.stderr_tail))
+        if proc.poll() is not None:
+            detail = f": {stderr_text}" if stderr_text else ""
+            raise RuntimeError(f"Prime ACP process exited during {method}{detail}")
+        raise TimeoutError(f"Timed out waiting for Prime ACP response to {method}.")
+
+    @staticmethod
+    def _close_process(state: _PrimeACPState) -> None:
+        proc = state.process
+        state.process = None
+        if proc is None:
+            return
+        # Prime persists/releases its session on normal ACP stdio EOF.  Give it
+        # a bounded chance to do so before escalating to terminate and kill.
+        try:
+            if proc.stdin is not None and not proc.stdin.closed:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=_PRIME_CLOSE_TIMEOUT_SECONDS)
+            return
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+            return
+        except Exception:
+            pass
+        try:
+            proc.kill()
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+    def abort(self, state_key: str | None = None) -> None:
+        key = str(state_key or "").strip()
+        with self._states_lock:
+            states = [self._states[key]] if key and key in self._states else list(self._states.values())
+        for state in states:
+            # Abort is called by the watchdog thread while ``run`` owns the
+            # per-session lock. Closing stdio must not wait on that lock or it
+            # cannot unblock the pending ACP read.
+            self._close_process(state)
+
+    def close(self) -> None:
+        with self._states_lock:
+            if self._closed:
+                return
+            self._closed = True
+            states = list(self._states.values())
+        for state in states:
+            with state.lock:
+                self._close_process(state)
+
+
 def _build_openai_tool_call(
     *,
     call_id: str,
@@ -503,16 +779,23 @@ class CopilotACPClient:
     ):
         raw_url = str(base_url or "").strip()
         raw_key = str(api_key or "").strip()
+        is_prime = _is_prime_base_url(raw_url) or raw_key == "prime-acp"
         # Cursor identity is the marker URL. The dedicated api_key sentinel is
         # a second signal so a caller that omits base_url cannot fall through
         # to Copilot's default URL and process-env overrides.
-        is_cursor = _is_cursor_base_url(raw_url) or (
+        is_cursor = not is_prime and (_is_cursor_base_url(raw_url) or (
             raw_key == "cursor-agent" and not _is_copilot_base_url(raw_url)
+        ))
+        self.api_key = api_key or (
+            "prime-acp" if is_prime else ("cursor-agent" if is_cursor else "copilot-acp")
         )
-        self.api_key = api_key or ("cursor-agent" if is_cursor else "copilot-acp")
-        self.base_url = raw_url or (CURSOR_MARKER_BASE_URL if is_cursor else ACP_MARKER_BASE_URL)
+        self.base_url = raw_url or (
+            PRIME_MARKER_BASE_URL if is_prime else (
+                CURSOR_MARKER_BASE_URL if is_cursor else ACP_MARKER_BASE_URL
+            )
+        )
         self._default_headers = dict(default_headers or {})
-        if is_cursor:
+        if is_cursor or is_prime:
             selected_command = _first_nonempty(acp_command, command)
             if acp_args is not None:
                 selected_args = list(acp_args)
@@ -521,8 +804,9 @@ class CopilotACPClient:
             else:
                 selected_args = None
             if not selected_command or not selected_args:
+                backend = "Prime ACP" if is_prime else "Cursor ACP"
                 raise ValueError(
-                    "Cursor ACP requires an explicit command and args; "
+                    f"{backend} requires an explicit command and args; "
                     "refusing to fall back to Copilot ACP environment overrides."
                 )
             self._acp_command = selected_command
@@ -540,13 +824,20 @@ class CopilotACPClient:
         # spawned workspaces begin with identical prompts.
         self._antigravity_conversation = AntigravityConversation()
         self._owns_antigravity_conversation = True
+        self._prime_conversation = PrimeACPConversation()
+        self._owns_prime_conversation = True
 
     def _is_antigravity(self) -> bool:
         return str(self.base_url or "").rstrip("/") == ANTIGRAVITY_MARKER_BASE_URL
 
+    def _is_prime(self) -> bool:
+        return _is_prime_base_url(self.base_url)
+
     def _backend_label(self) -> str:
         if _is_cursor_base_url(self.base_url):
             return "Cursor Agent"
+        if self._is_prime():
+            return "Prime ACP"
         if self._is_antigravity():
             return "Antigravity"
         return "Copilot ACP"
@@ -554,6 +845,8 @@ class CopilotACPClient:
     def close(self) -> None:
         if self._owns_antigravity_conversation:
             self._antigravity_conversation.abort()
+        if self._owns_prime_conversation:
+            self._prime_conversation.close()
         proc: subprocess.Popen[str] | None
         with self._active_process_lock:
             proc = self._active_process
@@ -581,12 +874,15 @@ class CopilotACPClient:
         stream: bool = False,
         **_: Any,
     ) -> Any:
-        prompt_text = _format_messages_as_prompt(
-            messages or [],
-            model=model,
-            tools=tools,
-            tool_choice=tool_choice,
-        )
+        if self._is_prime():
+            prompt_text = _latest_user_request(messages or [])
+        else:
+            prompt_text = _format_messages_as_prompt(
+                messages or [],
+                model=model,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
         if timeout is None:
@@ -603,7 +899,14 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        if self._is_antigravity():
+        if self._is_prime():
+            response_text, reasoning_text = self._prime_conversation.run(
+                prompt_text,
+                state_key=get_conversation_context(),
+                timeout_seconds=_effective_timeout,
+                client=self,
+            )
+        elif self._is_antigravity():
             # Only the main tool-enabled agent owns durable AGY continuity.
             # Auxiliary title/compression calls have no tool schema and must not
             # overwrite the main session's conversation mapping.
@@ -624,7 +927,12 @@ class CopilotACPClient:
                 timeout_seconds=_effective_timeout,
             )
 
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        if self._is_prime():
+            # Prime owns its tools. Its final text is opaque transport output,
+            # never an instruction for Hermes to execute a second tool loop.
+            tool_calls, cleaned_text = [], response_text
+        else:
+            tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
         usage = SimpleNamespace(
             prompt_tokens=0,
@@ -649,6 +957,58 @@ class CopilotACPClient:
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
+
+    @staticmethod
+    def _initialize_params() -> dict[str, Any]:
+        return {
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {"readTextFile": True, "writeTextFile": True}
+            },
+            "clientInfo": {
+                "name": "hermes-agent",
+                "title": "Hermes Agent",
+                "version": "0.0.0",
+            },
+        }
+
+    def _spawn_acp_process(self) -> subprocess.Popen[str]:
+        try:
+            from hermes_cli._subprocess_compat import windows_hide_flags
+
+            proc = subprocess.Popen(
+                [self._acp_command] + self._acp_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self._acp_cwd,
+                env=_build_subprocess_env(self.base_url),
+                creationflags=windows_hide_flags(),
+            )
+        except FileNotFoundError as exc:
+            if self._is_prime():
+                raise RuntimeError(
+                    f"Could not start explicit Prime ACP command '{self._acp_command}'."
+                ) from exc
+            if _is_cursor_base_url(self.base_url):
+                raise RuntimeError(
+                    f"Could not start Cursor Agent command '{self._acp_command}'. "
+                    "Install Cursor Agent or set cursor.command in config.yaml."
+                ) from exc
+            raise RuntimeError(
+                f"Could not start Copilot ACP command '{self._acp_command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+            ) from exc
+        if proc.stdin is None or proc.stdout is None:
+            proc.kill()
+            raise RuntimeError(
+                f"{self._backend_label()} process did not expose stdin/stdout pipes."
+            )
+        return proc
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
         try:
