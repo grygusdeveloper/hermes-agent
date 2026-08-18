@@ -3501,6 +3501,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 for tc_delta in delta.tool_calls:
                     raw_idx = tc_delta.index if tc_delta.index is not None else 0
                     delta_id = tc_delta.id or ""
+                    delta_call_id = getattr(tc_delta, "call_id", None)
+                    delta_response_item_id = getattr(
+                        tc_delta, "response_item_id", None
+                    )
 
                     # Ollama fix: detect a new tool call reusing the same
                     # raw index (different id) and redirect to a fresh slot.
@@ -3524,6 +3528,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             _tc_id = str(_tc_id)
                         tool_calls_acc[idx] = {
                             "id": _tc_id or "",
+                            "call_id": delta_call_id or "",
+                            "response_item_id": delta_response_item_id or "",
                             "type": "function",
                             "function": {"name": "", "arguments": ""},
                             "extra_content": None,
@@ -3535,6 +3541,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             _new_id = str(_new_id)
                         if _new_id:
                             entry["id"] = _new_id
+                    if delta_call_id:
+                        entry["call_id"] = delta_call_id
+                    if delta_response_item_id:
+                        entry["response_item_id"] = delta_response_item_id
                     if tc_delta.function:
                         if tc_delta.function.name:
                             # Use assignment, not +=.  Function names are
@@ -3663,6 +3673,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     has_truncated_tool_args = True
                 mock_tool_calls.append(SimpleNamespace(
                     id=tc["id"],
+                    call_id=tc.get("call_id") or None,
+                    response_item_id=tc.get("response_item_id") or None,
                     type=tc["type"],
                     extra_content=tc.get("extra_content"),
                     function=SimpleNamespace(
