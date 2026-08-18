@@ -14,12 +14,16 @@ import fcntl
 import hashlib
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
+
+from agent.session_activity import bound_activity_description
 
 # Linux limits each execve argument to MAX_ARG_STRLEN (normally 128 KiB).
 # Leave headroom for encoding and platform variation.
@@ -40,6 +44,7 @@ _CONVERSATION_ID_RE = re.compile(
 _MESSAGE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _STATE_VERSION = 1
 _STATE_LOCK = threading.Lock()
+_PROCESS_DRAIN_GRACE_SECONDS = 30.0
 
 
 def _render_content(content: Any) -> str:
@@ -495,6 +500,48 @@ def _is_expired_conversation_error(detail: str) -> bool:
     )
 
 
+def _reap_process_group(
+    process: subprocess.Popen[str], *, grace_seconds: float = 2.0
+) -> None:
+    """Terminate and reap AGY's whole process group with bounded waits."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except Exception:
+        pass
+    # The leader can exit while a descendant keeps stdout/stderr open. Always
+    # address the process group before the final bounded leader reap.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except Exception:
+        pass
+
+
+def _close_process_stream(stream: Any) -> None:
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
 class AntigravityConversation:
     """One collision-free AGY conversation bound to one Hermes model client."""
 
@@ -510,6 +557,164 @@ class AntigravityConversation:
         # Set for the lifetime of a whole run() call so abort() can stop a
         # multi-part sequence between chunks, not only mid-subprocess.
         self._sequence_abort_requested = False
+        self._progress_lock = threading.Lock()
+        self._progress_active = False
+        self._progress_description = ""
+        self._progress_updated_at = 0.0
+
+    def _set_progress(self, description: str, *, active: bool = True) -> None:
+        """Publish a truthful, prompt-free snapshot for gateway heartbeats."""
+
+        with self._progress_lock:
+            self._progress_active = active
+            self._progress_description = bound_activity_description(description)
+            self._progress_updated_at = time.time()
+
+    def get_progress_snapshot(self) -> dict[str, Any]:
+        """Return the latest AGY phase without exposing reasoning or prompt text."""
+
+        with self._progress_lock:
+            return {
+                "active": self._progress_active,
+                "description": self._progress_description,
+                "updated_at": self._progress_updated_at,
+            }
+
+    def _observe_stream_event(self, payload: dict[str, Any]) -> None:
+        """Translate AGY stream-json events into stable user-facing phases."""
+
+        event = str(payload.get("event") or "").strip().lower()
+        if event == "init":
+            self._set_progress("Antigravity connected — waiting for Gemini")
+            return
+        if event == "step_update":
+            step = payload.get("step_update")
+            if not isinstance(step, dict):
+                return
+            step_type = str(step.get("step_type") or "").strip().lower()
+            state = str(step.get("state") or "").strip().lower()
+            if step_type == "user_input":
+                self._set_progress(
+                    "Antigravity accepted the prompt — Gemini is reasoning"
+                )
+            elif step_type == "agent_response":
+                action = (
+                    "is composing the response"
+                    if state != "done"
+                    else "returned a response"
+                )
+                self._set_progress(f"Gemini {action}")
+            elif step_type == "checkpoint":
+                self._set_progress(
+                    "Antigravity is saving the conversation checkpoint"
+                )
+            elif step_type:
+                # Unknown AGY step metadata is provider-controlled. Keep the
+                # heartbeat useful without echoing arbitrary fields into chat.
+                self._set_progress("Antigravity is processing the provider turn")
+            return
+        if event == "result":
+            self._set_progress(
+                "Antigravity completed the provider turn", active=False
+            )
+
+    def _communicate_stream_json(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, str]:
+        """Drain AGY stdout/stderr while observing newline-delimited events."""
+
+        streams: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+        def _reader(name: str, stream: Any) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    streams.put((name, line))
+            finally:
+                streams.put((name, None))
+
+        stdout_stream = getattr(process, "stdout", None)
+        stderr_stream = getattr(process, "stderr", None)
+        if stdout_stream is None or stderr_stream is None:
+            return process.communicate(
+                timeout=timeout_seconds + _PROCESS_DRAIN_GRACE_SECONDS
+            )
+
+        readers = [
+            threading.Thread(
+                target=_reader,
+                args=("stdout", stdout_stream),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_reader,
+                args=("stderr", stderr_stream),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        finished: set[str] = set()
+        deadline = (
+            time.monotonic() + timeout_seconds + _PROCESS_DRAIN_GRACE_SECONDS
+        )
+        clean_exit = False
+        try:
+            while len(finished) < 2:
+                with self._process_lock:
+                    abort_requested = self._abort_requested
+                if abort_requested:
+                    raise RuntimeError("AGY request aborted")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        getattr(process, "args", "agy"),
+                        timeout_seconds + _PROCESS_DRAIN_GRACE_SECONDS,
+                    )
+                try:
+                    name, line = streams.get(timeout=min(0.5, remaining))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    finished.add(name)
+                    continue
+                if name == "stderr":
+                    stderr_parts.append(line)
+                    continue
+                stdout_parts.append(line)
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    try:
+                        self._observe_stream_event(payload)
+                    except Exception:
+                        # Progress reporting is observational. A malformed or
+                        # hostile event must not break process lifecycle.
+                        pass
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(
+                    getattr(process, "args", "agy"),
+                    timeout_seconds + _PROCESS_DRAIN_GRACE_SECONDS,
+                )
+            process.wait(timeout=max(0.1, min(2.0, remaining)))
+            clean_exit = True
+            return "".join(stdout_parts), "".join(stderr_parts)
+        finally:
+            if not clean_exit:
+                _reap_process_group(process, grace_seconds=2.0)
+            _close_process_stream(stdout_stream)
+            _close_process_stream(stderr_stream)
+            for reader in readers:
+                reader.join(timeout=1.0)
 
     def reset(self) -> None:
         with self._lock:
@@ -747,6 +952,7 @@ class AntigravityConversation:
                 raise RuntimeError("Concurrent AGY request on one conversation")
             self._request_active = True
             self._abort_requested = False
+        self._set_progress("Starting Antigravity — sending the request to Gemini")
         try:
             result = self._execute_active(
                 prompt_text,
@@ -768,10 +974,20 @@ class AntigravityConversation:
                 self._request_active = False
             return result
         finally:
+            self._set_progress("Antigravity provider turn ended", active=False)
+            process_to_reap: subprocess.Popen[str] | None
             with self._process_lock:
+                process_to_reap = self._active_process
                 self._active_process = None
                 self._abort_requested = False
                 self._request_active = False
+            if process_to_reap is not None:
+                try:
+                    still_running = process_to_reap.poll() is None
+                except Exception:
+                    still_running = True
+                if still_running:
+                    _reap_process_group(process_to_reap, grace_seconds=2.0)
 
     def _execute_active(
         self,
@@ -796,7 +1012,7 @@ class AntigravityConversation:
             "--sandbox",
             "--disable-slash-commands",
             "--output-format",
-            "json",
+            "stream-json",
             "--print-timeout",
             f"{max(1, int(timeout_seconds))}s",
         ]
@@ -817,6 +1033,9 @@ class AntigravityConversation:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
                     cwd=cwd or str(Path.home()),
                     env=process_env,
                     start_new_session=True,
@@ -826,14 +1045,13 @@ class AntigravityConversation:
             self._active_process = process
 
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds + 30)
+            stdout, stderr = self._communicate_stream_json(
+                process,
+                timeout_seconds=timeout_seconds,
+            )
         except subprocess.TimeoutExpired as exc:
             self.abort()
-            try:
-                process.wait(timeout=5)
-            except Exception:
-                process.kill()
-                process.wait()
+            _reap_process_group(process, grace_seconds=2.0)
             raise RuntimeError("AGY prompt timed out") from exc
 
         if process.returncode != 0:
@@ -846,10 +1064,25 @@ class AntigravityConversation:
             if conversation_id and _is_expired_conversation_error(detail):
                 raise AntigravityConversationExpired(f"AGY failed: {detail}")
             raise RuntimeError(f"AGY failed: {detail}")
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("AGY returned malformed JSON") from exc
+        payload: Any = None
+        for line in reversed(stdout.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("event") == "result"
+                and isinstance(candidate.get("result"), dict)
+            ):
+                payload = candidate["result"]
+                break
+        if payload is None:
+            # Compatibility with older AGY builds and simple process doubles.
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("AGY returned malformed JSON") from exc
         if not isinstance(payload, dict):
             raise RuntimeError("AGY returned non-object JSON")
         if str(payload.get("status") or "") != "SUCCESS":

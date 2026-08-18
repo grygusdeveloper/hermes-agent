@@ -143,6 +143,35 @@ class FailingAgent:
         }
 
 
+class ProviderProgressAgent:
+    """Keeps a provider call active long enough for one gateway heartbeat."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.16)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    def get_activity_summary(self):
+        return {
+            "api_call_count": 3,
+            "max_iterations": 90,
+            # Deliberately stale: the provider phase must win in the heartbeat.
+            "current_tool": "terminal",
+            "last_activity_desc": (
+                "Antigravity accepted the prompt — Gemini is reasoning"
+            ),
+            "provider_activity": {
+                "active": True,
+                "description": (
+                    "Antigravity accepted the prompt — Gemini is reasoning"
+                ),
+                "updated_at": time.time(),
+            },
+        }
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -186,7 +215,11 @@ def _install_fakes(
     import tools.terminal_tool  # noqa: F401 — register tool emoji
 
     gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda *args, **kwargs: {"api_key": "fake"},
+    )
 
     # Wire the per-platform cleanup_progress flag via the config loader the
     # gateway actually reads (``_load_gateway_config`` returns user config).
@@ -204,6 +237,39 @@ def _install_fakes(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_prefers_live_provider_phase_over_stale_tool(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.05")
+    adapter = CleanupCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(
+        monkeypatch,
+        ProviderProgressAgent,
+        cleanup_on=False,
+        cleanup_platform=Platform.DISCORD,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.DISCORD, chat_id="progress-thread")
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-provider-progress",
+        session_key="agent:main:discord:progress-thread",
+    )
+
+    assert result["final_response"] == "done"
+    heartbeat_text = "\n".join(
+        str(item["content"]) for item in [*adapter.sent, *adapter.edits]
+    )
+    assert "Antigravity accepted the prompt — Gemini is reasoning" in heartbeat_text
+    assert "iteration 3/90, terminal" not in heartbeat_text
 
 
 @pytest.mark.asyncio

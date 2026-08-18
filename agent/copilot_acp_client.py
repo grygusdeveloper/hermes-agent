@@ -1228,6 +1228,13 @@ class CopilotACPClient:
             return "Antigravity"
         return "Copilot ACP"
 
+    def get_runtime_activity(self) -> dict[str, Any] | None:
+        """Expose backend-owned progress for gateway heartbeat rendering."""
+
+        if not self._is_antigravity():
+            return None
+        return self._antigravity_conversation.get_progress_snapshot()
+
     def close(self) -> None:
         if self._owns_antigravity_conversation:
             self._antigravity_conversation.abort()

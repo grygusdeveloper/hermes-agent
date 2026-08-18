@@ -26171,7 +26171,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
                             )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
+                        _provider_activity = _a.get("provider_activity")
+                        _provider_action = ""
+                        if (
+                            isinstance(_provider_activity, dict)
+                            and _provider_activity.get("active")
+                        ):
+                            # get_activity_summary overlays and bounds the live
+                            # provider description into this shared field.
+                            _provider_action = str(
+                                _a.get("last_activity_desc") or ""
+                            ).strip()
+                        # A live provider phase is newer than the most recently
+                        # completed Hermes tool. Prefer it so a long AGY call is
+                        # not mislabeled as the stale prior tool.
+                        _action = (
+                            _provider_action
+                            or _a.get("current_tool")
+                            or _a.get("last_activity_desc")
+                        )
                         if _action:
                             _parts.append(str(_action))
                         if _parts:

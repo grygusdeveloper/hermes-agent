@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import io
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
 import threading
 import time
@@ -37,6 +40,241 @@ from tools.tool_result_storage import enforce_turn_budget
 
 def _messages(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     return [{"role": role, "content": content} for role, content in pairs]
+
+
+def test_stream_json_reports_provider_phases_and_returns_result(monkeypatch):
+    conversation = AntigravityConversation()
+    conversation_id = "12345678-1234-1234-1234-123456789abc"
+    events = [
+        {"event": "init", "conversation_id": conversation_id, "init": {}},
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 0,
+                "state": "DONE",
+                "step_type": "user_input",
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "state": "DONE",
+                "step_type": "agent_response",
+                "text_delta": "STREAM_OK",
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "conversation_id": conversation_id,
+                "status": "SUCCESS",
+                "response": "STREAM_OK",
+            },
+        },
+    ]
+    process = SimpleNamespace(
+        pid=12345,
+        returncode=0,
+        stdout=io.StringIO("".join(json.dumps(event) + "\n" for event in events)),
+        stderr=io.StringIO(""),
+        wait=Mock(return_value=0),
+    )
+    commands: list[list[str]] = []
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        return process
+
+    phases: list[tuple[str, bool]] = []
+    original_set_progress = conversation._set_progress
+
+    def record_progress(description: str, *, active: bool = True) -> None:
+        phases.append((description, active))
+        original_set_progress(description, active=active)
+
+    monkeypatch.setattr(conversation, "_set_progress", record_progress)
+    monkeypatch.setattr("agent.antigravity_session.subprocess.Popen", fake_popen)
+
+    response, reasoning, returned_id = conversation._execute(
+        "hello",
+        conversation_id=None,
+        model="gemini-3.7-flash-high",
+        effort="high",
+        timeout_seconds=30,
+        cwd=None,
+        env=None,
+    )
+
+    assert response == "STREAM_OK"
+    assert reasoning == ""
+    assert returned_id == conversation_id
+    output_index = commands[0].index("--output-format")
+    assert commands[0][output_index + 1] == "stream-json"
+    assert ("Antigravity connected — waiting for Gemini", True) in phases
+    assert (
+        "Antigravity accepted the prompt — Gemini is reasoning",
+        True,
+    ) in phases
+    assert ("Gemini returned a response", True) in phases
+    assert phases[-1] == ("Antigravity provider turn ended", False)
+
+
+def test_agent_activity_summary_prefers_active_provider_phase():
+    provider_updated_at = time.time()
+    runtime_activity = {
+        "active": True,
+        "description": "Antigravity accepted the prompt — Gemini is reasoning",
+        "updated_at": provider_updated_at,
+    }
+    agent = AIAgent.__new__(AIAgent)
+    agent.__dict__.update(
+        {
+            "client": SimpleNamespace(
+                get_runtime_activity=Mock(return_value=runtime_activity)
+            ),
+            "_last_activity_ts": provider_updated_at - 10,
+            "_last_activity_desc": "api_call",
+            "_last_activity_provenance": None,
+            "_current_tool": None,
+            "_api_call_count": 2,
+            "max_iterations": 90,
+            "iteration_budget": SimpleNamespace(used=2, max_total=90),
+        }
+    )
+
+    snapshot = agent.get_activity_summary()
+
+    assert snapshot["last_activity_at"] == provider_updated_at
+    assert snapshot["last_activity_desc"] == runtime_activity["description"]
+    assert snapshot["provider_activity"] == runtime_activity
+
+
+def test_agent_activity_summary_never_moves_activity_clock_backwards():
+    provider_updated_at = time.time()
+    newer_agent_activity = provider_updated_at + 10
+    agent = AIAgent.__new__(AIAgent)
+    agent.__dict__.update(
+        {
+            "client": SimpleNamespace(
+                get_runtime_activity=Mock(
+                    return_value={
+                        "active": True,
+                        "description": "Gemini is reasoning",
+                        "updated_at": provider_updated_at,
+                    }
+                )
+            ),
+            "_last_activity_ts": newer_agent_activity,
+            "_last_activity_desc": "api_call",
+            "_last_activity_provenance": None,
+            "_current_tool": None,
+            "_api_call_count": 2,
+            "max_iterations": 90,
+            "iteration_budget": SimpleNamespace(used=2, max_total=90),
+        }
+    )
+
+    snapshot = agent.get_activity_summary()
+
+    assert snapshot["last_activity_at"] == newer_agent_activity
+    assert snapshot["last_activity_desc"] == "Gemini is reasoning"
+
+
+def test_progress_snapshot_never_exposes_stream_payload_fields():
+    conversation = AntigravityConversation()
+    secret = "PRIVATE_REASONING_AND_RESPONSE"
+
+    conversation._observe_stream_event(
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "state": "RUNNING",
+                "text_delta": secret,
+                "reasoning": secret,
+            },
+        }
+    )
+    snapshot = conversation.get_progress_snapshot()
+    assert secret not in snapshot["description"]
+
+    conversation._observe_stream_event(
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_type": secret * 20,
+                "state": secret,
+            },
+        }
+    )
+    snapshot = conversation.get_progress_snapshot()
+    assert snapshot["description"] == "Antigravity is processing the provider turn"
+    assert secret not in snapshot["description"]
+
+
+def _blocking_stream_process() -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(60)"
+            ),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+
+
+def test_stream_drain_abort_reaps_term_ignoring_process_group():
+    conversation = AntigravityConversation()
+    process = _blocking_stream_process()
+    with conversation._process_lock:
+        conversation._request_active = True
+        conversation._active_process = process
+        conversation._abort_requested = False
+    outcome: list[BaseException] = []
+
+    def drain() -> None:
+        try:
+            conversation._communicate_stream_json(process, timeout_seconds=60)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=drain)
+    started = time.monotonic()
+    worker.start()
+    time.sleep(0.15)
+    conversation.abort()
+    worker.join(timeout=6)
+
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 6
+    assert process.poll() is not None
+    assert any("aborted" in str(exc).lower() for exc in outcome)
+
+
+def test_stream_drain_timeout_reaps_process_group(monkeypatch):
+    monkeypatch.setattr(
+        "agent.antigravity_session._PROCESS_DRAIN_GRACE_SECONDS", 0.05
+    )
+    conversation = AntigravityConversation()
+    process = _blocking_stream_process()
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        conversation._communicate_stream_json(process, timeout_seconds=0.05)
+
+    assert time.monotonic() - started < 6
+    assert process.poll() is not None
 
 
 def test_second_turn_uses_server_conversation_and_only_new_input(monkeypatch):

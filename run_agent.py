@@ -4127,9 +4127,38 @@ class AIAgent:
         provenance = getattr(self, "_last_activity_provenance", None)
         if provenance is None:
             provenance = ActivityProvenance.UNKNOWN
+
+        last_activity_at = getattr(self, "_last_activity_ts", None)
+        last_activity_description = getattr(self, "_last_activity_desc", None) or ""
+        runtime_activity = None
+        runtime_getter = getattr(
+            getattr(self, "client", None), "get_runtime_activity", None
+        )
+        if callable(runtime_getter):
+            try:
+                candidate = runtime_getter()
+                if isinstance(candidate, dict):
+                    runtime_activity = candidate
+            except Exception:
+                runtime_activity = None
+        if runtime_activity and runtime_activity.get("active"):
+            runtime_description = str(
+                runtime_activity.get("description") or ""
+            ).strip()
+            runtime_updated_at = runtime_activity.get("updated_at")
+            if runtime_description:
+                last_activity_description = runtime_description
+            if isinstance(runtime_updated_at, (int, float)) and runtime_updated_at > 0:
+                if last_activity_at is None:
+                    last_activity_at = float(runtime_updated_at)
+                else:
+                    last_activity_at = max(
+                        float(last_activity_at), float(runtime_updated_at)
+                    )
+
         return build_activity_snapshot(
-            last_activity_at=getattr(self, "_last_activity_ts", None),
-            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
+            last_activity_at=last_activity_at,
+            last_activity_description=last_activity_description,
             last_activity_provenance=provenance,
             extra={
             "current_tool": self._current_tool,
@@ -4137,6 +4166,7 @@ class AIAgent:
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
+            "provider_activity": runtime_activity,
             },
         )
 
