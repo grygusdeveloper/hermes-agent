@@ -14,6 +14,7 @@ import asyncio
 import importlib
 import inspect as _inspect
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -148,14 +149,17 @@ class ProviderProgressAgent:
 
     def __init__(self, **kwargs):
         self.tools = []
+        self._progress_observed = threading.Event()
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        # Leave enough margin for the heartbeat task to be scheduled even on a
-        # loaded production host; the configured test interval is 50 ms.
-        time.sleep(0.6)
+        # Stay live until the heartbeat has actually sampled provider activity.
+        # This avoids a wall-clock race during cold immutable-release imports.
+        assert self._progress_observed.wait(timeout=5.0)
+        time.sleep(0.05)
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
     def get_activity_summary(self):
+        self._progress_observed.set()
         return {
             "api_call_count": 3,
             "max_iterations": 90,
