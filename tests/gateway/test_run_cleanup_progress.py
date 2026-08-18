@@ -150,7 +150,9 @@ class ProviderProgressAgent:
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        time.sleep(0.16)
+        # Leave enough margin for the heartbeat task to be scheduled even on a
+        # loaded production host; the configured test interval is 50 ms.
+        time.sleep(0.6)
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
     def get_activity_summary(self):
