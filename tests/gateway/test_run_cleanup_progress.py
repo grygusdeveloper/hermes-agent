@@ -48,11 +48,12 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
 
     _next_mid = 100
 
-    def __init__(self, platform=Platform.TELEGRAM):
+    def __init__(self, platform=Platform.TELEGRAM, heartbeat_event=None):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
         self.edits = []
         self.deleted = []
+        self.heartbeat_event = heartbeat_event
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -69,6 +70,11 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
         self.sent.append(
             {"chat_id": chat_id, "content": content, "message_id": mid, "metadata": metadata}
         )
+        if (
+            self.heartbeat_event is not None
+            and "Antigravity accepted the prompt — Gemini is reasoning" in str(content)
+        ):
+            self.heartbeat_event.set()
         return SendResult(success=True, message_id=mid)
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
@@ -147,19 +153,19 @@ class FailingAgent:
 class ProviderProgressAgent:
     """Keeps a provider call active long enough for one gateway heartbeat."""
 
+    heartbeat_event: threading.Event | None = None
+
     def __init__(self, **kwargs):
         self.tools = []
-        self._progress_observed = threading.Event()
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        # Stay live until the heartbeat has actually sampled provider activity.
-        # This avoids a wall-clock race during cold immutable-release imports.
-        assert self._progress_observed.wait(timeout=5.0)
-        time.sleep(0.05)
+        # Stay live until the adapter receives the actual heartbeat. This avoids
+        # treating an unrelated activity-summary read as proof of delivery.
+        assert self.heartbeat_event is not None
+        assert self.heartbeat_event.wait(timeout=5.0)
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
     def get_activity_summary(self):
-        self._progress_observed.set()
         return {
             "api_call_count": 3,
             "max_iterations": 90,
@@ -192,6 +198,7 @@ def _make_runner(adapter):
     runner._session_db = None
     runner._running_agents = {}
     runner._session_run_generation = {}
+    runner._draining = False
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
@@ -250,7 +257,12 @@ async def test_heartbeat_prefers_live_provider_phase_over_stale_tool(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.05")
-    adapter = CleanupCaptureAdapter(platform=Platform.DISCORD)
+    heartbeat_event = threading.Event()
+    ProviderProgressAgent.heartbeat_event = heartbeat_event
+    adapter = CleanupCaptureAdapter(
+        platform=Platform.DISCORD,
+        heartbeat_event=heartbeat_event,
+    )
     runner = _make_runner(adapter)
     gateway_run = _install_fakes(
         monkeypatch,
@@ -261,13 +273,17 @@ async def test_heartbeat_prefers_live_provider_phase_over_stale_tool(
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     source = SessionSource(platform=Platform.DISCORD, chat_id="progress-thread")
+    session_key = "agent:main:discord:progress-thread"
+    runner._session_state(session_key).turn.agent = (
+        gateway_run._AGENT_PENDING_SENTINEL
+    )
     result = await runner._run_agent(
         message="hello",
         context_prompt="",
         history=[],
         source=source,
         session_id="sess-provider-progress",
-        session_key="agent:main:discord:progress-thread",
+        session_key=session_key,
     )
 
     assert result["final_response"] == "done"
