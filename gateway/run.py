@@ -26144,9 +26144,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _exec_ref = _executor_task
                 except NameError:
                     _exec_ref = None
+                if _exec_ref is not None and _exec_ref.done():
+                    break
+                # Agent construction happens in the executor thread. If the
+                # first heartbeat tick wins that startup race, keep waiting
+                # while the executor is alive instead of permanently ending
+                # notifications before the agent can publish its activity.
+                if agent_holder[0] is None:
+                    continue
                 if not self._should_emit_long_running_notification(
                     session_key, agent_holder[0], _exec_ref
                 ):
+                    # The real agent can exist briefly before track_agent()
+                    # promotes this run's pending claim. Wait only while the
+                    # generation proves the sentinel still belongs to us;
+                    # /new or another run invalidates it and must stop output.
+                    _slot_agent = None
+                    if session_key:
+                        _slot_state = self._peek_session_state(session_key)
+                        _slot_agent = (
+                            _slot_state.turn.agent if _slot_state else None
+                        )
+                    if (
+                        _slot_agent is _AGENT_PENDING_SENTINEL
+                        and run_generation is not None
+                        and self._is_session_run_current(
+                            session_key, run_generation
+                        )
+                    ):
+                        continue
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available. Default

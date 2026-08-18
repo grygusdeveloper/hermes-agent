@@ -156,6 +156,9 @@ class ProviderProgressAgent:
     heartbeat_event: threading.Event | None = None
 
     def __init__(self, **kwargs):
+        # Force the first 50 ms heartbeat tick to occur before agent_holder is
+        # populated, proving startup does not permanently stop notifications.
+        time.sleep(0.12)
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
@@ -274,6 +277,7 @@ async def test_heartbeat_prefers_live_provider_phase_over_stale_tool(
 
     source = SessionSource(platform=Platform.DISCORD, chat_id="progress-thread")
     session_key = "agent:main:discord:progress-thread"
+    run_generation = runner._begin_session_run_generation(session_key)
     runner._session_state(session_key).turn.agent = (
         gateway_run._AGENT_PENDING_SENTINEL
     )
@@ -284,6 +288,7 @@ async def test_heartbeat_prefers_live_provider_phase_over_stale_tool(
         source=source,
         session_id="sess-provider-progress",
         session_key=session_key,
+        run_generation=run_generation,
     )
 
     assert result["final_response"] == "done"
