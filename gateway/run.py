@@ -20750,8 +20750,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             current_name = str(getattr(current_thread, "name", "") or "").strip()
-            if current_name and not _is_spawn_topic_placeholder(current_name):
+            # Fail closed when Discord could not provide the current name, and
+            # never clobber a human title. Placeholder forum topics take this
+            # one semantic rename; tag binding deliberately leaves them alone
+            # so this call is not stranded behind Discord's rename rate limit.
+            if not current_name or not _is_spawn_topic_placeholder(current_name):
                 return
+            guard_name = current_name
             raw_config = _load_gateway_config() or {}
             key = self._session_key_for_source(source)
             override = None

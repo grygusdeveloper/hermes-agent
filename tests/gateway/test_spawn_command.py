@@ -293,6 +293,136 @@ async def test_forum_model_tag_binds_before_first_turn():
 
 
 @pytest.mark.asyncio
+async def test_forum_placeholder_waits_for_semantic_title_before_rename():
+    channel = SimpleNamespace(
+        name=".",
+        applied_tags=[SimpleNamespace(name="sol-high")],
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+        parent_chat_id="forum-1",
+        user_id="owner-1",
+    )
+    event = MessageEvent(
+        text="Fix dot title inference.",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=SimpleNamespace(channel=channel),
+    )
+    entry = SimpleNamespace(session_key=build_session_key(source))
+    store = SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=entry),
+        get_execution_profile=AsyncMock(return_value=None),
+        set_execution_profile=AsyncMock(),
+        set_model_override=AsyncMock(),
+    )
+    adapter = SimpleNamespace(
+        rename_thread=AsyncMock(return_value=True),
+        _threads=SimpleNamespace(mark=MagicMock()),
+        _spawn_owners=SimpleNamespace(mark=MagicMock()),
+    )
+    runner = SpawnHarness(adapter, store)
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "default_agent": "main",
+                "models": {
+                    "sol-high": {
+                        "label": "Sol High",
+                        "model": "gpt-5.6-sol",
+                        "provider": "openai-codex",
+                        "reasoning_effort": "high",
+                    }
+                },
+            }
+        }
+    }
+
+    with patch("gateway.run._load_gateway_config", return_value=config), patch(
+        "hermes_cli.profiles.profile_exists", return_value=True
+    ):
+        result = await runner._prepare_discord_forum_tag_session(event)
+
+    assert result is None
+    store.set_execution_profile.assert_awaited_once_with(entry.session_key, "default")
+    store.set_model_override.assert_awaited_once()
+    adapter.rename_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forum_semantic_title_performs_the_single_guarded_rename():
+    thread = SimpleNamespace(name=".")
+    adapter = SimpleNamespace(
+        _client=SimpleNamespace(fetch_channel=AsyncMock(return_value=thread)),
+        rename_thread=AsyncMock(return_value=True),
+    )
+
+    class RenameHarness:
+        _is_discord_spawn_forum_lane = GatewayRunner._is_discord_spawn_forum_lane
+        _is_discord_auto_thread_lane = GatewayRunner._is_discord_auto_thread_lane
+        _is_relay_discord_channel_lane = GatewayRunner._is_relay_discord_channel_lane
+        _await_relay_auto_thread_info = GatewayRunner._await_relay_auto_thread_info
+        _rename_discord_auto_thread_for_session_title = (
+            GatewayRunner._rename_discord_auto_thread_for_session_title
+        )
+
+        def __init__(self):
+            self.adapters = {Platform.DISCORD: adapter}
+            self.async_session_store = SimpleNamespace(
+                get_model_override=AsyncMock(
+                    return_value={"model": "gpt-5.6-sol"}
+                )
+            )
+
+        def _adapter_for_source(self, _source):
+            return adapter
+
+        def _session_key_for_source(self, source):
+            return build_session_key(source)
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="12345",
+        chat_type="thread",
+        thread_id="12345",
+        parent_chat_id="forum-1",
+        user_id="owner-1",
+    )
+    config = {
+        "gateway": {
+            "spawn": {
+                "parent_channel_id": "forum-1",
+                "models": {
+                    "sol-high": {
+                        "label": "Sol High",
+                        "model": "gpt-5.6-sol",
+                    }
+                },
+            }
+        }
+    }
+
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        await RenameHarness()._rename_discord_auto_thread_for_session_title(
+            source,
+            "session-1",
+            "Fix dot title inference",
+        )
+
+    adapter.rename_thread.assert_awaited_once_with(
+        "12345",
+        "Fix dot title inference · Sol High",
+        prefer_connector_created=False,
+        only_if_current_name=".",
+        parent_chat_id=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_forum_model_tag_requires_exactly_one_model():
     channel = SimpleNamespace(
         name="Audit",

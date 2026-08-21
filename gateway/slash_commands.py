@@ -367,7 +367,17 @@ class GatewaySlashCommandsMixin:
 
         current_name = str(getattr(channel, "name", "") or "").strip()
         rename_thread = getattr(adapter, "rename_thread", None)
-        if current_name and callable(rename_thread):
+        # A placeholder title is intentionally left untouched until the
+        # session titler produces the semantic name. Renaming ``.`` to
+        # ``New chat · Model`` here spends Discord's thread-rename bucket; the
+        # semantic rename scheduled seconds later is then rate-limited and the
+        # placeholder can survive permanently. Non-placeholder titles still
+        # get their deterministic ≤4-word normalization before turn one.
+        if (
+            current_name
+            and not _is_spawn_topic_placeholder(current_name)
+            and callable(rename_thread)
+        ):
             new_name = _spawn_topic_title(
                 current_name, _spawn_model_label(raw_config, alias, model_override["model"])
             )
