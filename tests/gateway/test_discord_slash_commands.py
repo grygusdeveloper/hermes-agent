@@ -694,6 +694,8 @@ async def test_rename_thread_edits_only_when_current_name_matches(adapter):
         "999",
         "Semantic Session Title",
         only_if_current_name="raw user prompt",
+        prefer_connector_created=False,
+        parent_chat_id=None,
     )
 
     assert result is True

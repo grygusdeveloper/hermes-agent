@@ -7796,11 +7796,17 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         *,
         only_if_current_name: Optional[str] = None,
+        prefer_connector_created: bool = False,
+        parent_chat_id: Optional[str] = None,
     ) -> bool:
         """Best-effort Discord thread rename.
 
         ``only_if_current_name`` prevents overwriting human-renamed or
         pre-existing threads.  This is intentionally a no-op on mismatch.
+        ``prefer_connector_created`` and ``parent_chat_id`` are relay-only
+        hints accepted here so the native and relay adapters implement the
+        same rename contract; native Discord already owns the channel object
+        and therefore does not need either hint.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return False
