@@ -112,6 +112,12 @@ class TestGenerate:
         assert result["model"] == "gpt-image-2-medium"
         assert result["provider"] == "openai-codex"
         assert result["quality"] == "medium"
+        assert result["requested_size"] == "1536x1024"
+        assert result["actual_width"] == 1
+        assert result["actual_height"] == 1
+        assert result["actual_bytes"] > 0
+        assert result["size_honored"] is False
+        assert result["upscale_honored"] is False
 
         saved = Path(result["image"])
         assert saved.exists()
@@ -125,13 +131,28 @@ class TestGenerate:
 
         captured = {}
 
-        def _collect(token, *, prompt, size, quality, input_images=None):
+        def _collect(
+            token,
+            *,
+            prompt,
+            size,
+            quality,
+            input_images=None,
+            diagnostics=None,
+        ):
             captured.update(codex_plugin._build_responses_payload(
                 prompt=prompt,
                 size=size,
                 quality=quality,
                 input_images=input_images,
             ))
+            if diagnostics is not None:
+                diagnostics.update({
+                    "source_event": "image_generation_call.result",
+                    "partial_image_count": 1,
+                    "final_image_count": 1,
+                    "event_types": ["response.output_item.done"],
+                })
             return _b64_png()
 
         monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
@@ -176,13 +197,48 @@ class TestGenerate:
         assert "not a supported image" in result["error"]
 
 
-    def test_partial_image_event_used_when_done_missing(self):
-        """If output_item.done is missing, partial_image_b64 is accepted."""
+    def test_legacy_extractor_can_inspect_partial_preview(self):
+        """The legacy recursive helper can still inspect preview payloads."""
         payload = {
             "type": "response.image_generation_call.partial_image",
             "partial_image_b64": _b64_png(),
         }
         assert codex_plugin._extract_image_b64(payload) == _b64_png()
+
+    def test_final_extractor_rejects_partial_preview(self):
+        payload = {
+            "type": "response.image_generation_call.partial_image",
+            "partial_image_b64": _b64_png(),
+        }
+        assert codex_plugin._extract_final_image_b64(payload) is None
+
+    def test_final_extractor_accepts_completed_result(self):
+        payload = {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "image_generation_call",
+                "status": "completed",
+                "result": _b64_png(),
+            },
+        }
+        assert codex_plugin._extract_final_image_b64(payload) == _b64_png()
+
+    def test_final_extractor_rejects_noncompleted_result(self):
+        payload = {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "image_generation_call",
+                "status": "in_progress",
+                "result": _b64_png(),
+            },
+        }
+        assert codex_plugin._extract_final_image_b64(payload) is None
+
+    def test_png_metadata_is_measured_from_bytes(self):
+        meta = codex_plugin._png_b64_metadata(_b64_png())
+        assert meta["actual_width"] == 1
+        assert meta["actual_height"] == 1
+        assert meta["actual_bytes"] > 0
 
     def test_sse_parser_handles_event_and_data_lines(self):
         class _Response:
@@ -221,6 +277,35 @@ class TestGenerate:
         result = provider.generate("a cat")
         assert result["success"] is False
         assert result["error_type"] == "empty_response"
+
+    def test_partial_only_response_returns_safe_diagnostics(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        def _partial_only(*args, diagnostics=None, **kwargs):
+            assert diagnostics is not None
+            diagnostics.update({
+                "source_event": None,
+                "partial_image_count": 1,
+                "final_image_count": 0,
+                "event_types": [
+                    "response.image_generation_call.partial_image",
+                    "response.output_item.done",
+                    "response.completed",
+                ],
+            })
+            return None
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _partial_only)
+        result = provider.generate("a cat", upscale=True)
+
+        assert result["success"] is False
+        assert result["error_type"] == "empty_response"
+        assert result["partial_image_count"] == 1
+        assert result["final_image_count"] == 0
+        assert result["source_event"] is None
+        assert result["upscale_requested"] is True
+        assert result["upscale_honored"] is False
+        assert "response.completed" in result["event_types"]
 
     def test_stream_exception_returns_api_error(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")

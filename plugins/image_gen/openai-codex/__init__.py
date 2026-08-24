@@ -24,6 +24,7 @@ import base64
 import json
 import logging
 import os
+import struct
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -356,6 +357,50 @@ def _extract_image_b64(value: Any) -> Optional[str]:
     return found
 
 
+def _extract_final_image_b64(value: Any) -> Optional[str]:
+    """Return only a completed ``image_generation_call.result`` image."""
+    found: Optional[str] = None
+    if isinstance(value, dict):
+        if (
+            value.get("type") == "image_generation_call"
+            and value.get("status") == "completed"
+        ):
+            result = value.get("result")
+            if isinstance(result, str) and result:
+                found = result
+        for child in value.values():
+            nested = _extract_final_image_b64(child)
+            if nested:
+                found = nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _extract_final_image_b64(child)
+            if nested:
+                found = nested
+    return found
+
+
+def _count_partial_images(value: Any) -> int:
+    """Count preview-image fields in one decoded Responses event."""
+    if isinstance(value, dict):
+        count = int(isinstance(value.get("partial_image_b64"), str) and bool(value.get("partial_image_b64")))
+        return count + sum(_count_partial_images(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(_count_partial_images(child) for child in value)
+    return 0
+
+
+def _png_b64_metadata(value: str) -> Dict[str, int]:
+    """Decode bounded, non-secret metadata from a generated PNG payload."""
+    raw = base64.b64decode(value, validate=True)
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n") or len(raw) < 24:
+        raise ValueError("Codex image result is not a valid PNG payload")
+    width, height = struct.unpack(">II", raw[16:24])
+    if width <= 0 or height <= 0:
+        raise ValueError("Codex image result has invalid PNG dimensions")
+    return {"actual_width": width, "actual_height": height, "actual_bytes": len(raw)}
+
+
 def _iter_sse_json(response: Any):
     """Yield JSON payloads from an SSE response without OpenAI SDK parsing.
 
@@ -410,8 +455,9 @@ def _collect_image_b64(
     size: str,
     quality: str,
     input_images: Optional[List[Dict[str, str]]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Stream a Codex Responses image_generation call and return the b64 image."""
+    """Stream a Codex Responses call and return only a completed image result."""
     import httpx
     from agent.auxiliary_client import _codex_cloudflare_headers
 
@@ -430,6 +476,10 @@ def _collect_image_b64(
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
     image_b64: Optional[str] = None
+    source_event: Optional[str] = None
+    event_types: List[str] = []
+    partial_image_count = 0
+    final_image_count = 0
     with httpx.Client(timeout=timeout, headers=headers) as http:
         with http.stream("POST", f"{_CODEX_BASE_URL}/responses", json=payload) as response:
             try:
@@ -441,9 +491,27 @@ def _collect_image_b64(
                     f"{_summarize_error_body(exc.response.text)}"
                 ) from exc
             for event in _iter_sse_json(response):
-                found = _extract_image_b64(event)
+                event_type: Optional[str] = None
+                if isinstance(event, dict):
+                    raw_event_type = event.get("type")
+                    if isinstance(raw_event_type, str):
+                        event_type = raw_event_type
+                        if event_type not in event_types:
+                            event_types.append(event_type)
+                partial_image_count += _count_partial_images(event)
+                found = _extract_final_image_b64(event)
                 if found:
                     image_b64 = found
+                    source_event = event_type
+                    final_image_count += 1
+
+    if diagnostics is not None:
+        diagnostics.update({
+            "event_types": event_types,
+            "partial_image_count": partial_image_count,
+            "final_image_count": final_image_count,
+            "source_event": source_event,
+        })
 
     return image_b64
 
@@ -577,6 +645,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
+        diagnostics: Dict[str, Any] = {}
         try:
             b64 = _collect_image_b64(
                 token,
@@ -584,6 +653,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 size=size,
                 quality=meta["quality"],
                 input_images=input_images or None,
+                diagnostics=diagnostics,
             )
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
@@ -597,16 +667,34 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         if not b64:
-            return error_response(
-                error="Codex response contained no image_generation_call result",
+            partial_count = diagnostics.get("partial_image_count", 0)
+            result = error_response(
+                error=(
+                    "Codex response contained no completed image_generation_call.result "
+                    f"(partial previews observed: {partial_count})"
+                ),
                 error_type="empty_response",
                 provider="openai-codex",
                 model=tier_id,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
+            result.update({
+                "source_event": diagnostics.get("source_event"),
+                "partial_image_count": partial_count,
+                "final_image_count": diagnostics.get("final_image_count", 0),
+                "event_types": diagnostics.get("event_types", []),
+                "upscale_requested": (
+                    kwargs.get("upscale")
+                    if isinstance(kwargs.get("upscale"), bool)
+                    else None
+                ),
+                "upscale_honored": False,
+            })
+            return result
 
         try:
+            image_meta = _png_b64_metadata(b64)
             saved_path = save_b64_image(b64, prefix=f"openai_codex_{tier_id}")
         except Exception as exc:
             return error_response(
@@ -618,6 +706,8 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
+        requested_width, requested_height = (int(part) for part in size.split("x", 1))
+        upscale_requested = kwargs.get("upscale") if isinstance(kwargs.get("upscale"), bool) else None
         return success_response(
             image=str(saved_path),
             model=tier_id,
@@ -625,7 +715,23 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             aspect_ratio=aspect,
             provider="openai-codex",
             modality="image" if input_images else "text",
-            extra={"size": size, "quality": meta["quality"], "input_image_count": len(input_images)},
+            extra={
+                "size": size,
+                "requested_size": size,
+                "quality": meta["quality"],
+                "input_image_count": len(input_images),
+                **image_meta,
+                "size_honored": (
+                    image_meta["actual_width"] == requested_width
+                    and image_meta["actual_height"] == requested_height
+                ),
+                "source_event": diagnostics.get("source_event"),
+                "partial_image_count": diagnostics.get("partial_image_count", 0),
+                "final_image_count": diagnostics.get("final_image_count", 0),
+                "event_types": diagnostics.get("event_types", []),
+                "upscale_requested": upscale_requested,
+                "upscale_honored": False,
+            },
         )
 
 
