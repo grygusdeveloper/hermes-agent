@@ -447,6 +447,15 @@ class TestClaudeSonnet5InCuratedLists:
         from hermes_cli.models import _PROVIDER_MODELS
         assert "claude-sonnet-5" in _PROVIDER_MODELS["anthropic"]
 
+    def test_claude_code_list_includes_latest_claude_5_family(self):
+        from hermes_cli.models import _PROVIDER_MODELS
+
+        assert {
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        }.issubset(set(_PROVIDER_MODELS["claude-code"]))
+
 
 
 

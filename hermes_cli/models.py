@@ -311,7 +311,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "cursor-grok-4.6-low",
     ],
     "claude-code": [
-        # Latest generation (Claude Code 2.1.183 accepts these exact IDs).
+        # Latest generation (Claude Code 2.1.226 accepts these exact IDs).
+        "claude-fable-5",
         "claude-opus-5",
         "claude-sonnet-5",
         # Short CLI aliases (currently resolve to latest 4.x family).
