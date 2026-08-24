@@ -940,7 +940,7 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
 
 
 VALID_REASONING_EFFORTS = (
-    "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode",
 )
 
 
@@ -948,7 +948,7 @@ def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
     Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max",
-    "ultra".
+    "ultra", "ultracode".
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
     YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``

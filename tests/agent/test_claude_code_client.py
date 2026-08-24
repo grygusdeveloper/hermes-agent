@@ -14,6 +14,7 @@ from agent.claude_code_client import (
     CLAUDE_CODE_MARKER_BASE_URL,
     ClaudeCodeClient,
     _format_messages_as_prompt,
+    _resolve_effort_from_kwargs,
 )
 from agent.claude_code_session import (
     ClaudeCodeSession,
@@ -61,6 +62,10 @@ class _FakeStream:
 
 def _messages(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     return [{"role": role, "content": content} for role, content in pairs]
+
+
+def test_claude_code_accepts_ultracode_effort_from_reasoning_kwargs():
+    assert _resolve_effort_from_kwargs({"reasoning": {"effort": "ultracode"}}) == "ultracode"
 
 
 class TestClaudeCodePromptUX:
