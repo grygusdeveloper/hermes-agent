@@ -223,6 +223,17 @@ class TestGenerate:
         }
         assert codex_plugin._extract_final_image_b64(payload) == _b64_png()
 
+    def test_final_extractor_accepts_done_result_without_item_status(self):
+        """The live Codex done event is authoritative even when status is omitted."""
+        payload = {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "image_generation_call",
+                "result": _b64_png(),
+            },
+        }
+        assert codex_plugin._extract_final_image_b64(payload) == _b64_png()
+
     def test_final_extractor_rejects_noncompleted_result(self):
         payload = {
             "type": "response.output_item.added",
@@ -233,6 +244,45 @@ class TestGenerate:
             },
         }
         assert codex_plugin._extract_final_image_b64(payload) is None
+
+    def test_done_event_can_confirm_matching_partial_as_final(self):
+        partials = {}
+        preview = _b64_png()
+        partial_event = {
+            "type": "response.image_generation_call.partial_image",
+            "item_id": "ig_live",
+            "partial_image_b64": preview,
+        }
+        done_event = {
+            "type": "response.output_item.done",
+            "item": {"id": "ig_live", "type": "image_generation_call"},
+        }
+
+        assert codex_plugin._consume_image_stream_event(partial_event, partials) == (None, None)
+        assert codex_plugin._consume_image_stream_event(done_event, partials) == (
+            preview,
+            "done_confirmed_partial",
+        )
+
+    def test_done_event_does_not_promote_unmatched_partial(self):
+        partials = {"ig_preview": _b64_png()}
+        done_event = {
+            "type": "response.output_item.done",
+            "item": {"id": "ig_other", "type": "image_generation_call"},
+        }
+        assert codex_plugin._consume_image_stream_event(done_event, partials) == (None, None)
+
+    def test_failed_done_event_does_not_promote_matching_partial(self):
+        partials = {"ig_failed": _b64_png()}
+        done_event = {
+            "type": "response.output_item.done",
+            "item": {
+                "id": "ig_failed",
+                "type": "image_generation_call",
+                "status": "failed",
+            },
+        }
+        assert codex_plugin._consume_image_stream_event(done_event, partials) == (None, None)
 
     def test_png_metadata_is_measured_from_bytes(self):
         meta = codex_plugin._png_b64_metadata(_b64_png())

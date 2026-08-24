@@ -358,11 +358,31 @@ def _extract_image_b64(value: Any) -> Optional[str]:
 
 
 def _extract_final_image_b64(value: Any) -> Optional[str]:
-    """Return only a completed ``image_generation_call.result`` image."""
+    """Return only a final ``image_generation_call.result`` image.
+
+    The live Codex SSE route does not always repeat ``status: completed`` on
+    the item carried by ``response.output_item.done``.  The *event envelope*
+    is therefore the completion proof for that shape.  Keep rejecting
+    status-less image calls everywhere else so previews and in-progress items
+    cannot be promoted accidentally.
+    """
     found: Optional[str] = None
     if isinstance(value, dict):
+        event_type = value.get("type")
+
+        # Live ChatGPT/Codex shape observed in successful high-tier runs:
+        # {"type":"response.output_item.done",
+        #  "item":{"type":"image_generation_call","result":"..."}}
+        # The item can omit ``status`` even though the enclosing event is done.
+        if event_type == "response.output_item.done":
+            item = value.get("item")
+            if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                result = item.get("result")
+                if isinstance(result, str) and result:
+                    found = result
+
         if (
-            value.get("type") == "image_generation_call"
+            event_type == "image_generation_call"
             and value.get("status") == "completed"
         ):
             result = value.get("result")
@@ -388,6 +408,51 @@ def _count_partial_images(value: Any) -> int:
     if isinstance(value, list):
         return sum(_count_partial_images(child) for child in value)
     return 0
+
+
+def _consume_image_stream_event(
+    event: Any,
+    partials_by_item_id: Dict[str, str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Consume one SSE event and return a final image plus provenance mode.
+
+    Codex sometimes omits the large ``result`` field from
+    ``response.output_item.done`` after sending the exact image bytes in a
+    preceding ``partial_image`` event. A preview is safe to promote only when
+    a later done event confirms the *same* image-generation item. Unmatched or
+    partial-only previews remain rejected.
+    """
+    if not isinstance(event, dict):
+        return None, None
+
+    event_type = event.get("type")
+    if event_type == "response.image_generation_call.partial_image":
+        item_id = event.get("item_id")
+        preview = event.get("partial_image_b64")
+        if isinstance(item_id, str) and item_id and isinstance(preview, str) and preview:
+            partials_by_item_id[item_id] = preview
+        return None, None
+
+    completed_result = _extract_final_image_b64(event)
+    if completed_result:
+        return completed_result, "completed_result"
+
+    if event_type != "response.output_item.done":
+        return None, None
+
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "image_generation_call":
+        return None, None
+    if item.get("status") in {"failed", "incomplete", "cancelled"}:
+        return None, None
+
+    item_id = item.get("id") or event.get("item_id")
+    if not isinstance(item_id, str) or not item_id:
+        return None, None
+    confirmed_preview = partials_by_item_id.get(item_id)
+    if confirmed_preview:
+        return confirmed_preview, "done_confirmed_partial"
+    return None, None
 
 
 def _png_b64_metadata(value: str) -> Dict[str, int]:
@@ -480,6 +545,8 @@ def _collect_image_b64(
     event_types: List[str] = []
     partial_image_count = 0
     final_image_count = 0
+    finalization_mode: Optional[str] = None
+    partials_by_item_id: Dict[str, str] = {}
     with httpx.Client(timeout=timeout, headers=headers) as http:
         with http.stream("POST", f"{_CODEX_BASE_URL}/responses", json=payload) as response:
             try:
@@ -499,10 +566,11 @@ def _collect_image_b64(
                         if event_type not in event_types:
                             event_types.append(event_type)
                 partial_image_count += _count_partial_images(event)
-                found = _extract_final_image_b64(event)
+                found, mode = _consume_image_stream_event(event, partials_by_item_id)
                 if found:
                     image_b64 = found
                     source_event = event_type
+                    finalization_mode = mode
                     final_image_count += 1
 
     if diagnostics is not None:
@@ -511,6 +579,7 @@ def _collect_image_b64(
             "partial_image_count": partial_image_count,
             "final_image_count": final_image_count,
             "source_event": source_event,
+            "finalization_mode": finalization_mode,
         })
 
     return image_b64
@@ -681,6 +750,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
             result.update({
                 "source_event": diagnostics.get("source_event"),
+                "finalization_mode": diagnostics.get("finalization_mode"),
                 "partial_image_count": partial_count,
                 "final_image_count": diagnostics.get("final_image_count", 0),
                 "event_types": diagnostics.get("event_types", []),
@@ -726,6 +796,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                     and image_meta["actual_height"] == requested_height
                 ),
                 "source_event": diagnostics.get("source_event"),
+                "finalization_mode": diagnostics.get("finalization_mode"),
                 "partial_image_count": diagnostics.get("partial_image_count", 0),
                 "final_image_count": diagnostics.get("final_image_count", 0),
                 "event_types": diagnostics.get("event_types", []),
