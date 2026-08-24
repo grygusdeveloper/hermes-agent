@@ -414,13 +414,12 @@ def _consume_image_stream_event(
     event: Any,
     partials_by_item_id: Dict[str, str],
 ) -> tuple[Optional[str], Optional[str]]:
-    """Consume one SSE event and return a final image plus provenance mode.
+    """Consume one SSE event and return only an explicit final image result.
 
-    Codex sometimes omits the large ``result`` field from
-    ``response.output_item.done`` after sending the exact image bytes in a
-    preceding ``partial_image`` event. A preview is safe to promote only when
-    a later done event confirms the *same* image-generation item. Unmatched or
-    partial-only previews remain rejected.
+    A ``response.output_item.done`` event without ``item.result`` is not enough
+    to promote a streamed partial. Live 2026-08-24 runs demonstrated that those
+    done-confirmed previews can still be visually unfinished. Keep partials only
+    for bounded diagnostics and require the completed result bytes themselves.
     """
     if not isinstance(event, dict):
         return None, None
@@ -436,22 +435,6 @@ def _consume_image_stream_event(
     completed_result = _extract_final_image_b64(event)
     if completed_result:
         return completed_result, "completed_result"
-
-    if event_type != "response.output_item.done":
-        return None, None
-
-    item = event.get("item")
-    if not isinstance(item, dict) or item.get("type") != "image_generation_call":
-        return None, None
-    if item.get("status") in {"failed", "incomplete", "cancelled"}:
-        return None, None
-
-    item_id = item.get("id") or event.get("item_id")
-    if not isinstance(item_id, str) or not item_id:
-        return None, None
-    confirmed_preview = partials_by_item_id.get(item_id)
-    if confirmed_preview:
-        return confirmed_preview, "done_confirmed_partial"
     return None, None
 
 

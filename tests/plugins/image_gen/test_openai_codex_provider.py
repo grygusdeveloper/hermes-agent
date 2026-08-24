@@ -245,7 +245,7 @@ class TestGenerate:
         }
         assert codex_plugin._extract_final_image_b64(payload) is None
 
-    def test_done_event_can_confirm_matching_partial_as_final(self):
+    def test_done_event_without_result_rejects_even_matching_partial(self):
         partials = {}
         preview = _b64_png()
         partial_event = {
@@ -259,10 +259,7 @@ class TestGenerate:
         }
 
         assert codex_plugin._consume_image_stream_event(partial_event, partials) == (None, None)
-        assert codex_plugin._consume_image_stream_event(done_event, partials) == (
-            preview,
-            "done_confirmed_partial",
-        )
+        assert codex_plugin._consume_image_stream_event(done_event, partials) == (None, None)
 
     def test_done_event_does_not_promote_unmatched_partial(self):
         partials = {"ig_preview": _b64_png()}
