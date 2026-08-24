@@ -617,14 +617,14 @@ def _resolve_effort_from_kwargs(kwargs: dict[str, Any]) -> str | None:
         value = kwargs.get(key)
         if isinstance(value, str) and value.strip():
             normalized = value.strip().lower()
-            if normalized in {"low", "medium", "high", "xhigh", "max"}:
+            if normalized in {"low", "medium", "high", "xhigh", "max", "ultracode"}:
                 return normalized
     reasoning = kwargs.get("reasoning")
     if isinstance(reasoning, dict):
         value = reasoning.get("effort")
         if isinstance(value, str) and value.strip():
             normalized = value.strip().lower()
-            if normalized in {"low", "medium", "high", "xhigh", "max"}:
+            if normalized in {"low", "medium", "high", "xhigh", "max", "ultracode"}:
                 return normalized
     return None
 
@@ -645,8 +645,8 @@ def _resolve_effort() -> str | None:
             effort = agent_cfg.get("reasoning_effort")
             if isinstance(effort, str) and effort.strip():
                 normalized = effort.strip().lower()
-                # Claude Code accepts: low, medium, high, xhigh, max.
-                if normalized in {"low", "medium", "high", "xhigh", "max"}:
+                # Claude Code also exposes Ultracode as its workflow-aware top tier.
+                if normalized in {"low", "medium", "high", "xhigh", "max", "ultracode"}:
                     return normalized
     except Exception:
         pass

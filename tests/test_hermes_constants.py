@@ -339,10 +339,10 @@ class TestParseReasoningEffort:
         """Guard against silently dropping a documented level.
 
         The docstring promises "minimal", "low", "medium", "high", "xhigh",
-        "max", "ultra". If someone removes one from VALID_REASONING_EFFORTS without
+        "max", "ultra", "ultracode". If someone removes one from VALID_REASONING_EFFORTS without
         updating the docstring, this test will fail and force the call out.
         """
-        documented = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+        documented = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"}
         assert documented.issubset(set(VALID_REASONING_EFFORTS))
 
 
