@@ -67,6 +67,9 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+OOB_USER_MESSAGE_KEY = "_hermes_oob_user_message"
+_PERSISTED_PATH_RE = re.compile(r"^Full output saved to:\s*(.+?)\s*$", re.MULTILINE)
+_PERSISTED_SIZE_RE = re.compile(r"^This tool result was too large \(.+?\)\.\s*$", re.MULTILINE)
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_once = False
@@ -295,9 +298,6 @@ def _build_persisted_message(
     return msg
 
 
-_PERSISTED_PATH_RE = re.compile(r"^Full output saved to: (.+)$", re.MULTILINE)
-
-
 def extract_persisted_path(content: str) -> str | None:
     """Return the file path from a <persisted-output> replacement block.
 
@@ -309,6 +309,41 @@ def extract_persisted_path(content: str) -> str | None:
         return None
     match = _PERSISTED_PATH_RE.search(content)
     return match.group(1).strip() if match else None
+
+
+def _compact_persisted_message(content: str) -> str:
+    """Drop an existing persisted preview while retaining its durable handle."""
+
+    path_match = _PERSISTED_PATH_RE.search(content)
+    if not path_match:
+        return content
+    size_match = _PERSISTED_SIZE_RE.search(content)
+    lines = [PERSISTED_OUTPUT_TAG]
+    if size_match:
+        lines.append(size_match.group(0))
+    lines.extend(
+        (
+            f"Full output saved to: {path_match.group(1)}",
+            "Use read_file with offset and limit to inspect the full output.",
+            PERSISTED_OUTPUT_CLOSING_TAG,
+        )
+    )
+    return "\n".join(lines)
+
+
+def _split_trusted_oob_suffix(message: dict, content: str) -> tuple[str, str]:
+    """Separate authenticated mid-turn steering from spillable tool output.
+
+    The marker text alone is not trusted because a tool can emit a lookalike.
+    ``agent_runtime_helpers`` sets the private metadata key only when Hermes
+    itself appends a genuine user steer. Keeping the suffix outside persisted
+    previews ensures aggregate compaction can never hide the user's message.
+    """
+
+    trusted = message.get(OOB_USER_MESSAGE_KEY)
+    if isinstance(trusted, str) and trusted and content.endswith(trusted):
+        return content[: -len(trusted)], trusted
+    return content, ""
 
 
 def maybe_persist_tool_result(
@@ -428,16 +463,19 @@ def enforce_turn_budget(
             break
         msg = tool_messages[idx]
         content = msg["content"]
+        spillable_content, trusted_oob = _split_trusted_oob_suffix(msg, content)
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
         replacement = maybe_persist_tool_result(
-            content=content,
+            content=spillable_content,
             tool_name=_BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,
             env=env,
             config=config,
             threshold=0,
         )
+        if trusted_oob:
+            replacement += trusted_oob
         if replacement != content:
             total_size -= size
             total_size += len(replacement)
@@ -446,5 +484,47 @@ def enforce_turn_budget(
                 "Budget enforcement: persisted tool result %s (%d chars)",
                 tool_use_id, size,
             )
+
+    # Several results may already have been individually persisted before this
+    # aggregate pass. Their previews can still add up past a stricter transport
+    # budget, so compact the largest previews while preserving every file path.
+    if total_size > config.turn_budget:
+        persisted = sorted(
+            (
+                (i, len(str(msg.get("content", ""))))
+                for i, msg in enumerate(tool_messages)
+                if PERSISTED_OUTPUT_TAG in str(msg.get("content", ""))
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for idx, size in persisted:
+            if total_size <= config.turn_budget:
+                break
+            content = str(tool_messages[idx].get("content", ""))
+            compactable_content, trusted_oob = _split_trusted_oob_suffix(
+                tool_messages[idx], content
+            )
+            replacement = _compact_persisted_message(compactable_content)
+            if trusted_oob:
+                replacement += trusted_oob
+            if replacement == content:
+                continue
+            tool_messages[idx]["content"] = replacement
+            total_size -= size
+            total_size += len(replacement)
+            logger.info(
+                "Budget enforcement: compacted persisted preview %s (%d -> %d chars)",
+                tool_messages[idx].get("tool_call_id", idx),
+                size,
+                len(replacement),
+            )
+
+    if total_size > config.turn_budget:
+        logger.warning(
+            "Tool-result aggregate remains over budget after persistence: %d > %d chars",
+            total_size,
+            config.turn_budget,
+        )
 
     return tool_messages

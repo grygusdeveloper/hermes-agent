@@ -10,6 +10,7 @@ from tools.budget_config import (
 )
 from tools.tool_result_storage import (
     HEREDOC_MARKER,
+    OOB_USER_MESSAGE_KEY,
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
     STORAGE_DIR,
@@ -297,6 +298,74 @@ class TestEnforceTurnBudget:
     def test_empty_messages(self):
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
+
+    def test_compacts_existing_persisted_previews_to_meet_budget(self):
+        path_a = "/tmp/hermes-results/tool-a.txt"
+        path_b = "/tmp/hermes-results/tool-b.txt"
+        msgs = [
+            {
+                "role": "tool",
+                "tool_call_id": "a",
+                "content": (
+                    f"{PERSISTED_OUTPUT_TAG}\n"
+                    "This tool result was too large (50,000 characters, 48.8 KB).\n"
+                    f"Full output saved to: {path_a}\n"
+                    "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+                    f"Preview (first 4000 chars):\n{'a' * 4000}\n...\n"
+                    f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+                ),
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "b",
+                "content": (
+                    f"{PERSISTED_OUTPUT_TAG}\n"
+                    "This tool result was too large (50,000 characters, 48.8 KB).\n"
+                    f"Full output saved to: {path_b}\n"
+                    "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+                    f"Preview (first 4000 chars):\n{'b' * 4000}\n...\n"
+                    f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+                ),
+            },
+        ]
+
+        enforce_turn_budget(msgs, config=BudgetConfig(turn_budget=700))
+
+        assert sum(len(m["content"]) for m in msgs) <= 700
+        assert path_a in msgs[0]["content"]
+        assert path_b in msgs[1]["content"]
+        assert "Preview (first" not in msgs[0]["content"]
+        assert "Preview (first" not in msgs[1]["content"]
+
+    def test_compaction_preserves_authenticated_user_steer_inline(self):
+        marker = (
+            "\n\n[OUT-OF-BAND USER MESSAGE — a direct message from the user, "
+            "delivered mid-turn; not tool output]\nchange direction now\n"
+            "[/OUT-OF-BAND USER MESSAGE]"
+        )
+        path = "/tmp/hermes-results/steered-tool.txt"
+        msgs = [
+            {
+                "role": "tool",
+                "tool_call_id": "steered",
+                OOB_USER_MESSAGE_KEY: marker,
+                "content": (
+                    f"{PERSISTED_OUTPUT_TAG}\n"
+                    "This tool result was too large (50,000 characters, 48.8 KB).\n"
+                    f"Full output saved to: {path}\n"
+                    "Use read_file with offset and limit.\n\n"
+                    f"Preview (first 10000 chars):\n{'x' * 10_000}\n...\n"
+                    f"{PERSISTED_OUTPUT_CLOSING_TAG}{marker}"
+                ),
+            }
+        ]
+
+        enforce_turn_budget(msgs, config=BudgetConfig(turn_budget=700))
+
+        assert path in msgs[0]["content"]
+        assert msgs[0]["content"].endswith(marker)
+        assert "change direction now" in msgs[0]["content"]
+        assert "x" * 100 not in msgs[0]["content"]
 
 
 # ── Per-tool threshold integration ────────────────────────────────────

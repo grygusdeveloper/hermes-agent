@@ -6031,10 +6031,24 @@ def _make_chunk(content=None, tool_calls=None, finish_reason=None, model="test/m
     return SimpleNamespace(model=model, choices=[choice])
 
 
-def _make_tc_delta(index=0, tc_id=None, name=None, arguments=None):
+def _make_tc_delta(
+    index=0,
+    tc_id=None,
+    name=None,
+    arguments=None,
+    *,
+    call_id=None,
+    response_item_id=None,
+):
     """Build a SimpleNamespace mimicking a streaming tool_call delta."""
     func = SimpleNamespace(name=name, arguments=arguments)
-    return SimpleNamespace(index=index, id=tc_id, function=func)
+    return SimpleNamespace(
+        index=index,
+        id=tc_id,
+        call_id=call_id,
+        response_item_id=response_item_id,
+        function=func,
+    )
 
 
 def _provider_sse_429_text(
@@ -6387,6 +6401,39 @@ class TestStreamingApiCall:
         assert tc[0].function.name == "web_search"
         assert tc[0].function.arguments == '{"q":"test"}'
         assert tc[0].id == "call_1"
+
+    def test_responses_tool_call_provenance_survives_stream_and_history(self, agent):
+        chunks = [
+            _make_chunk(
+                tool_calls=[
+                    _make_tc_delta(
+                        0,
+                        "fc_provider_item",
+                        "search_files",
+                        "{}",
+                        call_id="call-canonical",
+                        response_item_id="fc_provider_item",
+                    )
+                ]
+            ),
+            _make_chunk(finish_reason="tool_calls"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        response = agent._interruptible_streaming_api_call({"messages": []})
+        streamed = response.choices[0].message.tool_calls[0]
+        assert streamed.id == "fc_provider_item"
+        assert streamed.call_id == "call-canonical"
+        assert streamed.response_item_id == "fc_provider_item"
+
+        history = agent._build_assistant_message(
+            response.choices[0].message,
+            response.choices[0].finish_reason,
+        )
+        stored = history["tool_calls"][0]
+        assert stored["id"] == "call-canonical"
+        assert stored["call_id"] == "call-canonical"
+        assert stored["response_item_id"] == "fc_provider_item"
 
     def test_multiple_tool_calls(self, agent):
         chunks = [

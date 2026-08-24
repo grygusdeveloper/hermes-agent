@@ -910,6 +910,15 @@ class ChatCompletionsTransport(ProviderTransport):
                 # thought_signature — without replay on the next turn the API
                 # rejects the request with 400.
                 tc_provider_data: dict[str, Any] = {}
+                raw_call_id = getattr(tc, "call_id", None)
+                raw_response_item_id = getattr(tc, "response_item_id", None)
+                canonical_id = raw_call_id or tc.id
+                if raw_call_id:
+                    tc_provider_data["call_id"] = raw_call_id
+                if raw_response_item_id:
+                    tc_provider_data["response_item_id"] = raw_response_item_id
+                elif raw_call_id and tc.id and tc.id != raw_call_id:
+                    tc_provider_data["response_item_id"] = tc.id
                 extra = getattr(tc, "extra_content", None)
                 if extra is None and hasattr(tc, "model_extra"):
                     extra = (tc.model_extra if isinstance(tc.model_extra, dict) else {}).get("extra_content")
@@ -927,7 +936,7 @@ class ChatCompletionsTransport(ProviderTransport):
                     tc_provider_data["extra_content"] = extra
                 tool_calls.append(
                     ToolCall(
-                        id=getattr(tc, "id", None),
+                        id=canonical_id,
                         name=function_name,
                         arguments=(
                             function_arguments

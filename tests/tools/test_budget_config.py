@@ -7,11 +7,15 @@ and the PINNED_THRESHOLDS escape-hatch for read_file.
 
 import dataclasses
 import math
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from tools.budget_config import (
+    ANTIGRAVITY_PREVIEW_SIZE_CHARS,
+    ANTIGRAVITY_RESULT_SIZE_CHARS,
+    ANTIGRAVITY_TURN_BUDGET_CHARS,
     DEFAULT_BUDGET,
     DEFAULT_PREVIEW_SIZE_CHARS,
     DEFAULT_RESULT_SIZE_CHARS,
@@ -19,6 +23,7 @@ from tools.budget_config import (
     PINNED_THRESHOLDS,
     BudgetConfig,
     budget_for_context_window,
+    budget_for_transport,
 )
 
 
@@ -36,6 +41,43 @@ class TestModuleConstants:
 
     def test_default_preview_size(self):
         assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
+
+    def test_antigravity_transport_budget_is_utf8_safe(self):
+        assert ANTIGRAVITY_RESULT_SIZE_CHARS == 24_000
+        assert ANTIGRAVITY_TURN_BUDGET_CHARS == 24_000
+        assert ANTIGRAVITY_PREVIEW_SIZE_CHARS == 512
+        assert ANTIGRAVITY_TURN_BUDGET_CHARS * 4 < 120_000
+
+
+class TestTransportBudget:
+    def test_antigravity_clamps_large_context_budget(self):
+        cfg = budget_for_transport(
+            budget_for_context_window(1_048_576),
+            provider="copilot-acp",
+            base_url="acp://antigravity",
+        )
+        assert cfg.default_result_size == ANTIGRAVITY_RESULT_SIZE_CHARS
+        assert cfg.turn_budget == ANTIGRAVITY_TURN_BUDGET_CHARS
+        assert cfg.preview_size == ANTIGRAVITY_PREVIEW_SIZE_CHARS
+
+    def test_other_transport_is_unchanged(self):
+        original = budget_for_context_window(1_048_576)
+        assert budget_for_transport(
+            original,
+            provider="openai-codex",
+            base_url="https://example.invalid",
+        ) is original
+
+    def test_agent_budget_uses_live_client_transport(self):
+        from agent.tool_executor import _budget_for_agent
+
+        agent = SimpleNamespace(
+            context_compressor=SimpleNamespace(context_length=1_048_576),
+            client=SimpleNamespace(base_url="acp://antigravity"),
+        )
+        cfg = _budget_for_agent(agent)
+        assert cfg.turn_budget == ANTIGRAVITY_TURN_BUDGET_CHARS
+        assert cfg.preview_size == ANTIGRAVITY_PREVIEW_SIZE_CHARS
 
 
 class TestPinnedThresholds:

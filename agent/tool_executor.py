@@ -51,7 +51,12 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
     extract_persisted_path,
 )
-from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.budget_config import (
+    BudgetConfig,
+    DEFAULT_BUDGET,
+    budget_for_context_window,
+    budget_for_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +120,19 @@ def _budget_for_agent(agent) -> BudgetConfig:
         # budget_for_context_window(None) (rather than DEFAULT_BUDGET) so the
         # config-driven MCP threshold override still applies when the context
         # length isn't resolvable.
-        return budget_for_context_window(int(ctx) if ctx else None)
+        config = budget_for_context_window(int(ctx) if ctx else None)
+        client = getattr(agent, "client", None)
+        return budget_for_transport(
+            config,
+            provider=(
+                getattr(agent, "provider", None)
+                or getattr(client, "provider", None)
+            ),
+            base_url=(
+                getattr(agent, "base_url", None)
+                or getattr(client, "base_url", None)
+            ),
+        )
     except Exception:
         return DEFAULT_BUDGET
 

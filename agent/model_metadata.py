@@ -472,6 +472,10 @@ DEFAULT_CONTEXT_LENGTHS = {
     "gpt-4.1": 1047576,
     "gpt-4": 128000,
     # Google
+    # Antigravity's Gemini 3.6 route exposes a 1 Mi-token model context.  Keep
+    # the exact slug ahead of the family fallback so spawned-session routing is
+    # explicit and independently testable.
+    "gemini-3.6-flash-high": 1048576,
     "gemini": 1048576,
     # Gemma (open models served via AI Studio)
     "gemma-4": 256000,  # Gemma 4 family
