@@ -6606,7 +6606,7 @@ def resolve_provider_client(
         )
         creds = resolve_external_process_provider_credentials(
             provider,
-            target_model=final_model if provider == "cursor" else None,
+            target_model=final_model,
         )
         if provider in {"copilot-acp", "cursor"}:
             api_key = str(creds.get("api_key", "")).strip()

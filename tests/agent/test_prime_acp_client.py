@@ -14,6 +14,7 @@ from agent.copilot_acp_client import (
     _PrimeACPState,
     is_acp_stdio_runtime,
 )
+from agent.auxiliary_client import resolve_provider_client
 from agent.portal_tags import reset_conversation_context, set_conversation_context
 from hermes_cli.auth import (
     AuthError,
@@ -137,6 +138,52 @@ def test_prime_direct_alias_selects_inference_without_replacing_prime_runtime(
     assert runtime["args"] == creds["args"]
 
 
+def test_prime_auxiliary_client_forwards_selected_runtime_model(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+    def _resolve(provider, **kwargs):
+        captured["provider"] = provider
+        captured["target_model"] = kwargs.get("target_model")
+        return {
+            "provider": "copilot-acp",
+            "api_key": "prime-acp",
+            "base_url": "acp://prime",
+            "command": "/opt/prime/bin/prime-agent",
+            "args": [
+                "--mode", "acp", "--provider", "anthropic",
+                "--model", "claude-opus-5", "--thinking", "max",
+            ],
+            "source": "prime-process",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_external_process_provider_credentials",
+        _resolve,
+    )
+    monkeypatch.setattr("agent.copilot_acp_client.CopilotACPClient", _FakeClient)
+
+    selected = "prime:anthropic:claude-opus-5:max"
+    client, model = resolve_provider_client("copilot-acp", selected)
+
+    assert isinstance(client, _FakeClient)
+    assert model == selected
+    assert captured["provider"] == "copilot-acp"
+    assert captured["target_model"] == selected
+    assert captured["client_kwargs"] == {
+        "api_key": "prime-acp",
+        "base_url": "acp://prime",
+        "command": "/opt/prime/bin/prime-agent",
+        "args": [
+            "--mode", "acp", "--provider", "anthropic",
+            "--model", "claude-opus-5", "--thinking", "max",
+        ],
+    }
+
+
 @pytest.mark.parametrize(
     "target_model",
     [
@@ -163,6 +210,32 @@ def test_prime_direct_alias_rejects_invalid_runtime_selector(
             "copilot-acp", target_model=target_model
         )
     assert exc.value.code == "invalid_prime_runtime_model"
+
+
+@pytest.mark.parametrize(
+    "runtime_args",
+    [
+        "--mode acp --provider zai --model glm-5.2",
+        "--mode acp --provider zai --provider anthropic --model glm-5.2 --thinking xhigh",
+        "--mode acp --mode acp --provider zai --model glm-5.2 --thinking xhigh",
+    ],
+)
+def test_prime_direct_alias_rejects_missing_or_duplicate_runtime_flags(
+    monkeypatch, tmp_path, runtime_args
+):
+    command = tmp_path / "prime-agent"
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o700)
+    monkeypatch.setenv("COPILOT_ACP_BASE_URL", "acp://prime")
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", str(command))
+    monkeypatch.setenv("HERMES_COPILOT_ACP_ARGS", runtime_args)
+
+    with pytest.raises(AuthError) as exc:
+        resolve_external_process_provider_credentials(
+            "copilot-acp",
+            target_model="prime:anthropic:claude-opus-5:max",
+        )
+    assert exc.value.code == "invalid_prime_acp_runtime"
 
 
 def test_prime_prompt_boundary_and_final_text_is_opaque():

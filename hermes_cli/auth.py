@@ -7365,7 +7365,7 @@ def _prime_acp_args_for_target_model(
     def replace_option(args: list[str], flag: str, value: str) -> list[str]:
         updated: list[str] = []
         index = 0
-        replaced = False
+        matches = 0
         while index < len(args):
             item = args[index]
             if item == flag:
@@ -7375,36 +7375,50 @@ def _prime_acp_args_for_target_model(
                         provider=provider_id,
                         code="invalid_prime_acp_runtime",
                     )
-                if not replaced:
-                    updated.extend((flag, value))
-                    replaced = True
+                matches += 1
+                updated.extend((flag, value))
                 index += 2
                 continue
             if item.startswith(f"{flag}="):
-                if not replaced:
-                    updated.append(f"{flag}={value}")
-                    replaced = True
+                matches += 1
+                updated.append(f"{flag}={value}")
                 index += 1
                 continue
             updated.append(item)
             index += 1
-        if not replaced:
-            updated.extend((flag, value))
+        if matches != 1:
+            raise AuthError(
+                f"Prime model routing requires exactly one {flag} option in "
+                "the configured runtime argv.",
+                provider=provider_id,
+                code="invalid_prime_acp_runtime",
+            )
         return updated
 
     args = list(default_args)
-    mode_is_acp = any(
-        (
-            item == "--mode"
-            and index + 1 < len(args)
-            and args[index + 1] == "acp"
-        )
-        or item == "--mode=acp"
-        for index, item in enumerate(args)
-    )
-    if not mode_is_acp:
+    mode_matches = 0
+    mode_is_acp = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--mode":
+            if index + 1 >= len(args):
+                raise AuthError(
+                    "Prime ACP runtime argv has no value for --mode.",
+                    provider=provider_id,
+                    code="invalid_prime_acp_runtime",
+                )
+            mode_matches += 1
+            mode_is_acp = mode_is_acp or args[index + 1] == "acp"
+            index += 2
+            continue
+        if item.startswith("--mode="):
+            mode_matches += 1
+            mode_is_acp = mode_is_acp or item == "--mode=acp"
+        index += 1
+    if mode_matches != 1 or not mode_is_acp:
         raise AuthError(
-            "Prime model routing requires the configured runtime argv to use --mode acp.",
+            "Prime model routing requires exactly one configured --mode acp option.",
             provider=provider_id,
             code="invalid_prime_acp_runtime",
         )
