@@ -1785,8 +1785,23 @@ def switch_model(
             api_mode = runtime.get("api_mode", "")
             command = str(runtime.get("command") or "")
             args = list(runtime.get("args") or [])
-        except Exception:
-            pass
+        except Exception as e:
+            # External-process transports need a concrete executable and argv
+            # for every switch. Silently retaining the prior scalar
+            # credentials here can make /model report success while persisting
+            # an unusable route with command="" / args=[]; the next gateway
+            # turn then fails before the process runtime starts.
+            if target_provider in {"copilot-acp", "cursor", "claude-code"}:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=provider_label,
+                    is_global=is_global,
+                    error_message=(
+                        f"Could not resolve credentials for provider "
+                        f"'{provider_label}': {e}"
+                    ),
+                )
 
     # --- Direct alias override: apply exact endpoint + optional reasoning preset ---
     if resolved_alias:
@@ -1831,22 +1846,42 @@ def switch_model(
     )
     new_model = normalize_model_for_provider(new_model, target_provider)
 
-    # --- Validate ---
-    try:
-        validation = validate_requested_model(
-            new_model,
-            target_provider,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode or None,
-        )
-    except Exception as e:
+    # A resolved Prime selector has already been strictly parsed into Prime's
+    # provider/model/thinking argv by the external-process credential resolver.
+    # It is not a GitHub Copilot catalog model, so generic Copilot validation
+    # would add a misleading warning after a valid switch.
+    is_prime_process_route = (
+        target_provider == "copilot-acp"
+        and str(base_url or "").rstrip("/").lower() == "acp://prime"
+        and str(new_model or "").lower().startswith("prime:")
+        and bool(command)
+        and bool(args)
+    )
+    if is_prime_process_route:
+        provider_label = "Prime Agent"
         validation = {
-            "accepted": False,
-            "persist": False,
-            "recognized": False,
-            "message": f"Could not validate `{new_model}`: {e}",
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": "",
         }
+    else:
+        # --- Validate ---
+        try:
+            validation = validate_requested_model(
+                new_model,
+                target_provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode or None,
+            )
+        except Exception as e:
+            validation = {
+                "accepted": False,
+                "persist": False,
+                "recognized": False,
+                "message": f"Could not validate `{new_model}`: {e}",
+            }
 
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.

@@ -7050,6 +7050,24 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _external_process_env(name: str, default: str = "") -> str:
+    """Read one external-process setting through the active profile scope.
+
+    ACP executable, argv, and marker settings are profile-owned routing data.
+    A multiplexed gateway keeps each profile's ``.env`` in a context-local
+    scope rather than mutating process-global ``os.environ``; reading these
+    values directly from ``os.getenv`` therefore either loses the selected
+    runtime or borrows another profile's process settings. ``get_secret`` is
+    the shared scoped-env resolver despite its credential-oriented name: it
+    preserves legacy ``os.environ`` behavior outside multiplexing and fails
+    closed on an unscoped multiplex read.
+    """
+    from agent.secret_scope import get_secret
+
+    value = get_secret(name, default)
+    return str(value if value is not None else default)
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     provider_id = (provider_id or "").strip().lower()
@@ -7073,7 +7091,11 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         status.setdefault("args", [])
         return status
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    base_url = (
+        _external_process_env(pconfig.base_url_env_var).strip()
+        if pconfig.base_url_env_var
+        else ""
+    )
     if not base_url:
         base_url = pconfig.inference_base_url
     is_prime_acp = (
@@ -7083,25 +7105,25 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
 
     if provider_id == "claude-code":
         command = (
-            os.getenv("HERMES_CLAUDE_CODE_COMMAND", "").strip()
-            or os.getenv("CLAUDE_CODE_PATH", "").strip()
-            or os.getenv("CLAUDE_BIN", "").strip()
+            _external_process_env("HERMES_CLAUDE_CODE_COMMAND").strip()
+            or _external_process_env("CLAUDE_CODE_PATH").strip()
+            or _external_process_env("CLAUDE_BIN").strip()
             or "claude"
         )
         args: list[str] = []
     elif is_prime_acp:
         # Prime is a distinct ACP runtime, not another name for Copilot. Its
         # marker must never inherit the Copilot executable or default argv.
-        command = os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        command = _external_process_env("HERMES_COPILOT_ACP_COMMAND").strip()
+        raw_args = _external_process_env("HERMES_COPILOT_ACP_ARGS").strip()
         args = shlex.split(raw_args) if raw_args else []
     else:
         command = (
-            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            _external_process_env("HERMES_COPILOT_ACP_COMMAND").strip()
+            or _external_process_env("COPILOT_CLI_PATH").strip()
             or "copilot"
         )
-        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        raw_args = _external_process_env("HERMES_COPILOT_ACP_ARGS").strip()
         args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
 
     resolved_command = shutil.which(command) if command else None
@@ -7493,7 +7515,11 @@ def resolve_external_process_provider_credentials(
                 code=exc.code,
             ) from exc
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    base_url = (
+        _external_process_env(pconfig.base_url_env_var).strip()
+        if pconfig.base_url_env_var
+        else ""
+    )
     if not base_url:
         base_url = pconfig.inference_base_url
     is_prime_acp = (
@@ -7503,9 +7529,9 @@ def resolve_external_process_provider_credentials(
 
     if provider_id == "claude-code":
         command = (
-            os.getenv("HERMES_CLAUDE_CODE_COMMAND", "").strip()
-            or os.getenv("CLAUDE_CODE_PATH", "").strip()
-            or os.getenv("CLAUDE_BIN", "").strip()
+            _external_process_env("HERMES_CLAUDE_CODE_COMMAND").strip()
+            or _external_process_env("CLAUDE_CODE_PATH").strip()
+            or _external_process_env("CLAUDE_BIN").strip()
             or "claude"
         )
         resolved_command = shutil.which(command) if command else None
@@ -7526,8 +7552,8 @@ def resolve_external_process_provider_credentials(
         }
 
     if is_prime_acp:
-        command = os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        command = _external_process_env("HERMES_COPILOT_ACP_COMMAND").strip()
+        raw_args = _external_process_env("HERMES_COPILOT_ACP_ARGS").strip()
         args = shlex.split(raw_args) if raw_args else []
         if not command or not args:
             raise AuthError(
@@ -7558,11 +7584,11 @@ def resolve_external_process_provider_credentials(
         }
 
     command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        _external_process_env("HERMES_COPILOT_ACP_COMMAND").strip()
+        or _external_process_env("COPILOT_CLI_PATH").strip()
         or "copilot"
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    raw_args = _external_process_env("HERMES_COPILOT_ACP_ARGS").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):

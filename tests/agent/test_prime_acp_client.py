@@ -8,6 +8,8 @@ from unittest.mock import Mock
 
 import pytest
 
+import hermes_cli.model_switch as model_switch
+
 from agent.copilot_acp_client import (
     CopilotACPClient,
     PrimeACPConversation,
@@ -16,6 +18,12 @@ from agent.copilot_acp_client import (
 )
 from agent.auxiliary_client import resolve_provider_client
 from agent.portal_tags import reset_conversation_context, set_conversation_context
+from agent.secret_scope import (
+    UnscopedSecretError,
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
 from hermes_cli.auth import (
     AuthError,
     get_external_process_provider_status,
@@ -67,6 +75,142 @@ def test_prime_runtime_resolution_never_inherits_copilot_defaults(monkeypatch):
     with pytest.raises(AuthError) as exc:
         resolve_external_process_provider_credentials("copilot-acp")
     assert exc.value.code == "missing_prime_acp_runtime"
+
+
+def test_prime_runtime_resolution_uses_profile_scope_and_fails_closed(
+    monkeypatch, tmp_path
+):
+    command = tmp_path / "prime-agent"
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o700)
+    monkeypatch.setenv("COPILOT_ACP_BASE_URL", "acp://cursor")
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", "/wrong/process-command")
+    monkeypatch.setenv("HERMES_COPILOT_ACP_ARGS", "--acp --stdio")
+
+    set_multiplex_active(True)
+    try:
+        with pytest.raises(UnscopedSecretError):
+            resolve_external_process_provider_credentials("copilot-acp")
+
+        token = set_secret_scope(
+            {
+                "COPILOT_ACP_BASE_URL": "acp://prime",
+                "HERMES_COPILOT_ACP_COMMAND": str(command),
+                "HERMES_COPILOT_ACP_ARGS": (
+                    "--mode acp --provider zai --model glm-5.2 --thinking xhigh"
+                ),
+            }
+        )
+        try:
+            creds = resolve_external_process_provider_credentials(
+                "copilot-acp",
+                target_model="prime:anthropic:claude-sonnet-5:high",
+            )
+            status = get_external_process_provider_status("copilot-acp")
+        finally:
+            reset_secret_scope(token)
+    finally:
+        set_multiplex_active(False)
+
+    assert creds["base_url"] == "acp://prime"
+    assert creds["command"] == str(command)
+    assert creds["args"] == [
+        "--mode", "acp", "--provider", "anthropic",
+        "--model", "claude-sonnet-5", "--thinking", "high",
+    ]
+    assert status["configured"] is True
+    assert status["command"] == str(command)
+
+
+def test_prime_model_switch_is_labeled_and_validated_by_runtime(monkeypatch):
+    selector = "prime:anthropic:claude-sonnet-5:high"
+    command = "/opt/prime/bin/prime"
+    args = [
+        "--mode", "acp", "--provider", "anthropic",
+        "--model", "claude-sonnet-5", "--thinking", "high",
+    ]
+    monkeypatch.setitem(
+        model_switch.DIRECT_ALIASES,
+        "prime-sonnet5-high",
+        model_switch.DirectAlias(
+            model=selector,
+            provider="copilot-acp",
+            base_url="acp://prime",
+            reasoning_effort="high",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "copilot-acp",
+            "api_key": "prime-acp",
+            "base_url": "acp://prime",
+            "api_mode": "chat_completions",
+            "command": command,
+            "args": args,
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_a, **_k: pytest.fail(
+            "Prime selectors must not use the GitHub Copilot model catalog"
+        ),
+    )
+    monkeypatch.setattr(
+        model_switch, "get_model_capabilities", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(model_switch, "get_model_info", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        model_switch, "_check_hermes_model_warning", lambda *_a, **_k: None
+    )
+
+    result = model_switch.switch_model(
+        raw_input="prime-sonnet5-high",
+        current_provider="copilot-acp",
+        current_model="prime:zai:glm-5.2:xhigh",
+        current_base_url="acp://prime",
+        current_api_key="prime-acp",
+    )
+
+    assert result.success is True
+    assert result.new_model == selector
+    assert result.provider_label == "Prime Agent"
+    assert result.warning_message == ""
+    assert result.command == command
+    assert result.args == args
+
+
+def test_prime_model_switch_fails_closed_when_runtime_resolution_fails(monkeypatch):
+    selector = "prime:anthropic:claude-sonnet-5:high"
+    monkeypatch.setitem(
+        model_switch.DIRECT_ALIASES,
+        "prime-sonnet5-high",
+        model_switch.DirectAlias(
+            model=selector,
+            provider="copilot-acp",
+            base_url="acp://prime",
+            reasoning_effort="high",
+        ),
+    )
+
+    def _fail_runtime(**_kwargs):
+        raise ValueError("Prime ACP requires an explicit command and args")
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _fail_runtime
+    )
+
+    result = model_switch.switch_model(
+        raw_input="prime-sonnet5-high",
+        current_provider="copilot-acp",
+        current_model="prime:zai:glm-5.2:xhigh",
+        current_base_url="acp://prime",
+        current_api_key="prime-acp",
+    )
+
+    assert result.success is False
+    assert result.target_provider == "copilot-acp"
+    assert "Prime ACP requires an explicit command and args" in result.error_message
 
 
 def test_prime_runtime_resolution_requires_and_returns_exact_argv(monkeypatch, tmp_path):
