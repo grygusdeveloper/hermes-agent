@@ -2047,7 +2047,10 @@ def resolve_runtime_provider(
             }
 
     if provider == "copilot-acp":
-        creds = resolve_external_process_provider_credentials(provider)
+        creds = resolve_external_process_provider_credentials(
+            provider,
+            target_model=target_model,
+        )
         return {
             "provider": "copilot-acp",
             "api_mode": "chat_completions",

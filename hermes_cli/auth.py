@@ -7321,6 +7321,98 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _prime_acp_args_for_target_model(
+    default_args: list[str],
+    target_model: Optional[str],
+    *,
+    provider_id: str,
+) -> list[str]:
+    """Apply a config-owned inference selector while Prime keeps the agent loop.
+
+    Structured direct aliases use ``prime:<provider>:<model>:<thinking>``.
+    Ordinary Prime model values leave the configured default argv unchanged.
+    """
+    selected = str(target_model or "").strip()
+    if not selected.lower().startswith("prime:"):
+        return list(default_args)
+
+    parts = selected.split(":")
+    if len(parts) != 4:
+        raise AuthError(
+            "Prime runtime model selectors must use "
+            "prime:<provider>:<model>:<thinking>.",
+            provider=provider_id,
+            code="invalid_prime_runtime_model",
+        )
+    _, prime_provider, prime_model, thinking = parts
+    safe_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    )
+    if (
+        not prime_provider
+        or not prime_model
+        or any(char not in safe_chars for char in prime_provider)
+        or any(char not in safe_chars for char in prime_model)
+        or thinking not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+    ):
+        raise AuthError(
+            "Prime runtime model selector contains an invalid provider, model, "
+            "or thinking level.",
+            provider=provider_id,
+            code="invalid_prime_runtime_model",
+        )
+
+    def replace_option(args: list[str], flag: str, value: str) -> list[str]:
+        updated: list[str] = []
+        index = 0
+        replaced = False
+        while index < len(args):
+            item = args[index]
+            if item == flag:
+                if index + 1 >= len(args):
+                    raise AuthError(
+                        f"Prime ACP runtime argv has no value for {flag}.",
+                        provider=provider_id,
+                        code="invalid_prime_acp_runtime",
+                    )
+                if not replaced:
+                    updated.extend((flag, value))
+                    replaced = True
+                index += 2
+                continue
+            if item.startswith(f"{flag}="):
+                if not replaced:
+                    updated.append(f"{flag}={value}")
+                    replaced = True
+                index += 1
+                continue
+            updated.append(item)
+            index += 1
+        if not replaced:
+            updated.extend((flag, value))
+        return updated
+
+    args = list(default_args)
+    mode_is_acp = any(
+        (
+            item == "--mode"
+            and index + 1 < len(args)
+            and args[index + 1] == "acp"
+        )
+        or item == "--mode=acp"
+        for index, item in enumerate(args)
+    )
+    if not mode_is_acp:
+        raise AuthError(
+            "Prime model routing requires the configured runtime argv to use --mode acp.",
+            provider=provider_id,
+            code="invalid_prime_acp_runtime",
+        )
+    args = replace_option(args, "--provider", prime_provider)
+    args = replace_option(args, "--model", prime_model)
+    return replace_option(args, "--thinking", thinking)
+
+
 def resolve_external_process_provider_credentials(
     provider_id: str,
     *,
@@ -7437,6 +7529,11 @@ def resolve_external_process_provider_credentials(
                 provider=provider_id,
                 code="missing_prime_acp_command",
             )
+        args = _prime_acp_args_for_target_model(
+            args,
+            target_model,
+            provider_id=provider_id,
+        )
         return {
             "provider": provider_id,
             "api_key": "prime-acp",

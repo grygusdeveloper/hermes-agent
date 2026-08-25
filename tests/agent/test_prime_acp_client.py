@@ -20,6 +20,7 @@ from hermes_cli.auth import (
     get_external_process_provider_status,
     resolve_external_process_provider_credentials,
 )
+from hermes_cli.runtime_provider import resolve_runtime_provider
 from run_agent import AIAgent
 
 
@@ -90,6 +91,78 @@ def test_prime_runtime_resolution_requires_and_returns_exact_argv(monkeypatch, t
         ],
         "source": "prime-process",
     }
+
+
+@pytest.mark.parametrize(
+    ("target_model", "provider", "model", "thinking"),
+    [
+        ("prime:anthropic:claude-fable-5:high", "anthropic", "claude-fable-5", "high"),
+        ("prime:anthropic:claude-opus-5:max", "anthropic", "claude-opus-5", "max"),
+        ("prime:anthropic:claude-sonnet-5:high", "anthropic", "claude-sonnet-5", "high"),
+    ],
+)
+def test_prime_direct_alias_selects_inference_without_replacing_prime_runtime(
+    monkeypatch, tmp_path, target_model, provider, model, thinking
+):
+    command = tmp_path / "prime-agent"
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o700)
+    monkeypatch.setenv("COPILOT_ACP_BASE_URL", "acp://prime")
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", str(command))
+    monkeypatch.setenv(
+        "HERMES_COPILOT_ACP_ARGS",
+        "--mode acp --provider zai --model glm-5.2 --thinking xhigh",
+    )
+
+    creds = resolve_external_process_provider_credentials(
+        "copilot-acp", target_model=target_model
+    )
+
+    assert creds["provider"] == "copilot-acp"
+    assert creds["base_url"] == "acp://prime"
+    assert creds["source"] == "prime-process"
+    assert creds["command"] == str(command)
+    assert creds["args"] == [
+        "--mode", "acp", "--provider", provider, "--model", model,
+        "--thinking", thinking,
+    ]
+
+    runtime = resolve_runtime_provider(
+        requested="copilot-acp",
+        target_model=target_model,
+    )
+    assert runtime["provider"] == "copilot-acp"
+    assert runtime["base_url"] == "acp://prime"
+    assert runtime["command"] == str(command)
+    assert runtime["args"] == creds["args"]
+
+
+@pytest.mark.parametrize(
+    "target_model",
+    [
+        "prime:anthropic:claude-opus-5:ultracode",
+        "prime:anthropic:claude-opus-5",
+        "prime:anthropic:../escape:max",
+    ],
+)
+def test_prime_direct_alias_rejects_invalid_runtime_selector(
+    monkeypatch, tmp_path, target_model
+):
+    command = tmp_path / "prime-agent"
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o700)
+    monkeypatch.setenv("COPILOT_ACP_BASE_URL", "acp://prime")
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", str(command))
+    monkeypatch.setenv(
+        "HERMES_COPILOT_ACP_ARGS",
+        "--mode acp --provider zai --model glm-5.2 --thinking xhigh",
+    )
+
+    with pytest.raises(AuthError) as exc:
+        resolve_external_process_provider_credentials(
+            "copilot-acp", target_model=target_model
+        )
+    assert exc.value.code == "invalid_prime_runtime_model"
 
 
 def test_prime_prompt_boundary_and_final_text_is_opaque():
