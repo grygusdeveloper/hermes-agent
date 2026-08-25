@@ -7180,6 +7180,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
+                # External-process providers are not launchable from scalar
+                # credentials alone.  The fast path must carry the executable
+                # and argv saved by /model; dropping them here made a valid
+                # Prime switch fail on the very next Discord message.
+                "command": override.get("command"),
+                "args": list(override.get("args") or []),
             }
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:

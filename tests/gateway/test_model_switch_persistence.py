@@ -120,6 +120,40 @@ class TestApplySessionModelOverride:
         assert model == orig_model
         assert rt == orig_rt
 
+    def test_fast_runtime_resolution_preserves_prime_process_command_and_args(
+        self, monkeypatch
+    ):
+        """An in-memory Prime /model override remains directly launchable."""
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        command = "/home/primeagent/bin/prime-discord-acp"
+        args = [
+            "--mode", "acp", "--provider", "anthropic",
+            "--model", "claude-sonnet-5", "--thinking", "high",
+        ]
+        runner._session_model_overrides[sk] = {
+            "model": "prime:anthropic:claude-sonnet-5:high",
+            "provider": "copilot-acp",
+            "api_key": "prime-acp",
+            "base_url": "acp://prime",
+            "api_mode": "chat_completions",
+            "command": command,
+            "args": args,
+        }
+        monkeypatch.setattr(
+            "gateway.run._resolve_gateway_model", lambda _cfg=None: "prime-glm-5.2"
+        )
+
+        model, runtime = runner._resolve_session_agent_runtime(
+            session_key=sk, user_config={}
+        )
+
+        assert model == "prime:anthropic:claude-sonnet-5:high"
+        assert runtime["provider"] == "copilot-acp"
+        assert runtime["base_url"] == "acp://prime"
+        assert runtime["command"] == command
+        assert runtime["args"] == args
+
 
 # ---------------------------------------------------------------------------
 # Tests: _is_intentional_model_switch
