@@ -16,6 +16,7 @@ import pytest
 from agent.antigravity_session import (
     INLINE_PROMPT_LIMIT_BYTES,
     TRANSPORT_CHUNK_BUDGET_BYTES,
+    WINDOWS_INLINE_PROMPT_LIMIT_BYTES,
     AntigravityConversation,
     AntigravityConversationExpired,
     _incremental_prompt,
@@ -2043,6 +2044,37 @@ def test_abort_before_atomic_success_transition_cannot_be_lost(monkeypatch):
 
 def test_split_into_chunks_keeps_small_text_whole():
     assert _split_into_chunks("short", 1_000) == ["short"]
+
+
+def test_windows_deliver_splits_below_linux_argv_limit(monkeypatch):
+    conversation = AntigravityConversation()
+    calls: list[dict] = []
+
+    def fake_execute(prompt_text, **kwargs):
+        calls.append({"prompt": prompt_text, **kwargs})
+        return "answer", "", "12345678-1234-1234-1234-123456789abc"
+
+    monkeypatch.setattr("agent.antigravity_session.sys.platform", "win32")
+    monkeypatch.setattr(conversation, "_execute", fake_execute)
+    prompt = "quoted \\\"content\\\" " * 2_000
+
+    conversation._deliver(
+        prompt,
+        conversation_id=None,
+        model="gemini-3.7-flash-high",
+        effort="high",
+        timeout_seconds=30,
+        cwd=None,
+        env=None,
+    )
+
+    assert WINDOWS_INLINE_PROMPT_LIMIT_BYTES < len(prompt.encode("utf-8"))
+    assert len(prompt.encode("utf-8")) < INLINE_PROMPT_LIMIT_BYTES
+    assert len(calls) > 1
+    assert all(
+        len(call["prompt"].encode("utf-8")) <= WINDOWS_INLINE_PROMPT_LIMIT_BYTES
+        for call in calls
+    )
 
 
 def test_split_into_chunks_respects_budget_and_preserves_content():

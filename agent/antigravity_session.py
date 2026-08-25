@@ -28,6 +28,12 @@ from agent.deadline import kill_process_tree
 # Linux limits each execve argument to MAX_ARG_STRLEN (normally 128 KiB).
 # Leave headroom for encoding and platform variation.
 INLINE_PROMPT_LIMIT_BYTES = 120_000
+# Windows limits the complete CreateProcess command line to 32,767 UTF-16 code
+# units.  Python's argv quoting can expand backslashes and quotes, and AGY's
+# flags/executable path consume part of that same budget.  Keep each prompt
+# body deliberately below the raw limit so even hostile quote-heavy content
+# cannot trigger WinError 206 before AGY starts.
+WINDOWS_INLINE_PROMPT_LIMIT_BYTES = 12_000
 # AGY's --print has no stdin or file-attachment path that reaches the
 # tools-disabled Hermes agent (its "@path" expansion depends on the model's
 # own native file tool, which the Hermes agent profile deliberately has none
@@ -46,6 +52,20 @@ _STATE_VERSION = 1
 _STATE_LOCK = threading.Lock()
 _PROCESS_DRAIN_GRACE_SECONDS = 30.0
 _FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def _inline_prompt_limit_bytes() -> int:
+    """Return the safe per-process prompt budget for the active platform."""
+
+    if sys.platform == "win32":
+        return WINDOWS_INLINE_PROMPT_LIMIT_BYTES
+    return INLINE_PROMPT_LIMIT_BYTES
+
+
+def _transport_chunk_budget_bytes() -> int:
+    """Reserve room for the multipart wrapper beneath the platform ceiling."""
+
+    return _inline_prompt_limit_bytes() - _CHUNK_WRAPPER_RESERVE_BYTES
 
 
 def _default_agy_path() -> str:
@@ -819,7 +839,7 @@ class AntigravityConversation:
 
         with self._process_lock:
             self._sequence_abort_requested = False
-        if len(prompt_text.encode("utf-8")) <= INLINE_PROMPT_LIMIT_BYTES:
+        if len(prompt_text.encode("utf-8")) <= _inline_prompt_limit_bytes():
             return self._execute(
                 prompt_text,
                 conversation_id=conversation_id,
@@ -864,7 +884,7 @@ class AntigravityConversation:
         with self._process_lock:
             self._sequence_abort_requested = False
 
-        parts = _split_into_chunks(prompt_text, TRANSPORT_CHUNK_BUDGET_BYTES)
+        parts = _split_into_chunks(prompt_text, _transport_chunk_budget_bytes())
         total = len(parts)
         current_conversation_id = conversation_id
         response = ""
