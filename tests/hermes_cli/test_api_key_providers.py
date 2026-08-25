@@ -504,6 +504,21 @@ class TestRuntimeProviderResolution:
         assert result["command"] == "/usr/local/bin/copilot"
         assert result["args"] == ["--acp", "--stdio", "--debug"]
 
+    def test_runtime_antigravity_marker_does_not_require_copilot_binary(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("COPILOT_ACP_BASE_URL", "acp://antigravity")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: None)
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        result = resolve_runtime_provider(requested="copilot-acp")
+
+        assert result["provider"] == "copilot-acp"
+        assert result["api_mode"] == "chat_completions"
+        assert result["api_key"] == "copilot-acp"
+        assert result["base_url"] == "acp://antigravity"
+
 
 # =============================================================================
 # _has_any_provider_configured tests

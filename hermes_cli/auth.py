@@ -7502,7 +7502,16 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    # The Antigravity marker is handled in-process by CopilotACPClient and
+    # launches managed AGY, not the GitHub Copilot executable.  Requiring a
+    # binary named ``copilot`` here makes the subscription-backed AGY route
+    # impossible on otherwise-correct installations (notably Windows).
+    marker_only_runtime = base_url.rstrip("/") == "acp://antigravity"
+    if (
+        not resolved_command
+        and not base_url.startswith("acp+tcp://")
+        and not marker_only_runtime
+    ):
         raise AuthError(
             f"Could not find the Copilot CLI command '{command}'. "
             "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
