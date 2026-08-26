@@ -19,6 +19,7 @@ from agent.antigravity_session import (
     WINDOWS_INLINE_PROMPT_LIMIT_BYTES,
     AntigravityConversation,
     AntigravityConversationExpired,
+    _chmod_private,
     _incremental_prompt,
     _message_fingerprint,
     _split_into_chunks,
@@ -348,6 +349,26 @@ def test_durable_state_resumes_after_new_client_without_storing_prompt(
     assert calls[0]["conversation_id"] == conversation_id
     assert "second question" in calls[0]["prompt"]
     assert secret not in calls[0]["prompt"]
+
+
+def test_private_state_chmod_preserves_windows_ntfs_acl(monkeypatch, tmp_path):
+    chmod = Mock()
+    monkeypatch.setattr("agent.antigravity_session.sys.platform", "win32")
+    monkeypatch.setattr("agent.antigravity_session.os.chmod", chmod)
+
+    _chmod_private(tmp_path, 0o700)
+
+    chmod.assert_not_called()
+
+
+def test_private_state_chmod_applies_posix_mode(monkeypatch, tmp_path):
+    chmod = Mock()
+    monkeypatch.setattr("agent.antigravity_session.sys.platform", "linux")
+    monkeypatch.setattr("agent.antigravity_session.os.chmod", chmod)
+
+    _chmod_private(tmp_path, 0o700)
+
+    chmod.assert_called_once_with(tmp_path, 0o700)
 
 
 def test_restart_resume_delivers_parallel_results_once_without_replaying_calls(

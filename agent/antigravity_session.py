@@ -343,6 +343,19 @@ def _state_path(state_key: str) -> Path:
     return _state_dir() / f"{digest}.json"
 
 
+def _chmod_private(path: Path, mode: int) -> None:
+    """Apply POSIX privacy modes without corrupting Windows NTFS ACLs.
+
+    CPython's ``os.chmod`` on Windows maps POSIX write bits onto the DACL.
+    Applying ``0o700``/``0o600`` can therefore remove the interactive user's
+    inherited ACE and leave only elevated Administrators/SYSTEM access. Hermes
+    state already inherits a user-private ACL on Windows, so preserve it.
+    """
+
+    if sys.platform != "win32":
+        os.chmod(path, mode)
+
+
 def _load_durable_state(
     state_key: str,
 ) -> tuple[str, tuple[tuple[str, str], ...]] | None:
@@ -394,7 +407,7 @@ def _save_durable_state(
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     with _STATE_LOCK:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
+        _chmod_private(directory, 0o700)
         temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -403,7 +416,7 @@ def _save_durable_state(
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp, path)
-            os.chmod(path, 0o600)
+            _chmod_private(path, 0o600)
         finally:
             try:
                 temp.unlink()
