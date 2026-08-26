@@ -39,6 +39,53 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
+    def test_gpt56_native_output_verbosity_is_independent_of_reasoning(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "high"},
+            output_verbosity="low",
+            provider="openai-codex",
+            is_codex_backend=True,
+        )
+
+        assert kw["reasoning"]["effort"] == "high"
+        assert kw["text"] == {"verbosity": "low"}
+
+    @pytest.mark.parametrize(
+        "model,flags",
+        [
+            ("gpt-5.5", {}),
+            ("gpt-5.6-sol", {"is_github_responses": True}),
+            ("gpt-5.6-sol", {"is_xai_responses": True}),
+        ],
+    )
+    def test_output_verbosity_omitted_on_unsupported_responses_routes(
+        self, transport, model, flags
+    ):
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            output_verbosity="low",
+            **flags,
+        )
+
+        assert "text" not in kw
+
+    def test_request_override_can_replace_configured_output_verbosity(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            output_verbosity="low",
+            is_codex_backend=True,
+            request_overrides={"text": {"verbosity": "high"}},
+        )
+
+        assert kw["text"] == {"verbosity": "high"}
+
 
 
 

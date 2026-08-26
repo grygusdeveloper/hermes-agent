@@ -1712,6 +1712,27 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # GPT-5.6 final-answer verbosity is independent of reasoning effort. Keep
+    # the normalized setting on the agent so every frontend (CLI, TUI,
+    # messaging gateway, and delegated children) reaches the same native
+    # Responses request path without duplicating config plumbing.
+    agent.output_verbosity = ""
+    try:
+        _agent_section = _agent_cfg.get("agent", {})
+        if isinstance(_agent_section, dict):
+            _output_verbosity = str(
+                _agent_section.get("output_verbosity", "") or ""
+            ).strip().lower()
+            if _output_verbosity in {"", "low", "medium", "high"}:
+                agent.output_verbosity = _output_verbosity
+            else:
+                logger.warning(
+                    "Ignoring invalid agent.output_verbosity=%r; expected low, medium, high, or empty",
+                    _output_verbosity,
+                )
+    except Exception:
+        agent.output_verbosity = ""
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

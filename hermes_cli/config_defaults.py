@@ -280,6 +280,11 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+        # Final-answer detail level for GPT-5.6 on native OpenAI/Codex
+        # Responses routes. This is independent of reasoning effort: the model
+        # can reason at high/xhigh while returning a concise answer.
+        # Empty keeps the provider default; otherwise low | medium | high.
+        "output_verbosity": "",
     },
 
     "terminal": {

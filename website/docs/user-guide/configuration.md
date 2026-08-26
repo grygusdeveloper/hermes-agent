@@ -1511,6 +1511,21 @@ agent:
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
 
+### GPT-5.6 Output Verbosity
+
+Control the detail level of GPT-5.6 final answers independently from reasoning
+effort on native OpenAI and Codex Responses routes:
+
+```yaml
+agent:
+  reasoning_effort: "high"
+  output_verbosity: "low"   # empty/provider default | low | medium | high
+```
+
+This lets GPT-5.6 reason deeply while returning concise technical output.
+Hermes omits the field for unsupported models and for GitHub/xAI Responses
+routes, so those providers retain their normal behavior.
+
 :::note Adaptive-thinking models (Claude 4.6+, Fable/Mythos-class) over OpenRouter
 These models use *adaptive* thinking and don't accept the usual `reasoning.effort`
 field — OpenRouter ignores it for them. Hermes transparently routes your

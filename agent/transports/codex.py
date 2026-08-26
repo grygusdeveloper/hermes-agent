@@ -234,6 +234,8 @@ class ResponsesApiTransport(ProviderTransport):
         params:
             instructions: str — system prompt (extracted from messages[0] if not given)
             reasoning_config: dict | None — {effort, enabled}
+            output_verbosity: str | None — GPT-5.6 final-answer detail level
+                (low, medium, or high), independent of reasoning effort
             session_id: str | None — transcript/session id; drives the xAI
                 x-grok-conv-id header and the Codex cache-scope headers, and is
                 the fallback prompt_cache_key when there is no static prefix to
@@ -368,6 +370,21 @@ class ResponsesApiTransport(ProviderTransport):
             ),
             "store": False,
         }
+
+        # GPT-5.6 exposes final-answer verbosity separately from reasoning
+        # effort. Apply it only to native OpenAI/Codex Responses routes known
+        # to support the field; xAI and GitHub Responses reject unknown request
+        # parameters, and older models should retain their provider defaults.
+        output_verbosity = str(
+            params.get("output_verbosity", "") or ""
+        ).strip().lower()
+        if (
+            output_verbosity in {"low", "medium", "high"}
+            and "gpt-5.6" in (model or "").lower()
+            and not is_github_responses
+            and not is_xai_responses
+        ):
+            kwargs["text"] = {"verbosity": output_verbosity}
         if response_tools:
             kwargs["tools"] = response_tools
             kwargs["tool_choice"] = "auto"
