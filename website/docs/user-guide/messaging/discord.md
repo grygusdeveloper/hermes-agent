@@ -643,14 +643,31 @@ The picker times out after 120 seconds. Only authorized users (those in `DISCORD
 
 ## Native Slash Commands for Skills
 
-Hermes automatically registers installed skills as **native Discord Application Commands**. This means skills appear in Discord's autocomplete `/` menu alongside built-in commands.
+Hermes exposes the full installed skill catalog through the native `/skill`
+command with dynamic autocomplete. This keeps the Discord registration payload
+small even with hundreds of skills and leaves room under Discord's 100 global
+application-command limit.
 
-- Each skill becomes a Discord slash command (e.g., `/code-review`, `/ascii-art`)
-- Skills accept an optional `args` string parameter
-- Discord has a limit of 100 application commands per bot — if you have more skills than available slots, extra skills are skipped with a warning in the logs
-- Skills are registered during bot startup alongside built-in commands like `/model`, `/reset`, and `/background`
+Frequently used skills can also receive direct top-level aliases:
 
-No extra configuration is needed — any skill installed via `hermes skills install` is automatically registered as a Discord slash command on the next gateway restart.
+```yaml
+discord:
+  promoted_skill_commands:
+    - show-me       # registers /show-me [args]
+    - excalidraw    # registers /excalidraw [args]
+```
+
+For `hermes config set`, use a comma-separated value:
+
+```bash
+hermes config set discord.promoted_skill_commands show-me,excalidraw
+```
+
+Each promoted skill consumes one global command slot. Unknown, disabled,
+invalid, or colliding skill names are skipped without replacing core commands.
+Restart or otherwise resync the gateway after changing this list; `/reload-skills`
+refreshes `/skill` autocomplete but does not change Discord's registered native
+command tree.
 
 ### Disabling Slash Command Registration
 

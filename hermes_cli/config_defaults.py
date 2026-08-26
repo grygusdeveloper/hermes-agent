@@ -1979,6 +1979,12 @@ DEFAULT_CONFIG = {
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
+        # Skills normally live behind Discord's scalable `/skill` autocomplete
+        # command. Put frequently used skill slugs here to also register native
+        # top-level aliases such as `/show-me`. Each alias consumes one of
+        # Discord's 100 global application-command slots and takes effect after
+        # the gateway next syncs commands.
+        "promoted_skill_commands": [],
         "missed_message_backfill": {
             "enabled": False,             # Replay missed Discord messages after reconnect/startup
             "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels

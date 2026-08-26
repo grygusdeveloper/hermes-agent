@@ -6489,6 +6489,91 @@ class DiscordAdapter(BasePlatformAdapter):
         slot_cap = _DISCORD_MAX_APP_COMMANDS - 1
         dropped_over_cap = 0
         try:
+            already_registered = {cmd.name for cmd in tree.get_commands()}
+        except Exception:
+            pass
+
+        # Frequently used skills can be promoted from the scalable `/skill`
+        # picker to native top-level Discord commands. This is config-driven so
+        # operators spend scarce application-command slots only on the skills
+        # they actually want in the picker; every other skill remains available
+        # through `/skill` autocomplete.
+        self._discord_promoted_skill_names: set[str] = set()
+        try:
+            from agent.skill_commands import get_skill_commands
+            from hermes_cli.config import load_config_readonly
+
+            _promoted_cfg = (load_config_readonly() or {}).get("discord", {})
+            _promoted_raw = (
+                _promoted_cfg.get("promoted_skill_commands", [])
+                if isinstance(_promoted_cfg, dict)
+                else []
+            )
+            if isinstance(_promoted_raw, str):
+                _promoted_raw = [
+                    token.strip()
+                    for token in _promoted_raw.split(",")
+                    if token.strip()
+                ]
+            if not isinstance(_promoted_raw, (list, tuple, set)):
+                _promoted_raw = []
+
+            _skill_commands = get_skill_commands()
+            _seen_promoted: set[str] = set()
+            for _requested in _promoted_raw:
+                _slug = str(_requested or "").strip().lower().lstrip("/")
+                _slug = _slug.replace("_", "-")
+                if not _slug or _slug in _seen_promoted:
+                    continue
+                _seen_promoted.add(_slug)
+                _cmd_key = f"/{_slug}"
+                _meta = _skill_commands.get(_cmd_key)
+                if not isinstance(_meta, dict):
+                    logger.warning(
+                        "[%s] Discord promoted skill %r is not installed or enabled; skipping",
+                        self.name,
+                        _requested,
+                    )
+                    continue
+                # Discord command names are lowercase, hyphenated, and at most
+                # 32 characters. Do not silently truncate to a different skill.
+                if len(_slug) > 32 or not re.fullmatch(r"[a-z0-9-]+", _slug):
+                    logger.warning(
+                        "[%s] Discord promoted skill %r is not a valid native command name; skipping",
+                        self.name,
+                        _requested,
+                    )
+                    continue
+                if _slug in already_registered:
+                    logger.warning(
+                        "[%s] Discord promoted skill /%s collides with an existing command; use /skill %s instead",
+                        self.name,
+                        _slug,
+                        _slug,
+                    )
+                    continue
+                if len(already_registered) >= slot_cap:
+                    dropped_over_cap += 1
+                    continue
+                _description = str(
+                    _meta.get("description") or f"Run the {_slug} skill"
+                )[:100]
+                _promoted_cmd = _build_auto_slash_command(
+                    _slug,
+                    _description,
+                    "Optional instruction for the skill",
+                )
+                tree.add_command(_promoted_cmd)
+                already_registered.add(_slug)
+                self._discord_promoted_skill_names.add(_slug)
+        except Exception as e:
+            logger.warning(
+                "[%s] Discord promoted skill command registration failed: %s",
+                self.name,
+                e,
+            )
+
+        try:
             from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
 
             try:
@@ -6658,6 +6743,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 existing_names = {cmd.name for cmd in tree.get_commands()}
             except Exception:
                 pass
+            # Promoted skills intentionally own a native top-level command but
+            # must remain discoverable in the consolidated `/skill` picker.
+            # Only unrelated core/plugin collisions should hide a skill there.
+            existing_names.difference_update(
+                getattr(self, "_discord_promoted_skill_names", set())
+            )
 
             # Populate the instance-level entries/lookup so the
             # autocomplete + handler callbacks below always read the

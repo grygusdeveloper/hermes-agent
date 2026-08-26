@@ -801,6 +801,75 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
 # ------------------------------------------------------------------
 
 
+def test_promoted_skill_registers_native_discord_command(adapter):
+    """Configured high-frequency skills get a direct native command while the
+    scalable `/skill` picker remains available for the full catalog.
+    """
+    adapter._run_simple_slash = AsyncMock()
+    skill_commands = {
+        "/show-me": {
+            "name": "show-me",
+            "description": "Explain the current topic visually.",
+        }
+    }
+
+    with (
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={
+                "discord": {"promoted_skill_commands": ["show-me"]}
+            },
+        ),
+        patch(
+            "agent.skill_commands.get_skill_commands",
+            return_value=skill_commands,
+        ),
+        patch(
+            "hermes_cli.commands.discord_skill_commands_by_category",
+            return_value=({}, [("show-me", "Explain visually", "/show-me")], 0),
+        ),
+    ):
+        adapter._register_slash_commands()
+
+    assert "show-me" in adapter._client.tree.commands
+    assert "skill" in adapter._client.tree.commands
+    assert "show-me" in adapter._skill_lookup
+    command = adapter._client.tree.commands["show-me"]
+
+    import asyncio
+
+    interaction = SimpleNamespace()
+    asyncio.run(command.callback(interaction, args="map the request flow"))
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/show-me map the request flow",
+    )
+
+
+def test_promoted_skill_collision_keeps_existing_native_command(adapter):
+    """Promotion never replaces a core/native command with a skill alias."""
+    with (
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"discord": {"promoted_skill_commands": ["status"]}},
+        ),
+        patch(
+            "agent.skill_commands.get_skill_commands",
+            return_value={
+                "/status": {
+                    "name": "status",
+                    "description": "Colliding skill",
+                }
+            },
+        ),
+    ):
+        adapter._register_slash_commands()
+
+    # The native callback registered at the top of _register_slash_commands
+    # survives; no second command replaced it in FakeTree.
+    assert adapter._client.tree.commands["status"].__name__ == "slash_status"
+
+
 def test_register_skill_command_callback_dispatches_by_name(adapter):
     """The /skill callback should look up the skill by ``name`` and
     dispatch via ``_run_simple_slash`` with the real command key.
