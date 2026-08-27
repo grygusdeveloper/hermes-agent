@@ -1,17 +1,11 @@
-"""LIVE Windows E2E: real-profile auth-DB copy under a real Chrome share-lock.
+"""LIVE Windows E2E: consented auto-close makes real-profile work with a running browser.
 
-Runs ONLY on a windows-latest GitHub runner (see .github/workflows/
-windows-realprofile-e2e.yml). It proves the thing the Linux lanes cannot:
-that copying the SQLite auth DBs via the online-backup API succeeds while a
-REAL Chrome process holds the cookie DB with a Windows OS-level share lock —
-the exact "file in use by another application" failure the copy approach had
-to solve.
+windows-latest only. Proves the end state: with browser.real_profile_autoclose
+on, a REAL running Chrome that share-locks its cookie DB is terminated by
+snapshot_real_profile, the lock releases, and a valid signed-in-shaped copy is
+produced. Also proves the default (autoclose off) fails fast, not hangs.
 
-Why this can't be a normal unit test: on Windows, Chrome opens
-Cookies/Login Data with a share mode that makes a plain file copy raise
-WinError 32. A Linux "open a write transaction" analog reproduces SQLite's
-internal lock, NOT the Windows filesystem share lock, so only a real Chrome on
-a real Windows runner exercises the failure this fix targets.
+PROOF branch evidence — reverted before merge; never lands on main.
 """
 from __future__ import annotations
 
@@ -25,144 +19,125 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "win32", reason="Windows-only live share-lock E2E"
-)
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only live E2E")
 
-_CHROME_CANDIDATES = (
+_CHROME = (
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
 )
 
 
-def _find_chrome() -> str | None:
-    for p in _CHROME_CANDIDATES:
+def _find_chrome():
+    for p in _CHROME:
         if os.path.isfile(p):
             return p
-    which = shutil.which("chrome") or shutil.which("chrome.exe")
-    return which
+    return shutil.which("chrome") or shutil.which("chrome.exe")
 
 
-def _raw_copy_raises_while_locked(path: str) -> bool:
-    """True if a plain copy of ``path`` fails (the WinError 32 we must beat)."""
+def _launch_chrome_on(user_data: Path):
+    proc = subprocess.Popen(
+        [_find_chrome(), "--headless=new", "--disable-gpu", "--no-first-run",
+         "--no-default-browser-check", f"--user-data-dir={user_data}",
+         "--remote-debugging-port=0", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    ck = None
+    deadline = time.time() + 60
+    while time.time() < deadline and not ck:
+        for rel in (r"Default\Network\Cookies", r"Default\Cookies"):
+            c = user_data / rel
+            if c.is_file() and c.stat().st_size > 0:
+                ck = c
+                break
+        time.sleep(1)
+    return proc, ck
+
+
+def _raw_copy_fails(path: str) -> bool:
     try:
-        shutil.copy2(path, path + ".rawcopy")
-        os.unlink(path + ".rawcopy")
-        return False
+        shutil.copy2(path, path + ".rc"); os.unlink(path + ".rc"); return False
     except OSError:
         return True
 
 
-def test_locked_profile_fails_closed_not_silent(tmp_path):
-    """Windows contract: a running Chrome holds the cookie DB deny-all (proven
-    live — even CreateFile with all share flags fails), so copy-while-running
-    is impossible. ``snapshot_real_profile`` must FAIL FAST with an actionable
-    'fully quit the browser' message — never hang, never a silent signed-out
-    copy. (Real-profile browsing on Windows therefore requires the browser
-    fully closed incl. background/tray; the live-drive path is #95669.)
-    """
-    import time as _t
-    chrome = _find_chrome()
-    if not chrome:
-        pytest.skip("Chrome not installed on this runner")
+def test_autoclose_off_fails_fast(tmp_path):
+    """Default (autoclose off): a running Chrome → fail fast (<30s) with the
+    quit/autoclose guidance, never a hang, never a silent copy."""
+    if not _find_chrome():
+        pytest.skip("no chrome")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import hermes_cli.browser_connect as bc
 
-    repo = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(repo))
-    from hermes_cli import browser_connect as bc
-
-    user_data = tmp_path / "chrome-user-data"
-    user_data.mkdir()
-
-    proc = subprocess.Popen(
-        [
-            chrome, "--headless=new", "--disable-gpu", "--no-first-run",
-            "--no-default-browser-check", f"--user-data-dir={user_data}",
-            "--remote-debugging-port=0", "about:blank",
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    ud = tmp_path / "ud"; ud.mkdir()
+    proc, ck = _launch_chrome_on(ud)
     try:
-        cookies = None
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            for rel in (r"Default\Network\Cookies", r"Default\Cookies"):
-                cand = user_data / rel
-                if cand.is_file() and cand.stat().st_size > 0:
-                    cookies = cand
-                    break
-            if cookies:
-                break
-            time.sleep(1)
-        assert cookies is not None, "Chrome never created a Cookies DB"
-
-        if not _raw_copy_raises_while_locked(str(cookies)):
-            pytest.skip("Chrome did not share-lock the cookie DB on this runner")
-
-        import hermes_cli.browser_connect as bc_mod
-        orig = bc_mod.real_profile_data_dir
-        bc_mod.real_profile_data_dir = lambda browser, system=None: str(user_data)
+        assert ck is not None, "no cookie db"
+        if not _raw_copy_fails(str(ck)):
+            pytest.skip("Chrome did not share-lock on this runner")
+        orig = bc.real_profile_data_dir
+        bc.real_profile_data_dir = lambda b, system=None: str(ud)
+        bc._real_profile_autoclose = lambda: False
         try:
-            # Must return FAST (fail-fast lock probe), not hang. Assert both the
-            # contract and that it took well under the old 24-min hang.
-            t0 = _t.time()
-            dst, err = bc.snapshot_real_profile("chrome", src=str(user_data))
-            elapsed = _t.time() - t0
+            t0 = time.time()
+            dst, err = bc.snapshot_real_profile("chrome", src=str(ud))
+            elapsed = time.time() - t0
         finally:
-            bc_mod.real_profile_data_dir = orig
-
-        assert dst is None, "must not return a (silently broken) copy while locked"
-        assert err is not None
-        low = err.lower()
-        assert "locked" in low or "running" in low, f"unclear error: {err}"
-        assert "quit" in low or "close" in low, f"error must tell the user to quit: {err}"
-        assert elapsed < 30, f"snapshot hung on a locked profile ({elapsed:.0f}s) — must fail fast"
+            bc.real_profile_data_dir = orig
+        assert dst is None and err
+        assert "quit" in err.lower() and "real_profile_autoclose" in err
+        assert elapsed < 30, f"hung {elapsed:.0f}s — must fail fast"
     finally:
         proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        try: proc.wait(timeout=15)
+        except subprocess.TimeoutExpired: proc.kill()
 
 
-def test_copy_works_when_chrome_closed(tmp_path):
-    """Sanity: with NO live Chrome holding the dir, the copy succeeds on Windows
-    (the supported path). Creates a profile with a real Chrome, closes it, then
-    snapshots — cookies DB must copy and be a valid SQLite file."""
-    chrome = _find_chrome()
-    if not chrome:
-        pytest.skip("Chrome not installed on this runner")
+def test_autoclose_on_closes_chrome_and_snapshots(tmp_path):
+    """Consented auto-close: a running Chrome is terminated, the lock releases,
+    and a valid cookie DB copy is produced — real-profile works WITH the browser
+    initially running."""
+    if not _find_chrome():
+        pytest.skip("no chrome")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import hermes_cli.browser_connect as bc
 
-    repo = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(repo))
-    from hermes_cli import browser_connect as bc
-
-    user_data = tmp_path / "ud"
-    user_data.mkdir()
-    # One-shot Chrome run to materialize a profile, then it exits.
-    subprocess.run(
-        [
-            chrome, "--headless=new", "--disable-gpu", "--no-first-run",
-            "--no-default-browser-check", f"--user-data-dir={user_data}",
-            "--dump-dom", "about:blank",
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
-    )
-    # Chrome has exited; the DB is now unlocked.
-    cookies = None
-    for rel in (r"Default\Network\Cookies", r"Default\Cookies"):
-        cand = user_data / rel
-        if cand.is_file():
-            cookies = cand
-            break
-    if cookies is None:
-        pytest.skip("Chrome did not create a Cookies DB in the one-shot run")
-
-    dst = tmp_path / "copy" / "Cookies"
-    assert bc._copy_auth_file(str(cookies), str(dst)) is True
-    assert dst.is_file()
-    con = sqlite3.connect(str(dst))
+    ud = tmp_path / "ud"; ud.mkdir()
+    proc, ck = _launch_chrome_on(ud)
     try:
-        con.execute("SELECT name FROM sqlite_master LIMIT 1")
-    finally:
-        con.close()
+        assert ck is not None, "no cookie db"
+        if not _raw_copy_fails(str(ck)):
+            pytest.skip("Chrome did not share-lock on this runner")
 
+        orig = bc.real_profile_data_dir
+        bc.real_profile_data_dir = lambda b, system=None: str(ud)
+        bc._real_profile_autoclose = lambda: True
+        # Isolate the snapshot store under tmp.
+        orig_home = bc.get_hermes_home
+        bc.get_hermes_home = lambda: tmp_path / "hh"
+        try:
+            dst, err = bc.snapshot_real_profile("chrome", src=str(ud))
+        finally:
+            bc.real_profile_data_dir = orig
+            bc.get_hermes_home = orig_home
+
+        assert err is None, f"auto-close snapshot failed: {err}"
+        assert dst is not None
+        copy_ck = Path(dst) / "Default" / "Cookies"
+        assert copy_ck.is_file(), "cookie DB not copied after auto-close"
+        # Valid SQLite with the cookies table.
+        con = sqlite3.connect(str(copy_ck))
+        try:
+            names = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            con.close()
+        assert "cookies" in names, f"copied DB missing cookies table: {names}"
+        # The original Chrome should now be gone (we terminated its tree).
+        assert proc.poll() is not None, "auto-close did not terminate Chrome"
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.terminate(); proc.wait(timeout=15)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
