@@ -1075,11 +1075,50 @@ def _extract_tool_calls_from_text(
                 if not stack:
                     end = index
                     break
-        if end < 0 or end + 1 >= len(raw_json) or raw_json[end + 1] != '"':
+        if end < 0:
             return None
-        # ``start - 1`` is the redundant opening quote; ``end + 1`` is its
-        # matching redundant closing quote.
-        return raw_json[: start - 1] + raw_json[start : end + 1] + raw_json[end + 2 :]
+        # ``start - 1`` is the redundant opening quote. Opus may emit either
+        # a matching redundant closing quote or omit it entirely. In the
+        # latter production shape it also omitted the outer tool-call brace.
+        suffix_start = (
+            end + 2
+            if end + 1 < len(raw_json) and raw_json[end + 1] == '"'
+            else end + 1
+        )
+        repaired = (
+            raw_json[: start - 1]
+            + raw_json[start : end + 1]
+            + raw_json[suffix_start:]
+        )
+
+        # Append only missing JSON container closers. This is deliberately
+        # narrow: any mismatched closer or unterminated JSON string aborts the
+        # repair rather than guessing at model output.
+        closers: list[str] = []
+        in_string = False
+        escaped = False
+        for char in repaired:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in pairs:
+                closers.append(pairs[char])
+            elif char in ("}", "]"):
+                if not closers or char != closers[-1]:
+                    return None
+                closers.pop()
+        if in_string:
+            return None
+        if closers:
+            repaired += "".join(reversed(closers))
+        return repaired
 
     def _try_add_tool_call(raw_json: str) -> None:
         try:

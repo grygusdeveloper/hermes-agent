@@ -197,6 +197,23 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is False
 
+        from agent.conversation_loop import _nonretryable_error_allows_fallback
+
+        assert _nonretryable_error_allows_fallback(result) is False
+
+    def test_nonretryable_gate_preserves_classifier_requested_fallback(self):
+        from agent.conversation_loop import _nonretryable_error_allows_fallback
+
+        result = classify_api_error(
+            MockAPIError("Bad Request", status_code=400),
+            provider="custom",
+            model="custom-model",
+        )
+
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert _nonretryable_error_allows_fallback(result) is True
+
     # ── Auth errors ──
 
     def test_401_classified_as_auth(self):

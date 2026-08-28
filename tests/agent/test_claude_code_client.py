@@ -556,6 +556,34 @@ class TestClaudeCodeClient:
             "timeout": 30,
         }
 
+    def test_repairs_production_call_missing_wrapper_quote_and_outer_brace(self):
+        from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+        # Exact 2026-08-28 hair-thread failure: arguments has an unmatched
+        # opening wrapper quote and the tool-call object is one brace short.
+        response = (
+            '<tool_call>{"id": "call_peek_rei3", "type": "function", '
+            '"function": {"name": "terminal", "arguments": '
+            '"{"command":"tail -40 /tmp/rei.log | grep -vE \'^Fra\'; '
+            "echo '=== FILES ==='; ls -laht /root/workspace/"
+            "stylized_hair_craft/renders/R_*.png 2>/dev/null || echo 'none yet'"
+            '"}}</tool_call>'
+        )
+
+        calls, cleaned = _extract_tool_calls_from_text(response)
+
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0].id == "call_peek_rei3"
+        assert calls[0].function.name == "terminal"
+        assert json.loads(calls[0].function.arguments) == {
+            "command": (
+                "tail -40 /tmp/rei.log | grep -vE '^Fra'; "
+                "echo '=== FILES ==='; ls -laht /root/workspace/"
+                "stylized_hair_craft/renders/R_*.png 2>/dev/null || echo 'none yet'"
+            )
+        }
+
     def test_stream_true_returns_iterable_text_chunks(self):
         client = ClaudeCodeClient(cwd="/tmp")
         with patch.object(
