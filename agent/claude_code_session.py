@@ -512,6 +512,15 @@ _INCOMPLETE_PREAMBLE_STARTERS = (
     "fixing ",
     "working on ",
     "processing ",
+    "running ",
+    "starting ",
+    "launching ",
+    "executing ",
+    "rendering ",
+    "re-rendering ",
+    "continuing ",
+    "resuming ",
+    "restarting ",
     "doing a ",
     "i'll do ",
     "i will do ",
@@ -554,13 +563,15 @@ def _is_incomplete_preamble_response(
     if body.count("\n\n") >= 2:
         return False
     lower = body.lower()
-    starts = lower.startswith(_INCOMPLETE_PREAMBLE_STARTERS) or any(
-        lower.startswith(s) for s in _INCOMPLETE_PREAMBLE_STARTERS
+    # Check every short status clause, not only the first sentence. Claude often
+    # prefixes the promise with a diagnosis such as "The job never launched —
+    # starting it now." That is still an unfinished action, not a final answer.
+    clauses = re.split(r"(?:\n+|(?<=[.!?])\s+|\s+[—–:;]\s+)", lower)
+    starts = any(
+        clause.lstrip("#>*- \t").startswith(_INCOMPLETE_PREAMBLE_STARTERS)
+        for clause in clauses
+        if clause.strip()
     )
-    if not starts:
-        # Also catch leading markdown bullets / fillers before the starter.
-        stripped = lower.lstrip("#>*- \t")
-        starts = stripped.startswith(_INCOMPLETE_PREAMBLE_STARTERS)
     if not starts:
         return False
     # Short planning sentence(s) without a substantial body.
@@ -569,8 +580,32 @@ def _is_incomplete_preamble_response(
 
 
 def _response_has_tool_calls(text: str) -> bool:
-    body = text or ""
-    return "<tool_call>" in body or "</tool_call>" in body
+    """Return true only when Hermes can parse at least one emitted tool call.
+
+    Merely seeing a ``<tool_call>`` tag is insufficient. Claude occasionally
+    emits malformed JSON inside the tag; the downstream extractor then removes
+    the block and Hermes delivers only the preceding progress sentence as a
+    final answer. Use the same parser as the client so retry/finality decisions
+    match what Hermes can actually execute.
+    """
+
+    if not text:
+        return False
+    from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+    tool_calls, _cleaned = _extract_tool_calls_from_text(text)
+    return bool(tool_calls)
+
+
+def _response_text_for_preamble_detection(text: str) -> str:
+    """Strip tool-call blocks before deciding whether prose is only a preamble."""
+
+    if not text:
+        return ""
+    from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+    _tool_calls, cleaned = _extract_tool_calls_from_text(text)
+    return cleaned
 
 
 def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -972,7 +1007,7 @@ class ClaudeCodeSession:
                 continue
 
             if _is_incomplete_preamble_response(
-                response,
+                _response_text_for_preamble_detection(response),
                 had_tools=had_tools,
                 has_tool_calls=_response_has_tool_calls(response),
             ):

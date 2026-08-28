@@ -1389,7 +1389,11 @@ class TestClaudeCodeSoftLimitRetry:
         assert response == "Full real answer here."
 
     def test_incomplete_preamble_retries_when_tools_available(self, monkeypatch):
-        from agent.claude_code_session import _is_incomplete_preamble_response
+        from agent.claude_code_session import (
+            _is_incomplete_preamble_response,
+            _response_has_tool_calls,
+            _response_text_for_preamble_detection,
+        )
 
         assert _is_incomplete_preamble_response(
             "I'll do a fresh, critical pass over the live code rather than repeating prior review summaries.",
@@ -1406,6 +1410,34 @@ class TestClaudeCodeSoftLimitRetry:
             had_tools=True,
             has_tool_calls=False,
         )
+
+        # Exact production replies from the Blender hair thread: each promised
+        # action but ended the turn without an executable tool call.
+        for production_preamble in (
+            "Applying the fix and running the render.",
+            "Patches never landed — applying them for real now.",
+            "Running the final render suite in the background now.",
+            "The final suite never actually launched — no `F0*` files exist. Starting it properly in the background.",
+        ):
+            assert _is_incomplete_preamble_response(
+                production_preamble,
+                had_tools=True,
+                has_tool_calls=False,
+            )
+
+        valid_call = (
+            'Running it now.\n\n<tool_call>{"id":"call_ok","type":"function",'
+            '"function":{"name":"terminal","arguments":"{\\"command\\":\\"true\\"}"}}'
+            '</tool_call>'
+        )
+        malformed_call = (
+            'Running it now.\n\n<tool_call>{"id":"call_bad","type":"function",'
+            '"function":{"name":"terminal","arguments":"{\\"command\\": "true"}"}}'
+            '</tool_call>'
+        )
+        assert _response_has_tool_calls(valid_call)
+        assert not _response_has_tool_calls(malformed_call)
+        assert _response_text_for_preamble_detection(malformed_call) == "Running it now."
 
         session = ClaudeCodeSession()
         calls = {"n": 0}
@@ -1435,3 +1467,36 @@ class TestClaudeCodeSoftLimitRetry:
         assert calls["n"] == 2
         assert response.startswith("Here is the full analysis")
         assert chunks == [response]
+
+    def test_malformed_tool_call_with_progress_prose_retries(self, monkeypatch):
+        from agent.claude_code_session import ClaudeCodeSession
+
+        session = ClaudeCodeSession()
+        calls = {"n": 0}
+        malformed = (
+            'Starting it properly in the background.\n\n'
+            '<tool_call>{"id":"call_bad","type":"function",'
+            '"function":{"name":"terminal","arguments":"{\\"command\\": "run"}"}}'
+            '</tool_call>'
+        )
+
+        def fake_execute(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return malformed, "", "12345678-1234-1234-1234-123456789abc"
+            return "Completed and verified.", "", "12345678-1234-1234-1234-123456789abc"
+
+        monkeypatch.setattr(session, "_execute", fake_execute)
+        response, _, _ = session._execute_with_soft_limit_retry(
+            "prompt",
+            session_id=None,
+            model="claude-opus-5",
+            effort="high",
+            timeout_seconds=30,
+            cwd="/tmp",
+            env={},
+            max_attempts=3,
+            had_tools=True,
+        )
+        assert calls["n"] == 2
+        assert response == "Completed and verified."
