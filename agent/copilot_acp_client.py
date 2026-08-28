@@ -1037,11 +1037,61 @@ def _extract_tool_calls_from_text(
     extracted: list[ChatCompletionMessageToolCall] = []
     consumed_spans: list[tuple[int, int]] = []
 
+    def _repair_unescaped_structured_arguments(raw_json: str) -> str | None:
+        """Repair ``"arguments": "{...}"`` with unescaped inner JSON.
+
+        Claude Code occasionally emits the function arguments object inside a
+        quoted string without escaping any of the object's quotes. The outer
+        tool-call JSON is then invalid even though the arguments object itself
+        is valid. Remove only that redundant wrapper quote; the normal parser
+        below will serialize the resulting dict back to canonical JSON.
+        """
+
+        marker = re.search(r'"arguments"\s*:\s*"(?=[{[])', raw_json)
+        if marker is None:
+            return None
+        start = marker.end()
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        pairs = {"{": "}", "[": "]"}
+        end = -1
+        for index in range(start, len(raw_json)):
+            char = raw_json[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in pairs:
+                stack.append(pairs[char])
+            elif stack and char == stack[-1]:
+                stack.pop()
+                if not stack:
+                    end = index
+                    break
+        if end < 0 or end + 1 >= len(raw_json) or raw_json[end + 1] != '"':
+            return None
+        # ``start - 1`` is the redundant opening quote; ``end + 1`` is its
+        # matching redundant closing quote.
+        return raw_json[: start - 1] + raw_json[start : end + 1] + raw_json[end + 2 :]
+
     def _try_add_tool_call(raw_json: str) -> None:
         try:
             obj = json.loads(raw_json)
         except Exception:
-            return
+            repaired = _repair_unescaped_structured_arguments(raw_json)
+            if repaired is None:
+                return
+            try:
+                obj = json.loads(repaired)
+            except Exception:
+                return
         if not isinstance(obj, dict):
             return
         fn = obj.get("function")

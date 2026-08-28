@@ -512,6 +512,50 @@ class TestClaudeCodeClient:
         assert json.loads(tool_call.function.arguments) == {"path": "README.md"}
         assert choice.message.content == "I'll inspect that."
 
+    def test_repairs_unescaped_structured_arguments_from_production(self):
+        from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+        # Exact malformed shape emitted repeatedly by Claude Opus in the hair
+        # thread: the arguments object is wrapped in unescaped string quotes.
+        response = (
+            '<tool_call>{"id": "call_find_rei_3", "type": "function", '
+            '"function": {"name": "search_files", "arguments": '
+            '"{"pattern": "*rei*", "target": "files", '
+            '"path": "/root/workspace", "limit": 60}"}}</tool_call>'
+        )
+
+        calls, cleaned = _extract_tool_calls_from_text(response)
+
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0].id == "call_find_rei_3"
+        assert calls[0].function.name == "search_files"
+        assert json.loads(calls[0].function.arguments) == {
+            "pattern": "*rei*",
+            "target": "files",
+            "path": "/root/workspace",
+            "limit": 60,
+        }
+
+    def test_repairs_unescaped_nested_terminal_arguments(self):
+        from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+        response = (
+            '<tool_call>{"id": "call_rei_locate_final", "type": "function", '
+            '"function": {"name": "terminal", "arguments": '
+            '"{"command": "ls -la /root/assets/", "timeout": 30}"}}</tool_call>'
+        )
+
+        calls, cleaned = _extract_tool_calls_from_text(response)
+
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0].function.name == "terminal"
+        assert json.loads(calls[0].function.arguments) == {
+            "command": "ls -la /root/assets/",
+            "timeout": 30,
+        }
+
     def test_stream_true_returns_iterable_text_chunks(self):
         client = ClaudeCodeClient(cwd="/tmp")
         with patch.object(
