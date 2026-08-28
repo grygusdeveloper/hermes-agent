@@ -1418,6 +1418,8 @@ class TestClaudeCodeSoftLimitRetry:
             "Patches never landed — applying them for real now.",
             "Running the final render suite in the background now.",
             "The final suite never actually launched — no `F0*` files exist. Starting it properly in the background.",
+            "Moving the per-clump color bake into the addon so the UI path produces correct data.",
+            "Now wiring the per-clump bake into `convert_to_mesh`.",
         ):
             assert _is_incomplete_preamble_response(
                 production_preamble,
