@@ -181,6 +181,22 @@ class TestClassify402:
 class TestClassifyApiError:
     """End-to-end classification tests."""
 
+    def test_claude_code_protocol_exhaustion_does_not_fallback(self):
+        error = RuntimeError(
+            "Claude Code CLI returned only intermediate planning text after "
+            "3 attempts (not treated as an answer). Detail: <tool_call>bad</tool_call>"
+        )
+
+        result = classify_api_error(
+            error,
+            provider="claude-code",
+            model="claude-opus-5",
+        )
+
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is False
+
     # ── Auth errors ──
 
     def test_401_classified_as_auth(self):

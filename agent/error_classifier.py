@@ -732,6 +732,22 @@ def classify_api_error(
             should_fallback=True,
         )
 
+    # Claude Code's durable adapter already retries planning-only / malformed
+    # tool-call responses internally. If all bounded repair attempts fail, the
+    # resulting RuntimeError is a local output-protocol failure, not provider
+    # rate limiting or outage. Falling back here both switches away from the
+    # user's explicitly selected Claude model and can misleadingly surface the
+    # fallback provider's unrelated quota error.
+    if (
+        provider_lower == "claude-code"
+        and "claude code cli returned only intermediate planning text" in error_msg
+    ):
+        return _result(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=False,
+        )
+
     # Anthropic thinking block recovery (400).  Two distinct failure modes,
     # same recovery (strip all reasoning_details and retry without thinking
     # blocks — see the thinking_signature handler in conversation_loop.py):
