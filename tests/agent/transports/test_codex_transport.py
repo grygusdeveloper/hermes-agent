@@ -39,7 +39,20 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
-    def test_gpt56_native_output_verbosity_is_independent_of_reasoning(self, transport):
+    def test_gpt56_direct_openai_output_verbosity_is_independent_of_reasoning(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "high"},
+            output_verbosity="low",
+            provider="openai",
+        )
+
+        assert kw["reasoning"]["effort"] == "high"
+        assert kw["text"] == {"verbosity": "low"}
+
+    def test_gpt56_codex_oauth_omits_unsupported_text_field(self, transport):
         kw = transport.build_kwargs(
             model="gpt-5.6-sol",
             messages=[{"role": "user", "content": "Hi"}],
@@ -51,7 +64,7 @@ class TestCodexBuildKwargs:
         )
 
         assert kw["reasoning"]["effort"] == "high"
-        assert kw["text"] == {"verbosity": "low"}
+        assert "text" not in kw
 
     @pytest.mark.parametrize(
         "model,flags",

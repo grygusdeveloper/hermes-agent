@@ -372,15 +372,18 @@ class ResponsesApiTransport(ProviderTransport):
         }
 
         # GPT-5.6 exposes final-answer verbosity separately from reasoning
-        # effort. Apply it only to native OpenAI/Codex Responses routes known
-        # to support the field; xAI and GitHub Responses reject unknown request
-        # parameters, and older models should retain their provider defaults.
+        # effort. Apply it only to the direct OpenAI Responses API. The
+        # ChatGPT Codex OAuth backend currently rejects the otherwise-valid
+        # ``text`` object with ``unsupported field(s): text``; xAI and GitHub
+        # Responses likewise reject unknown request parameters. Older models
+        # retain their provider defaults.
         output_verbosity = str(
             params.get("output_verbosity", "") or ""
         ).strip().lower()
         if (
             output_verbosity in {"low", "medium", "high"}
             and "gpt-5.6" in (model or "").lower()
+            and not is_codex_backend
             and not is_github_responses
             and not is_xai_responses
         ):
