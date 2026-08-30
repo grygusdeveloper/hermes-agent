@@ -1063,6 +1063,15 @@ export interface Translations {
         failedSelect: (backend: string) => string
         needsSetupHint: string
       }
+      browserRealProfile: {
+        label: string
+        description: string
+        enabledTitle: string
+        enabledMessage: string
+        disabledTitle: string
+        disabledMessage: string
+        failedSave: string
+      }
     }
   }
 
