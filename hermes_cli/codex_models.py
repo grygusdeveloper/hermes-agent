@@ -13,6 +13,10 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
+    # GPT-6 Astra — ChatGPT Codex rollout, verified live against the
+    # OAuth-backed catalog on 2026-09-04. Keep it first because the backend
+    # advertises it at priority 1 as the most capable Codex model.
+    "gpt-6-astra",
     # GPT-5.6 series (Sol/Terra/Luna + -pro high-effort modes) — GA 2026-07-09
     # (previewed 2026-06-26).
     "gpt-5.6-sol",
@@ -53,6 +57,10 @@ DEFAULT_CODEX_MODELS: List[str] = [
 ]
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
+    # Entitlement remains backend-enforced. This fallback keeps Astra visible
+    # during a transient catalog outage for installations that already have a
+    # modern GPT-5.6 Codex lineup, matching the existing Spark behavior below.
+    ("gpt-6-astra", ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")),
     ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-sol-pro", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),
