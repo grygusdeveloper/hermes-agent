@@ -142,6 +142,48 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
+async def test_model_autocomplete_shows_cursor_aliases_and_exact_models(adapter):
+    adapter._evaluate_slash_authorization = MagicMock(return_value=(True, ""))
+    config = {
+        "model_aliases": {
+            "gemini": {
+                "provider": "copilot-acp",
+                "base_url": "acp://antigravity",
+                "model": "gemini-3.8-high",
+            },
+            "cursor": {
+                "provider": "cursor",
+                "base_url": "acp://cursor",
+                "model": "cursor-grok-4.6-high",
+            },
+            "cursor-xhigh": {
+                "provider": "cursor",
+                "base_url": "acp://cursor",
+                "model": "cursor-grok-4.6-xhigh",
+            },
+        }
+    }
+
+    with patch("hermes_cli.config.load_config", return_value=config):
+        choices = await adapter._autocomplete_model_alias(SimpleNamespace(), "cursor")
+
+    assert [choice.value for choice in choices] == ["cursor", "cursor-xhigh"]
+    assert choices[0].name == "cursor — Cursor Agent · cursor-grok-4.6-high"
+    assert choices[1].name == "cursor-xhigh — Cursor Agent · cursor-grok-4.6-xhigh"
+
+
+@pytest.mark.asyncio
+async def test_model_autocomplete_does_not_leak_aliases_when_unauthorized(adapter):
+    adapter._evaluate_slash_authorization = MagicMock(return_value=(False, "denied"))
+
+    with patch("hermes_cli.config.load_config") as load_config:
+        choices = await adapter._autocomplete_model_alias(SimpleNamespace(), "cursor")
+
+    assert choices == []
+    load_config.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
         status = 404

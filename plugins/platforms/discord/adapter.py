@@ -5856,8 +5856,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
         @tree.command(name="model", description="Show or change the model")
         @discord.app_commands.describe(
-            name="Choose a model or alias, or leave empty to open the full model picker."
+            name="Start typing for model suggestions, or leave empty for the full picker."
         )
+        @discord.app_commands.autocomplete(name=self._autocomplete_model_alias)
         async def slash_model(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/model {name}".strip())
 
@@ -6329,6 +6330,67 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
         except Exception as exc:
             logger.warning("[%s] Failed to register /skill command: %s", self.name, exc)
+
+    async def _autocomplete_model_alias(
+        self, interaction: "discord.Interaction", current: str,
+    ) -> list:
+        """Return configured model aliases as Discord-native suggestions.
+
+        Alias values are returned rather than raw model IDs because ``/model``
+        resolves aliases across providers.  The label still includes the exact
+        provider and model so Cursor variants are discoverable without knowing
+        their IDs in advance.  Discord caps autocomplete responses at 25.
+        """
+        try:
+            allowed, _reason = self._evaluate_slash_authorization(interaction)
+        except Exception:
+            return []
+        if not allowed:
+            return []
+
+        try:
+            from hermes_cli.config import load_config
+
+            aliases = load_config().get("model_aliases", {}) or {}
+        except Exception:
+            return []
+        if not isinstance(aliases, dict):
+            return []
+
+        query = (current or "").strip().lower()
+        matches: list[tuple[int, str, str, str, str]] = []
+        for alias, spec in aliases.items():
+            if not isinstance(alias, str) or not isinstance(spec, dict):
+                continue
+            model = str(spec.get("model", "")).strip()
+            provider = str(spec.get("provider", "")).strip()
+            base_url = str(spec.get("base_url", "")).strip().lower()
+            if not model:
+                continue
+
+            if provider == "cursor" or base_url == "acp://cursor":
+                provider_label = "Cursor Agent"
+            elif base_url == "acp://antigravity":
+                provider_label = "Gemini (Antigravity)"
+            else:
+                provider_label = provider or "default provider"
+
+            haystack = f"{alias} {provider_label} {provider} {model}".lower()
+            if query and query not in haystack:
+                continue
+            rank = 0 if not query or alias.lower().startswith(query) else 1
+            matches.append((rank, alias.lower(), model.lower(), provider_label, alias))
+
+        choices: list = []
+        for _rank, _alias_lower, _model_lower, provider_label, alias in sorted(matches):
+            model = str(aliases[alias].get("model", "")).strip()
+            label = f"{alias} — {provider_label} · {model}"
+            if len(label) > 100:
+                label = label[:97] + "..."
+            choices.append(discord.app_commands.Choice(name=label, value=alias))
+            if len(choices) >= 25:
+                break
+        return choices
 
     def _refresh_skill_catalog_state(self) -> None:
         """Re-scan disk for skills and repopulate ``self._skill_entries``.
