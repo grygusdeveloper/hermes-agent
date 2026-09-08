@@ -117,6 +117,31 @@ class TestSnapshotRealProfile:
         assert err and "was not found" in err
 
 
+class TestRealProfileAgentBrowserStdio:
+    def test_short_command_uses_files_instead_of_pipes(self):
+        import tools.browser_tool as bt
+
+        child = Mock()
+        child.wait.return_value = 0
+        captured = {}
+
+        def fake_popen(argv, **kwargs):
+            captured.update(kwargs)
+            kwargs["stdout"].write(b"ws://127.0.0.1:41000/devtools/browser/x\n")
+            kwargs["stdout"].flush()
+            return child
+
+        with patch.object(bt.subprocess, "Popen", side_effect=fake_popen):
+            proc = bt._run_real_profile_agent_browser(["agent-browser", "get", "cdp-url"], 15)
+
+        assert proc.returncode == 0
+        assert "41000" in proc.stdout
+        assert captured["stdout"] is not bt.subprocess.PIPE
+        assert captured["stderr"] is not bt.subprocess.PIPE
+        assert captured["stdin"] is bt.subprocess.DEVNULL
+        assert captured["close_fds"] is True
+
+
 class TestRealProfileCdpLaunch:
     """The agent-browser-based launcher in browser_tool._real_profile_cdp."""
 
@@ -171,7 +196,7 @@ class TestRealProfileCdpLaunch:
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:41000"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt, "_run_real_profile_agent_browser", return_value=proc), \
              patch.object(bt, "_is_headed_mode", return_value=False):
             cdp, err = bt._real_profile_cdp()
         assert err is None
@@ -212,7 +237,7 @@ class TestRealProfileCdpLaunch:
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:41000"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", side_effect=fake_run), \
+             patch.object(bt, "_run_real_profile_agent_browser", side_effect=fake_run), \
              patch.object(bt, "_is_headed_mode", return_value=False):
             bt._real_profile_cdp()
         assert "--headless" not in captured["argv"]
@@ -247,7 +272,7 @@ class TestRealProfileCdpLaunch:
              patch.object(bt, "_agent_browser_close_session",
                           side_effect=lambda s: closed.__setitem__("n", closed["n"] + 1)), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt, "_run_real_profile_agent_browser", return_value=proc), \
              patch.object(bt, "_is_headed_mode", return_value=False):
             cdp, err = bt._real_profile_cdp()
         assert closed["n"] == 1  # stale wrong-dir session was closed
@@ -899,7 +924,7 @@ class TestReviewRound3:
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "Popen", side_effect=launch_browser), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt, "_run_real_profile_agent_browser", return_value=proc), \
              patch.object(bt, "_is_headed_mode", return_value=False):
             cdp, err = bt._real_profile_cdp()
         assert err is None

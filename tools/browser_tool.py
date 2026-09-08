@@ -1466,6 +1466,55 @@ def _cdp_http_ready(http_cdp: str) -> bool:
         return False
 
 
+def _run_real_profile_agent_browser(argv: list, timeout: int) -> subprocess.CompletedProcess:
+    """Run a short agent-browser command without PIPE-backed stdio.
+
+    On Windows the agent-browser CLI can spawn a detached daemon which inherits
+    stdout/stderr.  ``subprocess.run(capture_output=True)`` then waits forever
+    for pipe EOF even after the CLI process exits.  Real files let ``wait()``
+    observe only the command process while still preserving bounded diagnostics.
+    """
+    out_fd, out_path = tempfile.mkstemp(prefix="hermes-rp-out-", suffix=".log")
+    err_fd, err_path = tempfile.mkstemp(prefix="hermes-rp-err-", suffix=".log")
+    os.close(out_fd)
+    os.close(err_fd)
+    try:
+        with open(out_path, "wb") as stdout_fh, open(err_path, "wb") as stderr_fh:
+            proc = subprocess.Popen(
+                argv,
+                stdout=stdout_fh,
+                stderr=stderr_fh,
+                stdin=subprocess.DEVNULL,
+                env=_build_browser_env(),
+                creationflags=windows_hide_flags(),
+                close_fds=True,
+            )
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise
+        try:
+            stdout = Path(out_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            stdout = ""
+        try:
+            stderr = Path(err_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            stderr = ""
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+    finally:
+        for path in (out_path, err_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def _agent_browser_get_cdp(session_name: str) -> Optional[str]:
     """Return the HTTP CDP endpoint of an agent-browser session, or None.
 
@@ -1479,9 +1528,9 @@ def _agent_browser_get_cdp(session_name: str) -> Optional[str]:
     except FileNotFoundError:
         return None
     try:
-        proc = subprocess.run(
+        proc = _run_real_profile_agent_browser(
             [*_agent_browser_argv(browser_cmd), "--session", session_name, "get", "cdp-url"],
-            capture_output=True, text=True, timeout=15, env=_build_browser_env(),
+            timeout=15,
         )
     except (subprocess.SubprocessError, OSError) as e:
         logger.debug("real-profile get cdp-url failed: %s", e)
@@ -1519,9 +1568,9 @@ def _agent_browser_close_session(session_name: str) -> None:
     except FileNotFoundError:
         return
     try:
-        subprocess.run(
+        _run_real_profile_agent_browser(
             [*_agent_browser_argv(browser_cmd), "--session", session_name, "close"],
-            capture_output=True, text=True, timeout=15, env=_build_browser_env(),
+            timeout=15,
         )
     except (subprocess.SubprocessError, OSError) as e:
         logger.debug("real-profile session close failed: %s", e)
@@ -1747,10 +1796,9 @@ def _real_profile_cdp() -> tuple:
             "open", "about:blank",
         ]
         try:
-            proc = subprocess.run(
-                argv, capture_output=True, text=True,
+            proc = _run_real_profile_agent_browser(
+                argv,
                 timeout=_get_open_command_timeout(first_open=True),
-                env=_build_browser_env(),
             )
         except subprocess.TimeoutExpired:
             return None, (
