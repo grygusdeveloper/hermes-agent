@@ -56,6 +56,62 @@ def test_resolve_detached_python_swaps_legacy_pythonw_for_console_sibling(tmp_pa
     assert extra == []
 
 
+def _make_stable_windows_venv(project_root: Path) -> tuple[Path, Path]:
+    python = project_root / "venv" / "Scripts" / "python.exe"
+    bundle = project_root / "venv" / "Lib" / "site-packages" / "certifi" / "cacert.pem"
+    python.parent.mkdir(parents=True)
+    bundle.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    bundle.write_text("test-ca", encoding="utf-8")
+    return python, bundle
+
+
+def test_stable_launcher_python_replaces_disposable_update_runner(tmp_path):
+    project_root = tmp_path / "install" / "hermes-agent"
+    stable_python, _ = _make_stable_windows_venv(project_root)
+    transient_python = tmp_path / "Temp" / "hermes-update-runner" / "Scripts" / "python.exe"
+
+    with mock.patch("hermes_cli.gateway.get_python_path", return_value=str(transient_python)):
+        selected = gateway_windows._stable_launcher_python_path(project_root)
+
+    assert selected == str(stable_python)
+
+
+def test_stable_launcher_python_preserves_external_venv(tmp_path):
+    project_root = tmp_path / "install" / "hermes-agent"
+    _make_stable_windows_venv(project_root)
+    external_python = tmp_path / "durable-venvs" / "hermes" / "Scripts" / "python.exe"
+
+    with mock.patch("hermes_cli.gateway.get_python_path", return_value=str(external_python)):
+        selected = gateway_windows._stable_launcher_python_path(project_root)
+
+    assert selected == str(external_python)
+
+
+def test_ca_overlay_remaps_only_disposable_update_runner_values(monkeypatch, tmp_path):
+    project_root = tmp_path / "install" / "hermes-agent"
+    _, stable_bundle = _make_stable_windows_venv(project_root)
+    transient_bundle = tmp_path / "Temp" / "hermes-update-runner" / "Lib" / "site-packages" / "certifi" / "cacert.pem"
+    corporate_bundle = tmp_path / "company" / "root-ca.pem"
+    monkeypatch.setenv("SSL_CERT_FILE", str(transient_bundle))
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(corporate_bundle))
+    monkeypatch.delenv("CURL_CA_BUNDLE", raising=False)
+
+    overlay = gateway_windows._stable_ca_bundle_overlay(project_root)
+
+    assert overlay == {"SSL_CERT_FILE": str(stable_bundle)}
+
+
+def test_ca_overlay_is_empty_without_disposable_update_runner(monkeypatch, tmp_path):
+    project_root = tmp_path / "install" / "hermes-agent"
+    _make_stable_windows_venv(project_root)
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "company" / "root-ca.pem"))
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("CURL_CA_BUNDLE", raising=False)
+
+    assert gateway_windows._stable_ca_bundle_overlay(project_root) == {}
+
+
 
 
 @pytest.mark.windows_only

@@ -283,13 +283,72 @@ def _gateway_run_argv(python_exe: str, profile_arg: str) -> list[str]:
     return argv
 
 
+def _is_transient_update_runner_path(path: str | Path) -> bool:
+    """Whether *path* belongs to the disposable Windows update bootstrap venv."""
+    return any(part.casefold() == "hermes-update-runner" for part in Path(path).parts)
+
+
+def _stable_launcher_python_path(project_root: Path) -> str:
+    """Resolve the interpreter a persisted gateway launcher may safely retain.
+
+    Desktop updates execute the refreshed source through
+    ``%TEMP%\\hermes-update-runner``.  ``get_python_path()`` correctly reports
+    that active venv, but it is deleted when the update finishes and therefore
+    must never be written into Scheduled Task / Startup launchers.  Prefer the
+    install checkout's venv only for that known-disposable runner; preserve
+    every other active/external venv unchanged.
+    """
+    from hermes_cli.gateway import get_python_path  # avoid circular init
+    from hermes_constants import venv_python_path
+
+    selected = get_python_path()
+    if not _is_transient_update_runner_path(selected):
+        return selected
+
+    for name in ("venv", ".venv"):
+        candidate = venv_python_path(project_root / name, windows=True)
+        if candidate.is_file():
+            return str(candidate)
+    raise RuntimeError(
+        "Refusing to persist the disposable hermes-update-runner interpreter: "
+        "no stable project venv was found"
+    )
+
+
+def _stable_ca_bundle_overlay(project_root: Path) -> dict[str, str]:
+    """Replace CA paths inherited from the disposable update runner.
+
+    The restart watcher inherits the updater's environment.  certifi may set
+    ``SSL_CERT_FILE`` to its own bundle inside the temporary venv; the gateway
+    then starts successfully but every later turn fails once cleanup removes
+    that file.  Remap only updater-owned values, leaving user/corporate CA
+    configuration untouched.
+    """
+    inherited = {
+        name: os.environ.get(name, "")
+        for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+    }
+    affected = [name for name, value in inherited.items() if value and _is_transient_update_runner_path(value)]
+    if not affected:
+        return {}
+
+    for name in ("venv", ".venv"):
+        bundle = project_root / name / "Lib" / "site-packages" / "certifi" / "cacert.pem"
+        if bundle.is_file():
+            return {env_name: str(bundle) for env_name in affected}
+    raise RuntimeError(
+        "Refusing to restart the gateway with a CA bundle inside hermes-update-runner: "
+        "no stable certifi bundle was found"
+    )
+
+
 def _launcher_settings() -> tuple[str, str, str, str]:
     """Return (python_path, working_dir, hermes_home, profile_arg) for generated launchers."""
-    from hermes_cli.gateway import PROJECT_ROOT, _profile_arg, get_python_path  # avoid circular init
+    from hermes_cli.gateway import PROJECT_ROOT, _profile_arg  # avoid circular init
 
     hermes_home = str(_hermes_home())
     return (
-        _preserve_hermes_home_path(get_python_path()),
+        _preserve_hermes_home_path(_stable_launcher_python_path(PROJECT_ROOT)),
         _stable_gateway_working_dir(PROJECT_ROOT),
         hermes_home,
         _profile_arg(hermes_home),
@@ -582,6 +641,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
     python_exe, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
     env_overlay = {"HERMES_HOME": hermes_home, **dict(_GATEWAY_ENV), "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir)}
     _prepend_pythonpath(env_overlay, [_preserve_hermes_home_path(p) for p in (PROJECT_ROOT, *extra_pythonpath)])
+    env_overlay.update(_stable_ca_bundle_overlay(PROJECT_ROOT))
     return _gateway_run_argv(python_exe, profile_arg), working_dir, env_overlay
 
 
@@ -614,6 +674,7 @@ def windowless_gateway_restart_spec(run_argv: list[str]) -> tuple[list[str], str
     if hermes_home:
         env_overlay["HERMES_HOME"] = hermes_home
     _prepend_pythonpath(env_overlay, [str(PROJECT_ROOT), *extra_pythonpath])
+    env_overlay.update(_stable_ca_bundle_overlay(PROJECT_ROOT))
     return [hidden_console_python, *run_argv[1:]], _stable_gateway_working_dir(PROJECT_ROOT), env_overlay
 
 
