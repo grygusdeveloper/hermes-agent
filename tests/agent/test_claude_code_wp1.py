@@ -125,8 +125,10 @@ FAKE_CLI = textwrap.dedent(
         out(dict(shown, type="assistant", session_id=sid,
                  message={"content": [{"type": "thinking", "thinking": ""}]}))
         shown = {} if reply.get("no_uuid") else {"uuid": text_uuid}
+        # CLI-written banners carry model "<synthetic>".
+        model = "<synthetic>" if reply.get("synthetic") else "claude-sonnet-5"
         out(dict(shown, type="assistant", session_id=sid,
-                 message={"content": [{"type": "text", "text": text}]}))
+                 message={"model": model, "content": [{"type": "text", "text": text}]}))
         chain.append({"uuid": thinking_uuid, "text": "(thinking)"})
         chain.append({"uuid": text_uuid, "text": "A: " + text})
         save()
@@ -249,9 +251,9 @@ def test_renderings_restore_tool_names_from_assistant_calls():
         {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
     ]
     _system, prompt, _images = _build_claude_code_request(messages)
-    assert "Tool Result (name=terminal, tool_call_id=c1):\na.txt" in prompt
+    assert '<tool_result id="c1" name="terminal">\na.txt\n</tool_result>' in prompt
     incremental, _ = _incremental_prompt_with_images(messages, 2)
-    assert incremental == "Tool Result (name=terminal, tool_call_id=c1):\na.txt"
+    assert incremental == '<tool_result id="c1" name="terminal">\na.txt\n</tool_result>'
 
 
 def test_reused_call_ids_name_results_after_the_preceding_call():
@@ -270,16 +272,16 @@ def test_reused_call_ids_name_results_after_the_preceding_call():
         {"role": "tool", "tool_call_id": "g1", "content": "pid 7"},
     ]
     _system, prompt, _images = _build_claude_code_request(messages)
-    headers = [line for line in prompt.splitlines() if line.startswith("Tool Result")]
+    headers = [line for line in prompt.splitlines() if line.startswith("<tool_result")]
     assert headers == [
-        "Tool Result (name=read_file, tool_call_id=g1):",
-        "Tool Result (name=terminal, tool_call_id=g1):",
-        "Tool Result (name=process, tool_call_id=g1):",
+        '<tool_result id="g1" name="read_file">',
+        '<tool_result id="g1" name="terminal">',
+        '<tool_result id="g1" name="process">',
     ]
     incremental, _ = _incremental_prompt_with_images(messages[:7], 3)
-    assert "Tool Result (name=terminal, tool_call_id=g1):\nexit 0" in incremental
+    assert '<tool_result id="g1" name="terminal">\nexit 0\n</tool_result>' in incremental
     incremental, _ = _incremental_prompt_with_images(messages, 7)
-    assert incremental == "Tool Result (name=process, tool_call_id=g1):\npid 7"
+    assert incremental == '<tool_result id="g1" name="process">\npid 7\n</tool_result>'
 
 
 def test_state_version_bump_ignores_old_states(tmp_path, monkeypatch):
@@ -467,7 +469,7 @@ def test_stateless_fork_leaves_parent_state_untouched(fake_cli):
     assert "--no-session-persistence" in fork_spawns[0]["argv"]
     assert "--no-session-persistence" not in fake_cli.events("spawn")[0]["argv"]
     assert fake_cli.events("turn")[-1]["content"] == (
-        "Tool Result (name=memory, tool_call_id=m1):\nsaved"
+        '<tool_result id="m1" name="memory">\nsaved\n</tool_result>'
     )
     main.shutdown()
     fork.shutdown()
@@ -593,14 +595,14 @@ def test_failed_attempt_is_not_duplicated_on_retry(fake_cli):
         _run(session, fake_cli, history)  # the warm process got the payload, then failed
     _run(session, fake_cli, history)  # Hermes retries the same request
     context = fake_cli.events("turn")[-1]["context"]
-    assert sum("Tool Result" in entry for entry in context) == 1
+    assert sum("<tool_result" in entry for entry in context) == 1
     spawns = fake_cli.events("spawn")
     assert len(spawns) == 2 and "--resume-session-at" in spawns[1]["argv"]
 
 
 def test_preamble_exhaustion_is_dropped_on_the_next_attempt(fake_cli):
-    fake_cli.script({}, {"text": "Checking the logs."}, {"text": "Checking the logs."},
-                    {"text": "Checking the logs."}, {"text": "Everything is fine."})
+    fake_cli.script({}, {"text": "I'll check the logs."}, {"text": "I'll check the logs."},
+                    {"text": "I'll check the logs."}, {"text": "Everything is fine."})
     session = ClaudeCodeSession()
     history = [{"role": "user", "content": "hi"}]
     _run(session, fake_cli, history)
@@ -612,7 +614,7 @@ def test_preamble_exhaustion_is_dropped_on_the_next_attempt(fake_cli):
     response, _ = _run(session, fake_cli, history)
     assert response == "Everything is fine."
     context = fake_cli.events("turn")[-1]["context"]
-    assert sum("Tool Result" in entry for entry in context) == 1
+    assert sum("<tool_result" in entry for entry in context) == 1
     assert not any(_PROGRESS_CONTINUATION_PROMPT in entry for entry in context)
     assert len(fake_cli.events("spawn")) == 2
 
@@ -620,14 +622,14 @@ def test_preamble_exhaustion_is_dropped_on_the_next_attempt(fake_cli):
 def test_soft_limit_retry_resumes_at_the_checkpoint(fake_cli, monkeypatch):
     monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
     banner = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
-    fake_cli.script({}, {"text": banner}, {"text": "The listing shows one file."})
+    fake_cli.script({}, {"text": banner, "synthetic": True}, {"text": "The listing shows one file."})
     session = ClaudeCodeSession()
     history = [{"role": "user", "content": "hi"}]
     _run(session, fake_cli, history)
     response, _ = _run(session, fake_cli, _tool_turn(history))
     assert response == "The listing shows one file."
     context = fake_cli.events("turn")[-1]["context"]
-    assert sum("Tool Result" in entry for entry in context) == 1
+    assert sum("<tool_result" in entry for entry in context) == 1
     assert not any(banner in entry for entry in context)
 
 
@@ -675,7 +677,7 @@ def test_rewound_history_resumes_at_the_older_checkpoint(fake_cli, monkeypatch):
     spawn, turn = fake_cli.events("spawn")[-1], fake_cli.events("turn")[-1]
     assert _arg(spawn["argv"], "--resume-session-at") == first_checkpoint[1]
     assert turn["content"] == "User:\nu2"
-    assert not any("Tool Result" in entry for entry in turn["context"])
+    assert not any("<tool_result" in entry for entry in turn["context"])
     assert [cp[0] for cp in _load_durable_state("root|main").checkpoints] == [2, 4]
 
 
@@ -732,7 +734,7 @@ def test_rewind_then_advance_stays_on_the_new_branch(fake_cli, monkeypatch):
     turn_c = turn_b + [{"role": "assistant", "content": "Fake reply."}, {"role": "user", "content": "u3"}]
     _run(session, fake_cli, turn_c)
     context = fake_cli.events("turn")[-1]["context"]
-    assert not any("Tool Result" in entry for entry in context)
+    assert not any("<tool_result" in entry for entry in context)
     assert sum(entry == "User:\nu2" for entry in context) == 1
     assert context[-1] == "User:\nu3"
 
@@ -771,7 +773,7 @@ def test_rate_limit_error_retry_resumes_at_the_checkpoint(fake_cli, monkeypatch)
     spawns = fake_cli.events("spawn")
     assert len(spawns) == 2 and "--resume-session-at" in spawns[1]["argv"]
     context = fake_cli.events("turn")[-1]["context"]
-    assert sum("Tool Result" in entry for entry in context) == 1
+    assert sum("<tool_result" in entry for entry in context) == 1
 
 
 def test_aborted_turn_is_dropped_on_retry(fake_cli):
@@ -787,7 +789,7 @@ def test_aborted_turn_is_dropped_on_retry(fake_cli):
     fake_cli.script({})
     _run(session, fake_cli, _tool_turn(history))
     context = fake_cli.events("turn")[-1]["context"]
-    assert sum("Tool Result" in entry for entry in context) == 1
+    assert sum("<tool_result" in entry for entry in context) == 1
 
 
 def test_stateless_retry_without_warm_process_goes_fresh_directly(fake_cli, monkeypatch):
@@ -796,7 +798,8 @@ def test_stateless_retry_without_warm_process_goes_fresh_directly(fake_cli, monk
 
     monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
     banner = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
-    fake_cli.script({}, {"text": banner}, {"text": "Saved the preference to memory."})
+    fake_cli.script({}, {"text": banner, "synthetic": True},
+                    {"text": "Saved the preference to memory."})
     fork = ClaudeCodeSession()
     review = [{"role": "user", "content": "Review the conversation above"}]
     _run(fork, fake_cli, review, state_key=None, keepalive=True)

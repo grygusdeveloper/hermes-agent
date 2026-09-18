@@ -78,7 +78,10 @@ class TestClaudeCodePromptUX:
         assert "Avoid walls of text" in prompt
         assert "short descriptive headings" in prompt
         assert "bullets or numbered steps" in prompt
-        assert "Icons are optional" in prompt
+        assert "icons are optional" in prompt
+        # One style block, and Hermes's own instructions take precedence.
+        assert prompt.count("Avoid walls of text") == 1
+        assert "authoritative policy for\npersona, tone, formatting" in prompt
 
     def test_tool_turns_allow_one_safe_progress_sentence(self):
         prompt = _format_messages_as_prompt(
@@ -96,10 +99,13 @@ class TestClaudeCodePromptUX:
             ],
         )
 
-        assert "one short, concrete user-facing progress sentence" in prompt
-        assert "naming any skill you load" in prompt
-        assert "not private chain-of-thought" in prompt
-        assert "Do not add narration before or after tool calls" not in prompt
+        # Optional, in the same reply as the calls, never a reply of its own.
+        assert "A short progress sentence is optional" in prompt
+        assert "never in a reply of its own" in prompt
+        assert "stop right after\n  your final </tool_call>" in prompt
+        assert '"arguments" is a JSON object' in prompt
+        assert "arguments must be a JSON string" not in prompt
+        assert "Hermes requested model hint" not in prompt
 
 
 def _stream_stdout(
@@ -782,9 +788,8 @@ class TestReviewBlockerRegressions:
             },
         ]
         prompt = _incremental_prompt(msgs, previous_count=1)
-        assert "tool_call_id=call_a" in prompt
-        assert "tool_call_id=call_b" in prompt
-        assert "name=lookup" in prompt
+        assert '<tool_result id="call_a" name="lookup">\nsame-body\n</tool_result>' in prompt
+        assert '<tool_result id="call_b" name="lookup">\nsame-body\n</tool_result>' in prompt
 
     def test_tools_digest_includes_full_schema_not_just_names(self):
         from agent.claude_code_client import _tools_digest
@@ -1120,10 +1125,11 @@ class TestSol56BlockerRegressions:
             },
         ]
         prompt = _format_messages_as_prompt(messages, model="sonnet", tools=None)
-        assert "call_abc" in prompt
-        assert "get_weather" in prompt
-        assert "<tool_call>" in prompt
-        assert "tool_call_id=call_abc" in prompt
+        assert (
+            '<tool_call>{"id": "call_abc", "name": "get_weather", '
+            '"arguments": {"city": "Tokyo"}}</tool_call>'
+        ) in prompt
+        assert '<tool_result id="call_abc" name="get_weather">\n22C\n</tool_result>' in prompt
 
     def test_result_requires_boolean_false_is_error(self):
         from agent.claude_code_session import _parse_stream_json_output
@@ -1381,6 +1387,7 @@ class TestClaudeCodeSoftLimitRetry:
         def fake_execute(*args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
+                session._last_turn_synthetic = True  # the CLI wrote it
                 return notice, "", "12345678-1234-1234-1234-123456789abc"
             return "real answer", "", "12345678-1234-1234-1234-123456789abc"
 
@@ -1408,6 +1415,7 @@ class TestClaudeCodeSoftLimitRetry:
         notice = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
 
         def fake_execute(*args, **kwargs):
+            session._last_turn_synthetic = True  # the CLI wrote it
             return notice, "", "12345678-1234-1234-1234-123456789abc"
 
         monkeypatch.setattr(session, "_execute", fake_execute)

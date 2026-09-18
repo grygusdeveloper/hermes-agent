@@ -24,9 +24,10 @@ Key differences from the Copilot ACP bridge
   or the Antigravity command.
 * **Native tools disabled** — ``--tools ""`` turns off all Claude Code built-in
   tools so every tool call remains under Hermes logging, permissions, MCP, and
-  approvals.  Hermes injects its tool schemas into the prompt and parses
-  ``<tool_call>`` blocks back out of the response (same proven parser as the
-  Copilot ACP bridge).
+  approvals.  Hermes injects its tool schemas and protocol into the system
+  prompt and parses ``<tool_call>`` blocks back out of the response with the
+  bridge's own parser (``claude_code_session._parse_claude_reply``); Hermes
+  owns the resulting tool-call ids.
 
 Security
 --------
@@ -36,28 +37,40 @@ CLI.  This module never reads, passes, or logs credentials.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from agent.claude_code_session import (
     _HERMES_BACKEND_SYSTEM_PROMPT,
+    _HERMES_TOOL_PROTOCOL,
     ClaudeCodeSession,
+    _mask_code,
+    _parse_claude_reply,
     _render_content_collecting_images,
+    _render_tool_result,
     _ToolNameResolver,
 )
 from agent.portal_tags import get_bridge_state_key
 
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-_PROMPT_FORMAT_VERSION = 5
+# v6: flat <tool_call> objects with JSON-object arguments, <tool_result>
+# envelopes, one backend contract. Part of ``_tools_digest``, so a bump starts
+# every durable conversation fresh (Claude Code would otherwise replay the old
+# system prompt snapshot on --resume).
+_PROMPT_FORMAT_VERSION = 6
+_LOG = logging.getLogger(__name__)
 
-# Tool-call extraction shared with the Copilot ACP bridge (same <tool_call> shape).
 from agent.copilot_acp_client import (  # noqa: E402
-    _extract_tool_calls_from_text,
+    _build_openai_tool_call,
+    _historical_tool_call_ids,
     _render_message_content,
 )
 
@@ -66,6 +79,58 @@ def _render_transcript_content(content: Any, images: list[dict[str, Any]]) -> st
     if isinstance(content, list):
         return _render_content_collecting_images(content, images).strip()
     return _render_message_content(content)
+
+
+# Assistant rows saved before the v6 protocol can hold results Claude invented
+# after its tool calls ("Tool Result (tool_call_id=…): …"). Replaying them would
+# teach the pattern back, and put a fake result before its own call.
+_INVENTED_RESULT_RE = re.compile(
+    r"^[ \t]*(?:user[ \t]+)?(?:tool result[ \t]*\(|<tool_result\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_invented_results(text: str) -> str:
+    match = _INVENTED_RESULT_RE.search(_mask_code(text or ""))
+    return text[: match.start()].rstrip() if match else text
+
+
+def _replayed_tool_call(call: Any) -> dict[str, Any] | None:
+    """A stored assistant tool call in the v6 protocol shape."""
+
+    import json
+
+    model_dump = getattr(call, "model_dump", None)
+    if callable(model_dump):
+        try:
+            call = model_dump()
+        except Exception:
+            pass
+    if isinstance(call, dict):
+        function = call.get("function") or {}
+        # ``call_id`` is what tool results reference when it differs from the
+        # provider item ``id`` (calls made on the Codex path).
+        call_id = call.get("call_id") or call.get("id")
+        name = function.get("name") if isinstance(function, dict) else None
+        arguments = function.get("arguments") if isinstance(function, dict) else None
+    else:
+        function = getattr(call, "function", None)
+        call_id = getattr(call, "id", None)
+        name = getattr(function, "name", None)
+        arguments = getattr(function, "arguments", None)
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments, strict=False)
+        except ValueError:
+            pass
+    replayed: dict[str, Any] = {}
+    if isinstance(call_id, str) and call_id.strip():
+        replayed["id"] = call_id.strip()
+    replayed["name"] = name.strip()
+    replayed["arguments"] = arguments if arguments not in (None, "") else {}
+    return replayed
 
 
 def _build_claude_code_request(
@@ -79,41 +144,16 @@ def _build_claude_code_request(
     The system prompt carries the backend contract, the tool protocol + tool
     schemas and Hermes's own leading system messages, so Claude receives them
     in the real system slot (``--system-prompt-file``). The transcript keeps
-    assistant ``tool_calls`` and tool-result ``name``/``tool_call_id`` linkage
-    so fresh/expired full replays remain semantically complete. Image parts
-    become native image blocks, referenced from the text as ``[Image #n]``.
+    assistant ``tool_calls`` (as protocol ``<tool_call>`` blocks) and
+    ``<tool_result>`` envelopes with the call id and name, so fresh/expired
+    full replays remain semantically complete. Image parts become native image
+    blocks, referenced from the text as ``[Image #n]``. ``model`` is accepted
+    for interface parity; the model is chosen by ``--model``.
     """
 
     import json
 
-    sections: list[str] = [
-        _HERMES_BACKEND_SYSTEM_PROMPT,
-        "You are the active reasoning model inside Hermes.",
-        "Hermes, not Claude Code, owns all tool execution. Claude Code native tools are "
-        "intentionally disabled; every tool listed below remains available through Hermes.",
-        "TOOL RULE: If you take an action, emit one or more "
-        "<tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape. "
-        "For multi-step work, you may precede the first tool batch with one short, concrete "
-        "user-facing progress sentence saying what you are checking and naming any skill "
-        "you load. This is activity reporting, not private chain-of-thought. Do not narrate "
-        "every trivial call or append a final answer to a tool-call turn. Independent calls "
-        "may be emitted together to reduce round trips.",
-        "FINALITY RULE: If no tool is needed, return the complete user-facing answer now. "
-        "Never end with process narration such as 'I will check' or 'let me inspect'. "
-        "Do not repeat an inspection whose result is already present in the transcript.",
-        "STYLE RULE: In final answers, sound like a natural, thoughtful collaborator. "
-        "Match the user's language, tone, and requested level of detail. Avoid walls of text. "
-        "When an answer has several findings, decisions, comparisons, or steps, format it as "
-        "a readable Markdown document with short descriptive headings, compact paragraphs, "
-        "and bullets or numbered steps where useful. Use bold labels sparingly. Icons are "
-        "optional and should add a real visual cue, never decorate every line. Keep simple "
-        "conversation as natural prose rather than forcing a rigid report template. Lead "
-        "with the useful conclusion, not process commentary.",
-        "IMAGE RULE: Images attached to a message are sent as native image inputs labelled "
-        "'Image #n:' and referenced in the transcript as [Image #n]. Look at them directly.",
-    ]
-    if model:
-        sections.append(f"Hermes requested model hint: {model}")
+    sections: list[str] = [_HERMES_BACKEND_SYSTEM_PROMPT]
 
     if isinstance(tools, list) and tools:
         tool_specs: list[dict[str, Any]] = []
@@ -135,9 +175,8 @@ def _build_claude_code_request(
             )
         if tool_specs:
             sections.append(
-                "Available tools (OpenAI function schema). "
-                "For each tool call, emit <tool_call>{...}</tool_call> with one JSON object "
-                "containing id/type/function{name,arguments}. arguments must be a JSON string.\n"
+                _HERMES_TOOL_PROTOCOL
+                + "\n\nAvailable tools (name, description, JSON schema of the arguments):\n"
                 + json.dumps(tool_specs, ensure_ascii=False)
             )
 
@@ -177,43 +216,24 @@ def _build_claude_code_request(
         if role == "tool":
             tool_call_id = message.get("tool_call_id") or message.get("id") or ""
             rendered = _render_transcript_content(message.get("content"), images)
-            meta = []
-            if isinstance(tool_name, str) and tool_name.strip():
-                meta.append(f"name={tool_name.strip()}")
-            if isinstance(tool_call_id, str) and tool_call_id.strip():
-                meta.append(f"tool_call_id={tool_call_id.strip()}")
-            header = "Tool Result"
-            if meta:
-                header = f"Tool Result ({', '.join(meta)})"
-            transcript.append(f"{header}:\n{rendered}")
+            transcript.append(_render_tool_result(tool_call_id, tool_name, rendered))
             continue
         if role not in {"system", "user", "assistant"}:
             role = "context"
 
         rendered = _render_transcript_content(message.get("content"), images)
-        tool_calls = message.get("tool_calls")
         call_blocks: list[str] = []
-        if tool_calls:
+        if role == "assistant":
+            rendered = _strip_invented_results(rendered)
+            tool_calls = message.get("tool_calls")
             for tc in tool_calls if isinstance(tool_calls, list) else []:
                 try:
-                    if hasattr(tc, "model_dump"):
-                        obj = tc.model_dump()
-                    elif isinstance(tc, dict):
-                        obj = tc
-                    else:
-                        obj = {
-                            "id": getattr(tc, "id", None),
-                            "type": getattr(tc, "type", "function"),
-                            "function": {
-                                "name": getattr(getattr(tc, "function", None), "name", None),
-                                "arguments": getattr(
-                                    getattr(tc, "function", None), "arguments", "{}"
-                                ),
-                            },
-                        }
+                    replayed = _replayed_tool_call(tc)
+                    if replayed is None:
+                        continue
                     call_blocks.append(
                         "<tool_call>"
-                        + json.dumps(obj, ensure_ascii=False)
+                        + json.dumps(replayed, ensure_ascii=False)
                         + "</tool_call>"
                     )
                 except Exception:
@@ -251,6 +271,108 @@ def _format_messages_as_prompt(
         messages, model=model, tools=tools, tool_choice=tool_choice
     )
     return system_prompt + "\n\n" + prompt_text
+
+
+_CALL_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _assign_tool_call_ids(
+    calls: list[dict[str, str]], messages: list[dict[str, Any]] | None
+) -> list[Any]:
+    """Turn parsed calls into OpenAI tool calls with conversation-unique ids.
+
+    Hermes owns the ids. Claude's own id is kept when it is new; an id that
+    already appears in the history (Claude restarts ``call_1``/``g1`` across
+    turns) or earlier in the batch is re-keyed to ``<id>_r<n>``, the smallest
+    free suffix, so the alias stays readable in the ``<tool_result>`` Claude
+    gets back. Without this, the pre-send sanitizer drops the later call and
+    its result as duplicates, and the gateway's media auto-append maps the id
+    to the wrong tool. A missing id gets ``call_<n>``.
+    """
+
+    taken = _historical_tool_call_ids(messages or [])
+    assigned: list[Any] = []
+    for call in calls:
+        base = _CALL_ID_UNSAFE_RE.sub("_", str(call.get("id") or "")).strip("_")[:40]
+        if not base:
+            number = 1
+            while f"call_{number}" in taken:
+                number += 1
+            call_id = f"call_{number}"
+        elif base in taken:
+            suffix = 2
+            while f"{base}_r{suffix}" in taken:
+                suffix += 1
+            call_id = f"{base}_r{suffix}"
+            _LOG.warning(
+                "Claude Code reused tool call id %s; re-keyed to %s (tool=%s)",
+                base,
+                call_id,
+                call.get("name"),
+            )
+        else:
+            call_id = base
+        taken.add(call_id)
+        assigned.append(
+            _build_openai_tool_call(
+                call_id=call_id, name=call["name"], arguments=call["arguments"]
+            )
+        )
+    return assigned
+
+
+def _completion_parts(
+    response_text: str,
+    messages: list[dict[str, Any]] | None,
+    *,
+    tools_offered: bool,
+) -> tuple[list[Any], str, str]:
+    """``(tool_calls, content, finish_reason)`` for one Claude reply.
+
+    A reply whose tool calls still fail to parse (the session's in-session
+    repairs are exhausted) runs nothing. It reports ``finish_reason`` "length"
+    when a call was cut off (Hermes's continuation path), otherwise
+    "tool_calls" with no calls, which Hermes's dropped-tool-call recovery
+    re-prompts. Never raw markup in the content.
+
+    Without tools there is no protocol: the whole reply is the answer (a
+    title or summary may quote tool-call markup).
+    """
+
+    if not tools_offered:
+        return [], (response_text or "").strip(), "stop"
+    reply = _parse_claude_reply(response_text or "")
+    if reply.broken:
+        return [], reply.cleaned, "length" if reply.unterminated else "tool_calls"
+    tool_calls = _assign_tool_call_ids(reply.executable_calls, messages)
+    return tool_calls, reply.cleaned, "tool_calls" if tool_calls else "stop"
+
+
+def _current_time_label() -> str | None:
+    """Local wall-clock time for the stdin prompt, e.g.
+    ``Fri 2026-09-18 11:25 CEST (UTC+02:00)``.
+
+    Uses Hermes's configured timezone. Sent with each new user turn, never in
+    the system prompt (its digest is part of the durable session identity).
+    """
+
+    try:
+        try:
+            from hermes_time import now as _hermes_now
+
+            current = _hermes_now()
+        except Exception:
+            current = datetime.now().astimezone()
+        offset = current.strftime("%z")
+        if len(offset) == 5:
+            offset = f"{offset[:3]}:{offset[3:]}"
+        zone = current.tzname() or ""
+        label = current.strftime("%a %Y-%m-%d %H:%M")
+        if zone and zone != f"UTC{offset}":
+            label += f" {zone}"
+        return f"{label} (UTC{offset})" if offset else label
+    except Exception:
+        return None
 
 
 class _ClaudeCodeChatCompletions:
@@ -376,9 +498,15 @@ class ClaudeCodeClient:
             # A tool loop follows only when tools were offered; keep the
             # process warm for it whether or not the state is durable.
             keepalive=bool(tools),
+            # tools_digest is never empty (it hashes the format version), so
+            # tool presence travels explicitly.
+            has_tools=bool(tools),
         )
         if prompt_images:
             run_kwargs["prompt_images"] = prompt_images
+        now_label = _current_time_label()
+        if now_label:
+            run_kwargs["now_label"] = now_label
 
         if stream:
             return self._stream_chat_completion(
@@ -389,7 +517,9 @@ class ClaudeCodeClient:
 
         response_text, reasoning_text = self._claude_session.run(prompt_text, **run_kwargs)
 
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        tool_calls, cleaned_text, finish_reason = _completion_parts(
+            response_text, messages, tools_offered=bool(tools)
+        )
 
         usage = _completion_usage(self._claude_session.last_usage)
         assistant_message = SimpleNamespace(
@@ -399,7 +529,6 @@ class ClaudeCodeClient:
             reasoning_content=reasoning_text or None,
             reasoning_details=None,
         )
-        finish_reason = "tool_calls" if tool_calls else "stop"
         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
         completion = SimpleNamespace(
             choices=[choice],
@@ -496,7 +625,11 @@ class ClaudeCodeClient:
             if error_box.get("exc"):
                 raise error_box["exc"]
 
-            tool_calls, cleaned = _extract_tool_calls_from_text(final_text or "")
+            tool_calls, cleaned, finish = _completion_parts(
+                final_text,
+                run_kwargs.get("messages"),
+                tools_offered=bool(run_kwargs.get("has_tools")),
+            )
             already = "".join(emitted_text)
             # Safety net: emit any cleaned remainder the session did not stream.
             if cleaned and cleaned != already and cleaned.startswith(already):
@@ -504,7 +637,6 @@ class ClaudeCodeClient:
             # Reasoning reaches the consumer exactly once: live, or here.
             late_reasoning = None if streamed_reasoning else (final_reasoning or None)
 
-            finish = "tool_calls" if tool_calls else "stop"
             if tool_calls:
                 deltas = []
                 for index, tc in enumerate(tool_calls):

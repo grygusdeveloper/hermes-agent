@@ -68,27 +68,42 @@ def test_tool_result_images_are_forwarded():
             },
         ]
     )
-    assert "Tool Result (name=browser_screenshot, tool_call_id=call_1)" in prompt
-    assert "[Image #1]" in prompt
+    assert '<tool_result id="call_1" name="browser_screenshot">\ncaptured\n[Image #1]' in prompt
     assert len(images) == 1
 
 
-def test_oversized_and_unsupported_images_become_notes():
-    huge = "data:image/png;base64," + "A" * (7 * 1024 * 1024)
+def test_large_images_pass_through_for_the_cli_to_resize():
+    """Claude Code resizes base64 image blocks itself; a 7 MB screenshot used
+    to be replaced by a note and never reached Claude."""
+
+    large = "A" * (7 * 1024 * 1024)
     _sys, prompt, images = _build_claude_code_request(
         [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": huge}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + large}},
                     {"type": "image_url", "image_url": {"url": "data:image/tiff;base64,AAAA"}},
+                    {"type": "input_audio", "input_audio": {"data": "UklG"}},
                 ],
             }
         ]
     )
-    assert images == []
-    assert "larger than 5 MB" in prompt
+    assert len(images) == 1 and images[0]["source"]["data"] == large
+    assert "[Image #1]" in prompt
     assert "unsupported type image/tiff" in prompt
+    assert "[non-text part omitted: type=input_audio]" in prompt
+
+
+def test_absurd_image_payload_is_still_a_note():
+    from agent.claude_code_session import _MAX_IMAGE_BASE64_CHARS
+
+    huge = "data:image/png;base64," + "A" * (_MAX_IMAGE_BASE64_CHARS + 4)
+    _sys, prompt, images = _build_claude_code_request(
+        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": huge}}]}]
+    )
+    assert images == []
+    assert "larger than 32 MB" in prompt
 
 
 def test_user_content_keeps_only_most_recent_images():
@@ -325,7 +340,7 @@ def test_warm_process_serves_the_tool_loop_without_respawning(fake_cli):
     assert len(spawns) == 1
     assert "--system-prompt-file" in spawns[0]["argv"]
     assert turns[0]["content"] == "FULL PROMPT"
-    assert "Tool Result (name=terminal, tool_call_id=c1)" in turns[1]["content"]
+    assert '<tool_result id="c1" name="terminal">\nok\n</tool_result>' in turns[1]["content"]
     assert "".join(chunks) == "Warm reply."
     # total_cost_usd is cumulative per process; each turn reports its share.
     assert session.last_usage["total_cost_usd"] == pytest.approx(0.01)
@@ -388,7 +403,7 @@ def test_idle_warm_process_expires(fake_cli, monkeypatch):
     assert warm.process.poll() is not None
 
 
-def test_gate_commits_early_without_tools_but_defers_banners():
+def test_gate_commits_early_without_tools_even_for_limit_wording():
     out = []
     gate = _StreamGate(out.append, had_tools=False)
     answer = "Sure — here is a short poem about the sea and the patient light of morning. " * 2
@@ -396,11 +411,13 @@ def test_gate_commits_early_without_tools_but_defers_banners():
         gate.feed(answer[i : i + 5])
     assert gate.committed and out
 
-    banner_out = []
-    banner = _StreamGate(banner_out.append, had_tools=False)
-    notice = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage. " * 2
-    banner.feed(notice)
-    assert not banner.committed and banner_out == []
+    # Live text deltas are model output; CLI banners never arrive this way, so
+    # an answer *about* rate limits streams like any other.
+    limit_out = []
+    limits = _StreamGate(limit_out.append, had_tools=False)
+    about = "HTTP 429 means Too Many Requests: the server is rate limiting you. " * 2
+    limits.feed(about)
+    assert limits.committed and limit_out
 
 
 def test_committed_stream_is_accepted_even_if_it_mentions_limits(monkeypatch):
