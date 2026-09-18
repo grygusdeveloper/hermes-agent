@@ -938,3 +938,12 @@ def test_rekeyed_ids_stay_within_forty_characters():
     ids = [tc.id for tc in tool_calls]
     assert ids == ["x" * 37 + "_r2", "x" * 37 + "_r3"]
     assert all(len(call_id) <= 40 for call_id in ids)
+
+
+def test_wrapped_base64_in_data_urls_is_joined():
+    wrapped = "data:image/png;base64," + PNG_B64[:8] + "\n " + PNG_B64[8:] + "\r\n"
+    _system, prompt, images = _build_claude_code_request(
+        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": wrapped}}]}]
+    )
+    assert "[Image #1]" in prompt
+    assert images[0]["source"]["data"] == PNG_B64
