@@ -545,6 +545,60 @@ _INCOMPLETE_PREAMBLE_STARTERS = (
     "now wiring ",
 )
 
+# First-person promises are unambiguous. Gerund openers ("Running …",
+# "Checking …") are also how real one-line status answers begin ("Running
+# fine — nothing pending."), so a gerund clause only counts as a preamble when
+# it clearly names work about to happen: an object follows the gerund, or the
+# clause ends in "now"/an ellipsis without a benign state word.
+_FIRST_PERSON_PREAMBLE_STARTERS = (
+    "i'll ",
+    "i will ",
+    "let me ",
+    "i'm going to ",
+    "i am going to ",
+    "i'm about to ",
+)
+_PREAMBLE_OBJECT_WORDS = frozenset(
+    {
+        "the", "a", "an", "it", "its", "this", "that", "these", "those",
+        "them", "your", "my", "our", "their", "all", "each", "every", "both",
+        "another", "some", "any", "one", "everything", "up", "into",
+        "through", "over", "out", "back",
+    }
+)
+_PREAMBLE_BENIGN_WORDS = frozenset(
+    {
+        "fine", "well", "smoothly", "great", "good", "ok", "okay", "normally",
+        "correctly", "as", "expected", "perfectly", "fast", "slowly", "now",
+    }
+)
+
+
+def _clause_is_preamble(clause: str) -> bool:
+    text = clause.lstrip("#>*- \t").strip()
+    if not text.startswith(_INCOMPLETE_PREAMBLE_STARTERS):
+        return False
+    if text.startswith(_FIRST_PERSON_PREAMBLE_STARTERS):
+        return True
+    starter = max(
+        (s for s in _INCOMPLETE_PREAMBLE_STARTERS if text.startswith(s)),
+        key=len,
+    )
+    rest = text[len(starter):].strip()
+    next_word = rest.split(None, 1)[0] if rest else ""
+    bare_next = next_word.strip(".,!?;:()[]")
+    if bare_next in _PREAMBLE_OBJECT_WORDS:
+        return True
+    if next_word[:1] in {"`", '"', "'", "/", "~", "."}:
+        return True
+    stripped = text.rstrip(" .!")
+    if (
+        stripped.endswith((" now", "…", "..."))
+        or text.rstrip().endswith(("…", "..."))
+    ) and bare_next not in _PREAMBLE_BENIGN_WORDS:
+        return True
+    return False
+
 _PROGRESS_CONTINUATION_PROMPT = """\
 Continue the previous request now. Your last reply was only a progress/status
 statement, not a completed answer. Do not repeat the plan. If information or
@@ -586,11 +640,7 @@ def _is_incomplete_preamble_response(
     # prefixes the promise with a diagnosis such as "The job never launched —
     # starting it now." That is still an unfinished action, not a final answer.
     clauses = re.split(r"(?:\n+|(?<=[.!?])\s+|\s+[—–:;]\s+)", lower)
-    starts = any(
-        clause.lstrip("#>*- \t").startswith(_INCOMPLETE_PREAMBLE_STARTERS)
-        for clause in clauses
-        if clause.strip()
-    )
+    starts = any(_clause_is_preamble(clause) for clause in clauses if clause.strip())
     if not starts:
         return False
     # Short planning sentence(s) without a substantial body.

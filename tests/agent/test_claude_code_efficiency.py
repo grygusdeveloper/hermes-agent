@@ -121,3 +121,28 @@ def test_backend_system_prompt_replaces_coding_audit_persona():
     assert "not\na compliance form" in _HERMES_BACKEND_SYSTEM_PROMPT
     assert "code-review template" in _HERMES_BACKEND_SYSTEM_PROMPT
     assert "Hermes lists the tools available" in _HERMES_BACKEND_SYSTEM_PROMPT
+
+
+def test_preamble_detector_ignores_short_status_answers():
+    from agent.claude_code_session import _is_incomplete_preamble_response
+
+    for answer in (
+        "Running fine — nothing pending.",
+        "Looking good!",
+        "Checking in: all set.",
+        "Working as expected now.",
+        "Running smoothly now.",
+    ):
+        assert not _is_incomplete_preamble_response(
+            answer, had_tools=True, has_tool_calls=False
+        ), answer
+
+    for preamble in (
+        "Checking the logs.",
+        "Running tests now.",
+        "Looking into it.",
+        "Updating `config.yaml`...",
+    ):
+        assert _is_incomplete_preamble_response(
+            preamble, had_tools=True, has_tool_calls=False
+        ), preamble
