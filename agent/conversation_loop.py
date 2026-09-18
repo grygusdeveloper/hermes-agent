@@ -163,6 +163,11 @@ def _sync_provider_context_window(agent, usage) -> None:
     ``update_from_response`` (``update_model`` resets calibration).
     """
 
+    # Only the bridge's own usage object is trusted: an OpenAI-compatible
+    # SDK usage model keeps unknown response fields as attributes, and
+    # another provider's ``context_window`` extra must not resize Hermes.
+    if not _is_claude_code_agent(agent):
+        return
     window = getattr(usage, "context_window", None)
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         return
@@ -5028,6 +5033,9 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                        _remember_primary_failure(
+                            agent, _retry, f"Claude Code failed: {agent._summarize_api_error(api_error)}"
+                        )
                         if agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -5079,6 +5087,11 @@ def run_conversation(
                     agent._buffer_status(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
+                    )
+                    # A Claude Code login that expired must stay visible if
+                    # the fallback fails too (``claude /login`` fixes it).
+                    _remember_primary_failure(
+                        agent, _retry, f"Claude Code failed: {agent._summarize_api_error(api_error)}"
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(

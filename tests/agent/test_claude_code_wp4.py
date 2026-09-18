@@ -70,6 +70,12 @@ ERROR_CLI = textwrap.dedent(
     if os.environ.get("WP4_REJECT_THINKING") and "--thinking" in argv:
         sys.stderr.write("error: unknown option '--thinking'\\n")
         sys.exit(1)
+    # Commander names only the first unknown option it meets.
+    rejected = [f for f in os.environ.get("WP4_REJECT_FLAGS", "").split(",") if f]
+    for flag in argv:
+        if flag in rejected:
+            sys.stderr.write("error: unknown option '" + flag + "'\\n")
+            sys.exit(1)
 
     def arg(flag):
         return argv[argv.index(flag) + 1] if flag in argv else None
@@ -86,7 +92,8 @@ ERROR_CLI = textwrap.dedent(
         return replies[n] if n < len(replies) else {}
 
     def out(obj):
-        sys.stdout.write(json.dumps(obj) + "\\n")
+        # Like Claude Code (Node), non-ASCII is written as is.
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\\n")
         sys.stdout.flush()
 
     sid = arg("--resume") or arg("--session-id")
@@ -107,8 +114,11 @@ ERROR_CLI = textwrap.dedent(
             continue
         text = reply.get("text", "ok")
         out({"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": sid,
-             "message": {"model": "claude-opus-5",
+             "message": {"model": reply.get("model", "claude-opus-5"),
                          "content": [{"type": "text", "text": text}]}})
+        if reply.get("crash"):
+            sys.stderr.write("fatal: the CLI crashed\\n")
+            sys.exit(1)
         result = {"type": "result", "subtype": "success", "is_error": False,
                   "result": text, "session_id": sid,
                   "usage": {"input_tokens": 10, "output_tokens": 2}}
@@ -150,7 +160,7 @@ def error_cli(tmp_path, monkeypatch):
 
 
 def _env4():
-    keys = ("PATH", "WP4_LOG", "WP4_SCRIPT", "WP4_REJECT_THINKING")
+    keys = ("PATH", "WP4_LOG", "WP4_SCRIPT", "WP4_REJECT_THINKING", "WP4_REJECT_FLAGS")
     return {key: os.environ[key] for key in keys if key in os.environ}
 
 
@@ -856,3 +866,206 @@ def test_keepalive_chunks_are_not_a_first_token():
     assert _is_keepalive_chunk(chunk(reasoning_content="hmm", reasoning="hmm")) is False
     assert _is_keepalive_chunk(chunk(finish_reason="stop")) is False
     assert _is_keepalive_chunk(SimpleNamespace(choices=[], usage=SimpleNamespace())) is False
+
+
+# ---------------------------------------------------------------------------
+# WP4 review regressions
+# ---------------------------------------------------------------------------
+
+
+def test_cli_rejecting_both_optional_flags_still_answers(error_cli, monkeypatch):
+    """Regression: only one respawn was allowed, so a CLI that knows neither
+    --thinking nor --thinking-display failed the request after two spawns."""
+
+    monkeypatch.setattr(ccs, "_thinking_mode_supported", True)
+    monkeypatch.setattr(ccs, "_thinking_display_supported", True)
+    monkeypatch.setenv("WP4_REJECT_FLAGS", "--thinking,--thinking-display")
+    response, _reasoning = _run4(ClaudeCodeSession(), error_cli, thinking="disabled")
+    assert response == "ok"
+    spawns = error_cli.spawns()
+    assert len(spawns) == 3
+    assert "--thinking" not in spawns[2] and "--thinking-display" not in spawns[2]
+
+
+def test_cli_for_another_platform_is_a_launch_error(tmp_path, monkeypatch):
+    """Regression: ENOEXEC (a corrupt download, another platform's binary)
+    escaped as a raw OSError, which classifies as a transient transport
+    failure and was retried."""
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    garbage = tmp_path / "claude"
+    garbage.write_bytes(b"\x7fELF\x00 not for this machine")
+    garbage.chmod(0o755)
+    with pytest.raises(ClaudeCodeLaunchError) as info:
+        ClaudeCodeSession().run(
+            "P", messages=[{"role": "user", "content": "hi"}], model="opus",
+            command=str(garbage), cwd=str(tmp_path), env={}, timeout_seconds=5,
+        )
+    assert "Exec format error" in str(info.value)
+    classified = classify_api_error(info.value, provider="claude-code", model="opus")
+    assert classified.reason == FailoverReason.provider_unavailable
+
+
+def test_transient_popen_failure_stays_retryable(tmp_path, monkeypatch):
+    import errno
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    def busy(*_args, **_kwargs):
+        raise OSError(errno.ETXTBSY, "Text file busy", "/usr/local/bin/claude")
+
+    monkeypatch.setattr(ccs.subprocess, "Popen", busy)
+    with pytest.raises(OSError) as info:
+        ClaudeCodeSession().run(
+            "P", messages=[{"role": "user", "content": "hi"}], model="opus",
+            command="/usr/local/bin/claude", cwd=str(tmp_path), env={}, timeout_seconds=5,
+        )
+    assert not isinstance(info.value, ClaudeCodeLaunchError)
+
+
+def test_crashed_turn_quoting_a_limit_banner_is_not_a_limit(error_cli):
+    """Regression: a turn that died after the model quoted Claude Code's limit
+    wording was read as a subscription limit (from the model's own text in
+    stdout) and blocked the model for ten minutes."""
+
+    error_cli.script(
+        {"text": "That notice means: You've hit your limit · resets 3pm (UTC).", "crash": True}
+    )
+    with pytest.raises(RuntimeError) as info:
+        _run4(ClaudeCodeSession(), error_cli)
+    assert not isinstance(info.value, ClaudeCodeAPIError)
+    assert "exit 1" in str(info.value) and "the CLI crashed" in str(info.value)
+    assert ccs._usage_limit_block("opus") is None
+    assert len(error_cli.spawns()) == 1
+    # The model's words are not part of the error Hermes classifies (and
+    # shows): an ordinary crash, retried, not a "Claude usage limit".
+    assert "That notice means" not in str(info.value)
+    classified = classify_api_error(info.value, provider="claude-code", model="opus")
+    assert classified.reason == FailoverReason.unknown and classified.retryable
+
+
+def test_crash_after_a_cli_banner_is_still_a_limit_notice():
+    banner = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
+    events = [
+        {"type": "system", "subtype": "init", "session_id": SID},
+        {"type": "assistant", "session_id": SID,
+         "message": {"model": "<synthetic>", "content": [{"type": "text", "text": banner}]}},
+    ]
+    stdout = "\n".join(json.dumps(event, ensure_ascii=False) for event in events)
+    with pytest.raises(ClaudeCodeSoftLimitNotice) as info:
+        ClaudeCodeSession()._raise_process_failure(1, stdout, "", None)
+    assert info.value.detail == banner
+    # The same words from the model are not a notice.
+    events[1]["message"]["model"] = "claude-opus-5"
+    stdout = "\n".join(json.dumps(event, ensure_ascii=False) for event in events)
+    with pytest.raises(RuntimeError) as info:
+        ClaudeCodeSession()._raise_process_failure(1, stdout, "", None)
+    assert not isinstance(info.value, ClaudeCodeSoftLimitNotice)
+
+
+def test_context_window_is_the_serving_models_not_the_largest_reader():
+    """modelUsage is cumulative over the CLI session, so another model (a
+    refusal fallback, an earlier turn) can hold the most input."""
+
+    events = [
+        {"type": "system", "subtype": "init", "session_id": SID},
+        {"type": "assistant", "session_id": SID,
+         "message": {"model": "claude-opus-5", "content": [{"type": "text", "text": "ok"}]}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "ok",
+         "session_id": SID, "usage": {"input_tokens": 1},
+         "modelUsage": {
+             "claude-sonnet-5": {"inputTokens": 900_000, "contextWindow": 200_000,
+                                 "maxOutputTokens": 64_000},
+             "claude-opus-5": {"inputTokens": 5, "contextWindow": 1_000_000,
+                               "maxOutputTokens": 128_000},
+         }},
+    ]
+    usage = _parse_stream_json_usage("\n".join(json.dumps(event) for event in events))
+    assert (usage["context_window"], usage["max_output_tokens"]) == (1_000_000, 128_000)
+
+
+def test_context_window_sync_ignores_other_providers(monkeypatch):
+    """An OpenAI-compatible SDK usage object keeps unknown response fields; a
+    ``context_window`` extra from another provider must not resize Hermes."""
+
+    from agent import conversation_loop
+
+    monkeypatch.setattr(conversation_loop, "save_context_length", lambda *args: None)
+    compressor = _compressor(provider="zai")
+    agent = _loop_agent(compressor, provider="zai", model="glm-5.3", base_url="https://api.z.ai")
+    conversation_loop._sync_provider_context_window(agent, SimpleNamespace(context_window=8_192))
+    assert compressor.context_length == 1_000_000
+
+
+class _AuthError(Exception):
+    status_code = 401
+
+    def __init__(self):
+        super().__init__("Error code: 401 - OAuth token has expired")
+        self.body = {"error": {"type": "authentication_error",
+                               "message": "OAuth token has expired"}}
+        self.response = SimpleNamespace(headers={})
+
+
+def test_a_failing_fallback_does_not_hide_an_expired_claude_login(monkeypatch):
+    """Regression: after an auth failover the fallback's own error was all the
+    user saw; the Claude Code login problem vanished."""
+
+    agent = _claude_agent(fallback_model=[{"provider": "zai", "model": "glm-5.3"}])
+    client = agent.client = MagicMock()
+    client.chat.completions.create.side_effect = ClaudeCodeAPIError(
+        "Claude Code result rejected: OAuth token has expired · Please run /login",
+        status_code=401,
+        body=ccs._api_error_body(401, None, "OAuth token has expired · Please run /login"),
+    )
+    agent._cached_system_prompt = "You are helpful."
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    switched = []
+
+    def fake_fallback(reason=None):
+        if switched:
+            return False
+        switched.append(reason)
+        agent.provider, agent.model = "zai", "glm-5.3"
+        client.chat.completions.create.side_effect = _BillingError()
+        return True
+
+    monkeypatch.setattr(agent, "_try_activate_fallback", fake_fallback)
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+    finally:
+        agent.close()
+    assert switched == [FailoverReason.auth]
+    final = result["final_response"]
+    assert final.startswith("Claude Code failed: ")
+    assert "Please run /login" in final
+    assert "Fallback zai/glm-5.3 failed too: " in final
+
+
+def test_hard_limit_on_a_warm_streaming_turn(error_cli, monkeypatch):
+    """The live path: nothing of the banner reaches the user, the process is
+    not parked, and the error is the typed limit."""
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "30")
+    resets = int(time.time()) + 3600
+    error_cli.script(
+        {
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour",
+                                "resetsAt": resets, "overageStatus": "rejected"},
+            "error_status": 429,
+            "result": "You've hit your session limit · resets 3pm (UTC)",
+        },
+    )
+    chunks = []
+    session = ClaudeCodeSession()
+    with pytest.raises(ClaudeCodeUsageLimitError):
+        _run4(session, error_cli, keepalive=True, on_text_chunk=chunks.append)
+    assert chunks == []
+    assert session._warm is None
+    assert len(error_cli.spawns()) == 1

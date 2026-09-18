@@ -80,6 +80,7 @@ Design invariants
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import fcntl
 import hashlib
 import json
@@ -138,6 +139,9 @@ _thinking_display_supported = True
 # process if a CLI rejects it.
 _THINKING_MODES = frozenset({"enabled", "adaptive", "disabled"})
 _thinking_mode_supported = True
+# Optional flags a CLI may reject before reading the request (each is then
+# turned off for the process and the request respawned without it).
+_OPTIONAL_FLAG_RESPAWNS = 2
 # A graceful interrupt (stream-json ``control_request`` "interrupt") ends the
 # turn and keeps the warm process; the CLI answers within ~100 ms. If the turn
 # has not ended after this grace, the process group is killed.
@@ -2228,6 +2232,31 @@ class ClaudeCodeLaunchError(RuntimeError):
     never retries it. Deliberately not an ``OSError``: the error classifier
     treats those as transient transport failures.
     """
+
+
+# ``Popen`` failures that repeat until the installation or configuration is
+# fixed: a missing or non-executable CLI, a binary for another platform or a
+# corrupt download (ENOEXEC), a bad path or working directory. Resource
+# errors (EAGAIN, ENOMEM, EMFILE) and ETXTBSY (the auto-updater replacing the
+# binary) are transient and stay retryable.
+_LAUNCH_ERRNOS = frozenset(
+    {
+        errno.ENOENT,
+        errno.ENOTDIR,
+        errno.EACCES,
+        errno.EPERM,
+        errno.ENOEXEC,
+        errno.ELOOP,
+        errno.ENAMETOOLONG,
+        errno.EISDIR,
+    }
+)
+
+
+def _is_launch_failure(exc: OSError) -> bool:
+    return isinstance(
+        exc, (FileNotFoundError, NotADirectoryError, PermissionError, IsADirectoryError)
+    ) or exc.errno in _LAUNCH_ERRNOS
 
 
 # Anthropic error types by HTTP status, for results that name no type.
@@ -4515,7 +4544,10 @@ class ClaudeCodeSession:
                 "Claude Code stateless session is no longer warm; cannot resume it"
             )
 
-        for spawn in range(2):
+        # One spawn per optional flag a CLI may reject (``--thinking-display``,
+        # ``--thinking``): commander names only the first unknown option, so
+        # an older CLI that knows neither needs a respawn for each.
+        for spawn in range(_OPTIONAL_FLAG_RESPAWNS + 1):
             try:
                 return self._spawn_turn(
                     claude_bin,
@@ -4537,7 +4569,7 @@ class ClaudeCodeSession:
             except _CliFlagRejected:
                 # Rejected before it read the request: nothing ran or was
                 # persisted. The flag is now off; spawn once more without it.
-                if spawn:
+                if spawn >= _OPTIONAL_FLAG_RESPAWNS:
                     raise
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -4592,7 +4624,11 @@ class ClaudeCodeSession:
                     env=process_env,
                     start_new_session=True,
                 )
-            except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
+            except OSError as exc:
+                if not _is_launch_failure(exc):
+                    # Transient (fork limits, a binary being replaced by the
+                    # auto-updater): let the caller retry.
+                    raise
                 reason = exc.strerror or type(exc).__name__
                 if getattr(exc, "filename", None) == work_dir:
                     raise ClaudeCodeLaunchError(
@@ -4955,11 +4991,16 @@ class ClaudeCodeSession:
         stderr: str,
         session_id: str | None,
     ) -> None:
+        # Only what the CLI wrote itself: the model's reply in stdout (which
+        # may quote a limit banner, an expired-session message, anything)
+        # must not decide how the failure is handled, nor leak into the error
+        # text Hermes classifies and shows.
+        signals, notice = _cli_written_output(stdout)
         detail_parts = []
         if stderr.strip():
             detail_parts.append(stderr.strip()[-1000:])
-        if stdout.strip():
-            detail_parts.append(stdout.strip()[-1000:])
+        if signals.strip():
+            detail_parts.append(signals.strip()[-1000:])
         detail = "\n".join(detail_parts) if detail_parts else f"exit {returncode}"
         # Argument errors are on stderr only: stdout holds the turn's events,
         # and a reply that merely discusses these flags must not switch them
@@ -5005,10 +5046,15 @@ class ClaudeCodeSession:
         # Rate-limit / spend-limit notices arrive as exit 1 with
         # is_error:true and a 429 / rate_limit signal.  These are
         # transient — convert to a retryable exception so the soft-limit
-        # retry handler can re-attempt instead of killing the turn.
+        # retry handler can re-attempt instead of killing the turn. (A model
+        # reply that quotes a limit banner is not in ``detail``: it must not
+        # read as one, let alone block the model until a "reset".)
         if _is_soft_limit_detail(detail):
             raise ClaudeCodeSoftLimitNotice(
-                detail, status_code=status, body=body, detail=text or detail[-300:]
+                detail,
+                status_code=status,
+                body=body,
+                detail=text or notice or detail[-300:],
             )
         if status is not None:
             raise ClaudeCodeAPIError(
@@ -5273,6 +5319,49 @@ def _stream_events(stdout: str, kind: str) -> list[dict[str, Any]]:
     return found
 
 
+def _cli_written_output(stdout: str) -> tuple[str, str]:
+    """``(lines, notice)``: what the CLI itself wrote in a turn's stdout.
+
+    ``lines`` keeps non-JSON lines and every event except the model's own
+    output (streamed deltas, assistant messages the model wrote, a
+    successful result, echoed user turns); ``notice`` is the text of the
+    CLI's last ``<synthetic>`` assistant message (its limit banners).
+    """
+
+    kept: list[str] = []
+    notices: list[str] = []
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line) if line.startswith("{") else None
+        except json.JSONDecodeError:
+            event = None
+        if not isinstance(event, dict):
+            kept.append(line)
+            continue
+        kind = event.get("type")
+        if kind in {"stream_event", "user"}:
+            continue
+        if kind == "result" and event.get("is_error") is False:
+            # A successful result's ``result`` is the model's reply.
+            continue
+        if kind == "assistant":
+            if not _assistant_is_synthetic(event):
+                continue
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            text = "".join(
+                str(block.get("text") or "")
+                for block in message.get("content") or []
+                if isinstance(block, dict) and block.get("type") == "text"
+            ).strip()
+            if text:
+                notices.append(text)
+        kept.append(line)
+    return "\n".join(kept), (notices[-1] if notices else "")
+
+
 def _last_stream_event(stdout: str, kind: str) -> dict[str, Any] | None:
     found = _stream_events(stdout, kind)
     return found[-1] if found else None
@@ -5359,6 +5448,7 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
     """
 
     result: dict[str, Any] | None = None
+    served_by: str | None = None
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
         if not line.startswith("{"):
@@ -5367,8 +5457,16 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict) and event.get("type") == "result":
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result":
             result = event
+        elif event.get("type") == "assistant" and not _assistant_is_synthetic(event):
+            # The model that served the turn (a CLI fallback model included).
+            message = event.get("message")
+            model = message.get("model") if isinstance(message, dict) else None
+            if isinstance(model, str) and model.strip():
+                served_by = model.strip()
     if not result or result.get("is_error") is not False:
         return {}
     raw = result.get("usage")
@@ -5386,7 +5484,9 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
     prompt_tokens = input_tokens + cache_write_tokens + cached_tokens
     service_tier = raw.get("service_tier")
     total_cost = result.get("total_cost_usd")
-    context_window, max_output_tokens = _model_usage_limits(result.get("modelUsage"))
+    context_window, max_output_tokens = _model_usage_limits(
+        result.get("modelUsage"), served_by=served_by
+    )
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -5412,11 +5512,16 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
     }
 
 
-def _model_usage_limits(model_usage: Any) -> tuple[int | None, int | None]:
+def _model_usage_limits(
+    model_usage: Any, *, served_by: str | None = None
+) -> tuple[int | None, int | None]:
     """``(contextWindow, maxOutputTokens)`` of the model that served the turn.
 
-    ``modelUsage`` is keyed by full model id (``claude-haiku-4-5-20251001``);
-    the entry that read the most input is the conversation's model (any
+    ``modelUsage`` is keyed by full model id (``claude-haiku-4-5-20251001``)
+    and is cumulative over the CLI session (a resumed session restores it),
+    so it can hold another model that once served more. The entry of the
+    model the turn's assistant messages name (``served_by``) wins; without
+    one, the entry that read the most input is the conversation's model (any
     side request the CLI makes is small).
     """
 
@@ -5426,6 +5531,9 @@ def _model_usage_limits(model_usage: Any) -> tuple[int | None, int | None]:
     def positive(value: Any) -> int | None:
         return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
+    served = model_usage.get(served_by) if served_by else None
+    if isinstance(served, dict) and positive(served.get("contextWindow")) is not None:
+        return positive(served.get("contextWindow")), positive(served.get("maxOutputTokens"))
     best: tuple[int, int | None, int | None] | None = None
     for entry in model_usage.values():
         if not isinstance(entry, dict) or positive(entry.get("contextWindow")) is None:
