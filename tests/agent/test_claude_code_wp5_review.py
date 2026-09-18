@@ -388,3 +388,32 @@ def test_reset_does_not_wait_forever_behind_a_stuck_request(fake_cli, monkeypatc
     assert session.reset_conversation(wait=1.0)
     assert not ccs._state_path("root|main").exists()
     session.shutdown()
+
+
+def test_repeated_fallback_notice_is_not_shown_on_every_call(fake_cli, monkeypatch):
+    refusal = {
+        "system": [
+            {
+                "subtype": "model_refusal_fallback",
+                "originalModel": "claude-opus-5",
+                "fallbackModel": "claude-opus-4-8",
+                "scope": "session",
+                "content": "Opus 5's safeguards flagged this message. Switched to Opus 4.8.",
+            }
+        ],
+        "model": "claude-opus-4-8",
+    }
+    # A flagged conversation: every call of the tool loop resumes on Opus 5
+    # (a session-wide fallback is never parked) and falls back again.
+    fake_cli.script(refusal, refusal, refusal)
+    session = ClaudeCodeSession()
+    _run(session, fake_cli, _history(1))
+    assert len(session.take_notices()) == 1
+    _run(session, fake_cli, _history(2))
+    assert session.take_notices() == []
+    # Much later it is news again.
+    real_time = time.time
+    monkeypatch.setattr(ccs.time, "time", lambda: real_time() + 3600)
+    _run(session, fake_cli, _history(3))
+    assert len(session.take_notices()) == 1
+    session.shutdown()

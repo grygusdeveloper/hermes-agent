@@ -2544,6 +2544,10 @@ _RATE_LIMIT_UPDATE_LOCK = threading.Lock()
 # window first cannot swallow it.
 _LIMIT_WARNING_UTILIZATION = 0.9
 _MAX_PENDING_NOTICES = 8
+# The same model fallback notice is shown at most this often per session: a
+# flagged conversation falls back again on every call of a tool loop (a
+# session-wide fallback is never kept warm).
+_NOTICE_REPEAT_SECONDS = 600.0
 
 
 def _rate_limit_path() -> Path:
@@ -3718,6 +3722,8 @@ class ClaudeCodeSession:
         # to be delivered with the next reply (see ``take_notices``).
         # (text, plan window keys; empty for other notices) in arrival order.
         self._pending_notices: list[tuple[str, tuple[tuple[str, float | None], ...]]] = []
+        # Other notices shown lately (text -> when), see _NOTICE_REPEAT_SECONDS.
+        self._shown_notices: dict[str, float] = {}
         self._notice_lock = threading.Lock()
         # Sum of every CLI turn's API-equivalent cost this session reported
         # (retried attempts included): callers diff it around a Hermes turn.
@@ -3771,7 +3777,8 @@ class ClaudeCodeSession:
 
         Only a caller that shows them to the user should take them: plan
         warnings count as announced from here on. A plan warning whose window
-        has reset meanwhile is dropped (its figures are over).
+        has reset meanwhile is dropped (its figures are over), and a fallback
+        notice shown in the last ``_NOTICE_REPEAT_SECONDS`` is not repeated.
         """
 
         with self._notice_lock:
@@ -3791,13 +3798,23 @@ class ClaudeCodeSession:
                 _LOG.debug("Could not record delivered Claude plan warnings", exc_info=True)
         shown: list[str] = []
         index = 0
-        for text, keys in pending:
-            if keys:
-                deliverable = verdicts[index]
-                index += 1
-                if not deliverable:
+        with self._notice_lock:
+            self._shown_notices = {
+                text: at
+                for text, at in self._shown_notices.items()
+                if now - at < _NOTICE_REPEAT_SECONDS
+            }
+            for text, keys in pending:
+                if keys:
+                    deliverable = verdicts[index]
+                    index += 1
+                    if not deliverable:
+                        continue
+                elif text in self._shown_notices:
                     continue
-            shown.append(text)
+                else:
+                    self._shown_notices[text] = now
+                shown.append(text)
         return shown
 
     def _add_notice(
