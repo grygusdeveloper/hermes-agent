@@ -13,7 +13,6 @@ from tests.agent.test_claude_code_wp3 import (  # noqa: F401 - fake_cli is a fix
     LONG,
     _interrupt_second_turn,
     _run,
-    _wait_for,
     fake_cli,
 )
 
