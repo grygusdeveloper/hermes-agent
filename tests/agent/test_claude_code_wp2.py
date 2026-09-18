@@ -755,3 +755,186 @@ def test_image_truncation_note_uses_session_numbers():
     content = _user_message_content("text", images, start_index=4)
     assert "Images #5-#6 are not re-sent" in content[1]["text"]
     assert content[2] == {"type": "text", "text": "Image #7:"}
+
+
+# ---------------------------------------------------------------------------
+# Review regressions: mentions vs calls, unfenced examples, stream contract
+# ---------------------------------------------------------------------------
+
+
+def _live_client(monkeypatch, replies):
+    """Like ``_scripted_client``; a ``(streamed, returned)`` pair streams one
+    text live and returns another, as when Claude Code continues a reply cut
+    off at the output limit and the result holds only the last message."""
+
+    client = ClaudeCodeClient(cwd="/tmp")
+    session = client._claude_session
+    seen: list[dict] = []
+    queue = list(replies)
+
+    def fake_execute(prompt, *, on_event=None, session_id=None, **kwargs):
+        seen.append({"prompt": prompt, "session_id": session_id, **kwargs})
+        item = queue.pop(0)
+        live, text = item if isinstance(item, tuple) else (item, item)
+        if on_event is not None:
+            for index in range(0, len(live), 7):
+                on_event("text", live[index : index + 7])
+        session._last_turn_checkpoint = UUID_B
+        return text, "", SID
+
+    monkeypatch.setattr(session, "_execute", fake_execute)
+    return client, seen
+
+
+MENTIONS = [
+    "Hermes parses <tool_call> blocks out of my reply and runs them.",
+    "Each call ends with </tool_call>, and Hermes answers with a <tool_result> block.",
+    "The opener is <tool_call> and the closer is </tool_call>; results come back tagged.",
+]
+
+
+@pytest.mark.parametrize("answer", MENTIONS)
+def test_unfenced_tag_mentions_are_answers_not_broken_calls(monkeypatch, keyed, answer):
+    """Talking about the protocol without backticks used to trigger two repair
+    turns and then cut the answer at the tag (finish "length")."""
+
+    client, seen = _live_client(monkeypatch, [answer] * 6)
+    messages = [{"role": "user", "content": "how do tool calls work here?"}]
+    response = client._create_chat_completion(model="opus", messages=messages, tools=TOOLS)
+    choice = response.choices[0]
+    assert len(seen) == 1
+    assert choice.finish_reason == "stop" and choice.message.tool_calls == []
+    assert choice.message.content == answer
+    content, calls, finish = _stream(client, model="opus", messages=messages, tools=TOOLS)
+    assert len(seen) == 2
+    assert (content, calls, finish) == (answer, [], ["stop"])
+
+
+def test_orphan_closer_needs_the_tail_of_a_json_object():
+    assert not _parse_claude_reply("The closer is </tool_call>, always.").broken
+    assert not _parse_claude_reply('Write "</tool_call>" after the object.').broken
+    for tail in ('ort body"}}\n</tool_call>', '"}}]}</tool_call>', 'x"]\n</tool_call>\nmore'):
+        reply = _parse_claude_reply(tail)
+        assert reply.unterminated and reply.cleaned == "" and reply.failures[0].index == 0
+    # A mention before a real call: the call still runs, the prose is kept.
+    reply = _parse_claude_reply("Closing with </tool_call> now.\n" + _call())
+    assert len(reply.executable_calls) == 1 and reply.cleaned == "Closing with </tool_call> now."
+
+
+def test_cut_off_right_after_the_opener_is_still_a_cut_off_call():
+    reply = _parse_claude_reply("Writing the file.\n<tool_call>\n")
+    assert reply.unterminated and reply.cleaned == "Writing the file."
+
+
+FENCED_ELSEWHERE = [
+    # Fence nested in a list item (indented more than three spaces).
+    "Steps:\n1. Emit the block:\n     ```\n     " + _call(command="rm -rf /tmp/demo") + "\n     ```\n2. Done.",
+    # Fence inside a block quote.
+    "> ```\n> " + _call(command="rm -rf /tmp/demo") + "\n> ```\n\nThat is the shape.",
+    # Tab-indented fence.
+    "Shape:\n\t```json\n\t" + _call(command="rm -rf /tmp/demo") + "\n\t```",
+]
+
+
+@pytest.mark.parametrize("answer", FENCED_ELSEWHERE)
+def test_fences_in_lists_and_quotes_never_run(monkeypatch, keyed, answer):
+    client, _seen = _live_client(monkeypatch, [answer, answer])
+    messages = [{"role": "user", "content": "explain"}]
+    response = client._create_chat_completion(model="opus", messages=messages, tools=TOOLS)
+    choice = response.choices[0]
+    assert choice.message.tool_calls == [] and choice.finish_reason == "stop"
+    assert choice.message.content == answer.strip()
+    content, calls, _finish = _stream(client, model="opus", messages=messages, tools=TOOLS)
+    assert content == answer.strip() and calls == []
+
+
+def test_inline_triple_backticks_do_not_open_a_fence():
+    reply = _parse_claude_reply("Use ```x``` for code.\n" + _call())
+    assert len(reply.executable_calls) == 1 and reply.cleaned == "Use ```x``` for code."
+
+
+def test_unclosed_call_followed_by_prose_runs_nothing():
+    """A complete object without </tool_call> and prose after it may be an
+    unfenced example: it must not run. Claude is asked which it was."""
+
+    example = 'Emit <tool_call>{"name":"terminal","arguments":{"command":"rm -rf /tmp/demo"}} and Hermes runs it.'
+    reply = _parse_claude_reply(example)
+    assert reply.broken and reply.executable_calls == []
+    assert "no </tool_call>" in reply.failures[0].error and reply.cleaned == "Emit"
+    # Still a call when nothing, or only another call, follows.
+    assert len(_parse_claude_reply('<tool_call>{"name":"terminal","arguments":{}}\n\n').executable_calls) == 1
+    batch = '<tool_call>{"name":"terminal","arguments":{}}\n' + _call("read_file", "c2", path="a")
+    assert len(_parse_claude_reply(batch).executable_calls) == 2
+
+
+def test_repair_prompt_lets_an_example_be_an_example(monkeypatch, keyed):
+    from agent.claude_code_session import _tool_call_repair_prompt
+
+    reply = _parse_claude_reply(BROKEN)
+    assert "give the complete answer again" in _tool_call_repair_prompt(reply)
+    assert "continue the answer after the text already shown" in _tool_call_repair_prompt(
+        reply, shown=True
+    )
+    prose = "Here is what I found in the logs. " * 12
+    example = prose + '\nThe format: <tool_call>{"name": ...}</tool_call>'
+    fixed = "Put it in code: `<tool_call>{...}</tool_call>`."
+    client, seen = _live_client(monkeypatch, [example, fixed])
+    content, calls, finish = _stream(
+        client, model="opus", messages=[{"role": "user", "content": "format?"}], tools=TOOLS
+    )
+    assert "continue the answer after the text already shown" in seen[1]["prompt"]
+    assert content == (prose + "\nThe format:").strip() + "\n\n" + fixed
+    assert calls == [] and finish == ["stop"]
+
+
+def test_prose_streamed_before_a_continued_cut_off_call_is_kept(monkeypatch, keyed):
+    """Claude Code continued a reply cut off at the output limit: the prose
+    streamed live, but the result text is only the tail of the call. The
+    repaired answer keeps that prose, so the stream equals the content."""
+
+    prose = "I looked at the renderer and found the problem in the loader. " * 8
+    live = prose + '\n<tool_call>{"id":"c1","name":"terminal","arguments":{"command":"echo done"}}\n</tool_call>'
+    tail = 'done"}}\n</tool_call>'
+    client, seen = _live_client(monkeypatch, [(live, tail), FIXED])
+    session = client._claude_session
+    returned = []
+    run = session.run
+
+    def capture(*args, **kwargs):
+        result = run(*args, **kwargs)
+        returned.append(result[0])
+        return result
+
+    monkeypatch.setattr(session, "run", capture)
+    messages = [{"role": "user", "content": "fix it"}]
+    content, calls, finish = _stream(client, model="opus", messages=messages, tools=TOOLS)
+    assert content == prose.strip()
+    assert [tc.function.name for tc in calls] == ["terminal"] and finish == ["tool_calls"]
+    assert "continue the answer after the text already shown" in seen[1]["prompt"]
+    # The streamed deltas equal the content of the returned reply.
+    assert _completion_parts(returned[0], messages, tools_offered=True)[1] == content
+
+
+def test_gate_never_emits_whitespace_that_precedes_a_call():
+    out = []
+    gate = _StreamGate(out.append, commit_chars=40)
+    reply = "The answer is long enough to commit the stream early." + "\n" * 30 + _call()
+    for index in range(0, len(reply), 5):
+        gate.feed(reply[index : index + 5])
+    gate.finish(reply)
+    assert "".join(out) == _parse_claude_reply(reply).cleaned
+
+
+def test_rekeyed_ids_stay_within_forty_characters():
+    long_id = "x" * 40
+    history = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [_tool_call(long_id, "terminal")]},
+        {"role": "tool", "tool_call_id": long_id, "content": "ok"},
+    ]
+    tool_calls, _content, _finish = _completion_parts(
+        _call("terminal", long_id) + _call("terminal", long_id), history, tools_offered=True
+    )
+    ids = [tc.id for tc in tool_calls]
+    assert ids == ["x" * 37 + "_r2", "x" * 37 + "_r3"]
+    assert all(len(call_id) <= 40 for call_id in ids)

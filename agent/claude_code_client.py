@@ -274,6 +274,14 @@ def _format_messages_as_prompt(
 
 
 _CALL_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]+")
+# OpenAI rejects tool-call ids over 40 characters (history outlives a /model
+# switch), so Hermes-assigned ids stay within that.
+_MAX_CALL_ID_CHARS = 40
+
+
+def _rekeyed_call_id(base: str, suffix: int) -> str:
+    tag = f"_r{suffix}"
+    return base[: _MAX_CALL_ID_CHARS - len(tag)] + tag
 
 
 def _assign_tool_call_ids(
@@ -293,7 +301,8 @@ def _assign_tool_call_ids(
     taken = _historical_tool_call_ids(messages or [])
     assigned: list[Any] = []
     for call in calls:
-        base = _CALL_ID_UNSAFE_RE.sub("_", str(call.get("id") or "")).strip("_")[:40]
+        base = _CALL_ID_UNSAFE_RE.sub("_", str(call.get("id") or "")).strip("_")
+        base = base[:_MAX_CALL_ID_CHARS]
         if not base:
             number = 1
             while f"call_{number}" in taken:
@@ -301,9 +310,9 @@ def _assign_tool_call_ids(
             call_id = f"call_{number}"
         elif base in taken:
             suffix = 2
-            while f"{base}_r{suffix}" in taken:
+            while _rekeyed_call_id(base, suffix) in taken:
                 suffix += 1
-            call_id = f"{base}_r{suffix}"
+            call_id = _rekeyed_call_id(base, suffix)
             _LOG.warning(
                 "Claude Code reused tool call id %s; re-keyed to %s (tool=%s)",
                 base,

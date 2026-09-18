@@ -710,7 +710,10 @@ def _image_block_or_note(part: dict[str, Any]) -> tuple[dict[str, Any] | None, s
         media_type = match.group(1).lower()
         if media_type == "image/jpg":
             media_type = "image/jpeg"
-        data = re.sub(r"\s+", "", match.group(2))
+        # str.split() drops the same whitespace as re.sub(r"\s+", ...), about
+        # 20x faster on multi-MB payloads; every request re-renders the whole
+        # history's images (full request and resumed-turn numbering).
+        data = "".join(match.group(2).split())
         if media_type not in _SUPPORTED_IMAGE_TYPES:
             return None, f"image omitted: unsupported type {media_type}"
         if len(data) > _MAX_IMAGE_BASE64_CHARS:
@@ -936,13 +939,22 @@ def _system_prompt_file(system_prompt: str) -> str:
 # Hermes tool-call protocol: parsing Claude's replies
 # ---------------------------------------------------------------------------
 
-_TOOL_CALL_OPEN_RE = re.compile(r"<tool_call(?:\s[^>]*)?>")
+# An opening tag starts a call only when a JSON object follows it (or the
+# reply ends right there, cut off): "Hermes parses <tool_call> blocks" in an
+# answer is a mention, not a broken call.
+_TOOL_CALL_OPEN_RE = re.compile(r"<tool_call(?:\s[^>]*)?>(?=\s*(?:\{|\Z))")
 _TOOL_CALL_CLOSE_RE = re.compile(r"</tool_call\s*>")
+# A closing tag without a start is the tail of a cut-off call only when the
+# text before it ends like a JSON object; otherwise it is a mention in prose.
+_ORPHAN_TAIL_RE = re.compile(r"[}\]]\s*\Z")
 # Tolerated between a call's JSON object and its closing tag: stray closers or
 # quotes after an otherwise complete object (observed: an extra "]}").
 _TOOL_CALL_JUNK_RE = re.compile(r"""[\s\]})"',;]*""")
 _TOOL_NAME_HINT_RE = re.compile(r'"name"\s*:\s*"([^"\\]{1,64})"')
-_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# Fences also open inside list items and block quotes (any indentation, ">"
+# markers). A backtick fence's info string holds no backtick: a line such as
+# "```x``` more" is inline code, not a fence.
+_FENCE_OPEN_RE = re.compile(r"^[ \t>]*(?:(`{3,})(?![^\n]*`)|(~{3,}))")
 _INLINE_CODE_RE = re.compile(r"(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 # In-session repair turns for unparseable or cut-off tool calls, per request.
 # Separate from the soft-limit/preamble attempt budget.
@@ -954,11 +966,18 @@ def _blank(text: str) -> str:
     return re.sub(r"[^\n]", " ", text)
 
 
+def _fence_opened(line: str) -> tuple[str, int] | None:
+    opened = _FENCE_OPEN_RE.match(line)
+    if opened is None:
+        return None
+    marker = opened.group(1) or opened.group(2)
+    return marker[0], len(marker)
+
+
 def _closes_fence(line: str, fence: tuple[str, int]) -> bool:
     char, length = fence
-    stripped = line.strip()
-    indent = len(line) - len(line.lstrip(" "))
-    return indent <= 3 and len(stripped) >= length and set(stripped) == {char}
+    stripped = line.lstrip(" \t>").strip()
+    return len(stripped) >= length and set(stripped) == {char}
 
 
 def _mask_code(text: str) -> str:
@@ -973,9 +992,8 @@ def _mask_code(text: str) -> str:
     fence: tuple[str, int] | None = None
     for line in text.splitlines(keepends=True):
         if fence is None:
-            opened = _FENCE_OPEN_RE.match(line)
-            if opened:
-                fence = (opened.group(1)[0], len(opened.group(1)))
+            fence = _fence_opened(line)
+            if fence is not None:
                 pieces.append(_blank(line))
             else:
                 pieces.append(_INLINE_CODE_RE.sub(lambda m: _blank(m.group(0)), line))
@@ -992,9 +1010,7 @@ def _inside_open_fence(text: str) -> bool:
     fence: tuple[str, int] | None = None
     for line in text.splitlines(keepends=True):
         if fence is None:
-            opened = _FENCE_OPEN_RE.match(line)
-            if opened:
-                fence = (opened.group(1)[0], len(opened.group(1)))
+            fence = _fence_opened(line)
         elif line.endswith("\n") and _closes_fence(line, fence):
             fence = None
     return fence is not None
@@ -1141,7 +1157,14 @@ def _parse_claude_reply(text: str | None) -> _ClaudeReply:
     masked = _mask_code(text)
     first = _TOOL_CALL_OPEN_RE.search(masked)
     prose_end = first.start() if first is not None else len(text)
-    orphan = _TOOL_CALL_CLOSE_RE.search(masked, 0, prose_end)
+    orphan = next(
+        (
+            closing
+            for closing in _TOOL_CALL_CLOSE_RE.finditer(masked, 0, prose_end)
+            if _ORPHAN_TAIL_RE.search(text, 0, closing.start())
+        ),
+        None,
+    )
     if orphan is not None:
         # A closing tag with no start: Claude Code continued a reply cut off
         # at the output limit and only the tail of a call survived. What
@@ -1210,8 +1233,18 @@ def _parse_claude_reply(text: str | None) -> _ClaudeReply:
                     excerpt = _excerpt(text, after)
                     block_end = later_close.end()
                 else:
-                    # Complete object; only the closing tag is missing.
+                    # Complete object; only the closing tag is missing. That
+                    # is a call when nothing but another call follows. With
+                    # prose after it, it may as well be an unfenced example:
+                    # run nothing and let Claude say which it was.
                     block_end = after
+                    following = _skip_space(text, after)
+                    if following < len(text) and not _TOOL_CALL_OPEN_RE.match(
+                        text, following
+                    ):
+                        obj = None
+                        error = "no </tool_call> after the JSON object"
+                        excerpt = _excerpt(text, after)
         name = ""
         if obj is not None:
             call, name, error = _normalize_tool_call(obj)
@@ -1236,8 +1269,12 @@ def _parse_claude_reply(text: str | None) -> _ClaudeReply:
     )
 
 
-def _tool_call_repair_prompt(reply: _ClaudeReply) -> str:
-    """Corrective turn after a reply whose tool calls could not all be used."""
+def _tool_call_repair_prompt(reply: _ClaudeReply, *, shown: bool = False) -> str:
+    """Corrective turn after a reply whose tool calls could not all be used.
+
+    ``shown``: the reply's prose already reached the user and stays part of
+    the answer, so a corrected answer must continue after it.
+    """
 
     lines = [
         "Hermes could not use the tool calls in your previous reply, so NOTHING "
@@ -1270,6 +1307,17 @@ def _tool_call_repair_prompt(reply: _ClaudeReply) -> str:
         '<tool_call>{"id": "c1", "name": "...", "arguments": {...}}</tool_call> '
         'with "arguments" as a JSON object, not a string. Write nothing else: '
         "no prose and no tool results."
+    )
+    # An unfenced example in an answer looks like a broken call; do not push
+    # Claude into running it.
+    lines.append(
+        "If that markup was only an example for the user, not a call, "
+        + (
+            "continue the answer after the text already shown"
+            if shown
+            else "give the complete answer again"
+        )
+        + " and put the markup inside a code block."
     )
     return "\n".join(lines)
 
@@ -1341,7 +1389,9 @@ class _StreamGate:
             safe = self._raw[:markup].strip()
             self._closed = True
         else:
-            safe = self._raw[: max(0, len(self._raw) - _STREAM_HOLDBACK_CHARS)].lstrip()
+            # Trailing whitespace waits too: the final answer is stripped, so
+            # whitespace right before a tool call must never be emitted.
+            safe = self._raw[: max(0, len(self._raw) - _STREAM_HOLDBACK_CHARS)].strip()
         if not self.committed:
             if len(safe) <= self._commit_chars:
                 return
@@ -2740,14 +2790,21 @@ class ClaudeCodeSession:
                 repairs += 1
                 if gate is not None and gate.committed:
                     # The prose is already on screen: keep it, and let the
-                    # repaired calls follow it.
-                    carried = _parse_claude_reply(response).cleaned
+                    # repaired calls follow it. It normally is the reply's
+                    # prose; when Claude Code continued a reply cut off at
+                    # the output limit, the final text is only the tail of a
+                    # call and the prose shown came from the earlier message.
+                    shown = gate.emitted.strip()
+                    prose = _parse_claude_reply(response).cleaned
+                    carried = prose if prose.startswith(shown) else shown
                     carried_emitted = gate.emitted
                 next_session_id, next_resume_at, in_session = _continuation(
                     sid, "tool-call-repair"
                 )
                 next_prompt = (
-                    _tool_call_repair_prompt(reply) if in_session else prompt_text
+                    _tool_call_repair_prompt(reply, shown=bool(carried))
+                    if in_session
+                    else prompt_text
                 )
                 continue
 
