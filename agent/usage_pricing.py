@@ -1003,6 +1003,10 @@ def resolve_billing_route(
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
+    # The Claude Code bridge runs on the CLI's own subscription OAuth login
+    # (Anthropic API keys are scrubbed from its environment).
+    if provider_name == "claude-code" or base.startswith("acp://claude-code"):
+        return BillingRoute(provider="claude-code", model=model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
