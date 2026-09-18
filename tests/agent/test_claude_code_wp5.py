@@ -335,7 +335,7 @@ def test_warning_seen_first_by_an_auxiliary_call_is_not_swallowed(fake_cli):
     fake_cli.script({"rate_limit_info": hot})
     aux = ClaudeCodeClient(command=fake_cli.command, cwd=str(fake_cli.tmp))
     completion = aux.chat.completions.create(model=MODEL, messages=HI)
-    assert completion.usage.hermes_notices == ()
+    assert completion.usage.hermes_claim_notices is None
     # The agent's own session still announces it, once.
     main = ClaudeCodeSession()
     main._record_rate_limit(hot)
@@ -405,32 +405,50 @@ def test_notices_ride_on_both_completion_paths(fake_cli):
     client = ClaudeCodeClient(command=fake_cli.command, cwd=str(fake_cli.tmp))
     tools = [{"type": "function", "function": {"name": "terminal", "parameters": {}}}]
     completion = client.chat.completions.create(model=MODEL, messages=_history(1), tools=tools)
-    assert len(completion.usage.hermes_notices) == 1
-    assert "5-hour session limit is 93% used" in completion.usage.hermes_notices[0]
+    notices = completion.usage.hermes_claim_notices()
+    assert len(notices) == 1
+    assert "5-hour session limit is 93% used" in notices[0]
     chunks = list(
         client.chat.completions.create(model=MODEL, messages=_history(2), tools=tools, stream=True)
     )
     usage = [chunk.usage for chunk in chunks if getattr(chunk, "usage", None)][-1]
-    assert len(usage.hermes_notices) == 1 and "weekly limit is 96% used" in usage.hermes_notices[0]
+    notices = usage.hermes_claim_notices()
+    assert len(notices) == 1 and "weekly limit is 96% used" in notices[0]
     client.close()
 
 
 def test_completion_usage_defaults_to_no_notices():
-    assert _completion_usage({}).hermes_notices == ()
+    assert _completion_usage({}).hermes_claim_notices is None
 
 
 def test_conversation_loop_shows_bridge_notices_only_for_claude_code():
     from agent.conversation_loop import _show_provider_notices
 
     shown = []
-    agent = SimpleNamespace(provider="claude-code", _emit_status=shown.append)
-    usage = SimpleNamespace(hermes_notices=("⚠️ Claude weekly limit is 95% used.", "", 3))
+    claims = []
+
+    def claim():
+        claims.append(1)
+        return ["⚠️ Claude weekly limit is 95% used.", "", 3]
+
+    agent = SimpleNamespace(
+        provider="claude-code", status_callback=lambda *a: None, _emit_status=shown.append
+    )
+    usage = SimpleNamespace(hermes_claim_notices=claim)
     _show_provider_notices(agent, usage)
     assert shown == ["⚠️ Claude weekly limit is 95% used."]
-    other = SimpleNamespace(provider="openrouter", _emit_status=shown.append)
+    other = SimpleNamespace(
+        provider="openrouter", status_callback=lambda *a: None, _emit_status=shown.append
+    )
     _show_provider_notices(other, usage)
     _show_provider_notices(agent, SimpleNamespace())
-    assert len(shown) == 1
+    # An agent whose status lines reach no one (a subagent) never claims.
+    unseen = SimpleNamespace(provider="claude-code", platform="subagent", _emit_status=shown.append)
+    _show_provider_notices(unseen, usage)
+    assert len(shown) == 1 and len(claims) == 1
+    cli = SimpleNamespace(provider="claude-code", platform="cli", _emit_status=shown.append)
+    _show_provider_notices(cli, usage)
+    assert len(shown) == 2
 
 
 def test_cost_total_sums_every_cli_turn(fake_cli):

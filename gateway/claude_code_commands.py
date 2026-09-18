@@ -51,6 +51,10 @@ BUSY_RESET_TEXT = (
     "Wait for the reply or `/claude stop` first."
 )
 
+# How long ``/claude reset`` waits for a request still holding the session
+# (an abandoned reply winding down) before it asks the user to retry.
+_RESET_WAIT_SECONDS = 20.0
+
 # Plan windows in the one-line summaries, in display order.
 _PLAN_SHORT_LABELS: tuple[tuple[str, str], ...] = (
     ("five_hour", "5h"),
@@ -205,18 +209,19 @@ def plan_snapshot(session: Any = None) -> tuple[dict[str, Any], Optional[float]]
 def plan_line(session: Any = None) -> str:
     """``Claude plan: 5h 28% · week 41% (as of 14:02)``, or "" without data."""
 
-    from agent.claude_code_session import plan_windows
+    from agent.claude_code_session import live_plan_windows, plan_status_live
 
     info, recorded_at = plan_snapshot(session)
     if not info:
         return ""
-    windows = plan_windows(info)
+    # Windows that reset since the report no longer have its figures.
+    windows = live_plan_windows(info)
     parts = []
     for key, label in _PLAN_SHORT_LABELS:
         utilization = windows.get(key, (None, None))[0]
         if utilization is not None:
             parts.append(f"{label} {utilization:.0%}")
-    status = str(info.get("status") or "")
+    status = str(info.get("status") or "") if plan_status_live(info) else ""
     if status == "rejected":
         parts.append("limit reached")
     elif status == "allowed_warning":
@@ -521,7 +526,13 @@ def do_reset(agent: Any) -> str:
     keys = state_keys(agent)
     dropped: list[str] = []
     for key in keys or [None]:
-        sid = target.reset_conversation(key)
+        try:
+            sid = target.reset_conversation(key, wait=_RESET_WAIT_SECONDS)
+        except TimeoutError:
+            return (
+                "⏳ Claude Code is still finishing a request for this session — "
+                "try `/claude reset` again in a moment (or `/claude stop` first)."
+            )
         if sid and sid not in dropped:
             dropped.append(sid)
     if not dropped:
@@ -592,7 +603,7 @@ def footer_meta(agent: Any, *, cost_before: Optional[float] = None) -> Optional[
     session = claude_session(agent)
     if session is None:
         return None
-    from agent.claude_code_session import plan_windows
+    from agent.claude_code_session import live_plan_windows
 
     meta: dict[str, Any] = {}
     usage = session.last_usage
@@ -603,7 +614,7 @@ def footer_meta(agent: Any, *, cost_before: Optional[float] = None) -> Optional[
     if cost_before is not None and after is not None and after >= cost_before:
         meta["turn_cost_usd"] = after - cost_before
     info, _recorded_at = plan_snapshot(session)
-    windows = plan_windows(info)
+    windows = live_plan_windows(info)
     for key, field in (("five_hour", "plan_5h"), ("seven_day", "plan_7d")):
         utilization = windows.get(key, (None, None))[0]
         if utilization is not None:

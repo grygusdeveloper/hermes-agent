@@ -1017,20 +1017,27 @@ def build_claude_code_usage_snapshot(
             title="Claude plan limits",
             unavailable_reason=note,
         )
-    from agent.claude_code_session import _RATE_LIMIT_LABELS, plan_windows
+    from agent.claude_code_session import _RATE_LIMIT_LABELS, plan_status_live, plan_windows
 
     labels = dict(_CLAUDE_WINDOW_LABELS)
+    now = time.time()
     for key, (utilization, resets_at) in plan_windows(rate_limit).items():
         if utilization is None:
             continue
+        label = labels.get(key) or key.replace("_", " ").capitalize()
+        if resets_at is not None and resets_at <= now:
+            # The report predates this window's reset: its figure is over.
+            stamp = datetime.fromtimestamp(resets_at, tz=timezone.utc).astimezone()
+            details.append(f"{label}: reset at {stamp.strftime('%Y-%m-%d %H:%M %Z')}, after this report")
+            continue
         windows.append(
             AccountUsageWindow(
-                label=labels.get(key) or key.replace("_", " ").capitalize(),
+                label=label,
                 used_percent=utilization * 100.0,
                 reset_at=_parse_dt(resets_at),
             )
         )
-    status = str(rate_limit.get("status") or "")
+    status = str(rate_limit.get("status") or "") if plan_status_live(rate_limit, now) else ""
     if status and status != "allowed":
         kind = str(rate_limit.get("rateLimitType") or "")
         label = _RATE_LIMIT_LABELS.get(kind) or kind.replace("_", " ")
@@ -1133,7 +1140,9 @@ def fetch_account_usage(
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
         if normalized == "claude-code":
-            return fetch_claude_code_account_usage()
+            # The CLI's /usage waits for this call (its executor joins on
+            # exit), so a hung control process must not hold it for long.
+            return fetch_claude_code_account_usage(timeout=10.0)
     except Exception:
         return None
     return None

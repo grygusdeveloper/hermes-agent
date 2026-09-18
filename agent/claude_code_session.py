@@ -2550,6 +2550,34 @@ def _rate_limit_path() -> Path:
     return _state_dir() / _RATE_LIMIT_FILE_NAME
 
 
+@contextmanager
+def _rate_limit_update():
+    """Serialize a read-modify-write of ``rate_limit.json`` across threads
+    and processes (gateway profiles, cron, the CLI share the state dir), so
+    a warning recorded as announced is never overwritten by a stale copy."""
+
+    with _RATE_LIMIT_UPDATE_LOCK:
+        directory = _state_dir()
+        fd = None
+        try:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(directory / "rate_limit.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            # Best effort: the in-process lock still holds.
+            if fd is not None:
+                os.close(fd)
+            fd = None
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+
 def load_rate_limit_snapshot() -> dict[str, Any] | None:
     """The persisted plan snapshot: ``{"info", "recorded_at", "warned"}``.
 
@@ -2604,24 +2632,38 @@ def _save_rate_limit_snapshot(
                 pass
 
 
-def _mark_limit_warnings_delivered(
-    keys: list[tuple[str, float | None]],
-) -> set[tuple[str, float | None]]:
-    """Record plan warnings as shown; returns the ones not already shown by
-    another session (those are dropped rather than repeated)."""
+def _warned_for(warned: dict[str, Any], key: tuple[str, float | None]) -> bool:
+    return key[0] in warned and warned[key[0]] == key[1]
 
-    with _RATE_LIMIT_UPDATE_LOCK:
+
+def _mark_limit_warnings_delivered(
+    groups: list[tuple[tuple[str, float | None], ...]],
+) -> list[bool]:
+    """Record plan warnings as shown, one group of window keys per notice.
+
+    Returns, per group, whether it may be shown: a group none of whose
+    windows another session already announced this cycle. Those are recorded
+    (every window of the group, so a window that shares the notice's limit
+    is not announced again on its own); the others are dropped rather than
+    repeated.
+    """
+
+    with _rate_limit_update():
         snapshot = load_rate_limit_snapshot()
         if snapshot is None:
-            return set(keys)
+            return [True for _group in groups]
         warned = dict(snapshot["warned"])
-        fresh = {key for key in keys if key[0] not in warned or warned[key[0]] != key[1]}
-        if fresh:
-            warned.update(dict(fresh))
+        verdicts = []
+        for group in groups:
+            fresh = not any(_warned_for(warned, key) for key in group)
+            if fresh:
+                warned.update(dict(group))
+            verdicts.append(fresh)
+        if any(verdicts):
             _save_rate_limit_snapshot(
                 snapshot["info"], warned, recorded_at=snapshot.get("recorded_at")
             )
-        return fresh
+        return verdicts
 
 
 def _utilization(value: Any) -> float | None:
@@ -2655,34 +2697,72 @@ def plan_windows(info: dict[str, Any] | None) -> dict[str, tuple[float | None, f
     return windows
 
 
+def live_plan_windows(
+    info: dict[str, Any] | None, now: float | None = None
+) -> dict[str, tuple[float | None, float | None]]:
+    """:func:`plan_windows` minus the windows whose reset has passed.
+
+    A persisted ``rate_limit_info`` can be hours old: a window that reset
+    since then no longer has the utilization it reports.
+    """
+
+    now = time.time() if now is None else now
+    return {
+        name: window
+        for name, window in plan_windows(info).items()
+        if window[1] is None or window[1] > now
+    }
+
+
+def plan_status_live(info: dict[str, Any] | None, now: float | None = None) -> bool:
+    """Whether the info's own ``status`` (for its ``rateLimitType``) still
+    applies: False once that window has reset."""
+
+    if not isinstance(info, dict):
+        return False
+    _kind, resets_at = _limit_window(info)
+    return resets_at is None or resets_at > (time.time() if now is None else now)
+
+
 def _limit_warnings(
     info: dict[str, Any], warned: dict[str, Any], now: float
-) -> list[tuple[str, float | None, str]]:
-    """``(window, reset, text)`` for windows to announce now.
+) -> list[tuple[tuple[tuple[str, float | None], ...], str]]:
+    """``(window keys, text)`` for plan limits to announce now.
 
     A window is announced when it is at ``_LIMIT_WARNING_UTILIZATION`` or
     more, or when the CLI flags it (status ``allowed_warning``), once per
     window cycle: ``warned`` maps a window to the reset it was announced for.
-    A rejected request is reported by the error path instead.
+    Windows that name the same limit (``seven_day`` and its twin
+    ``seven_day_overage_included``) make one notice with both keys, and
+    are not announced again once either was. A rejected request is reported
+    by the error path instead.
     """
 
     if info.get("status") == "rejected":
         return []
     flagged = info.get("rateLimitType") if info.get("status") == "allowed_warning" else None
-    found: list[tuple[str, float | None, str]] = []
+    by_label: dict[str, list[tuple[str, float | None, float | None]]] = {}
     for name, (utilization, resets_at) in plan_windows(info).items():
         hot = utilization is not None and utilization >= _LIMIT_WARNING_UTILIZATION
         if not hot and name != flagged:
             continue
         if resets_at is not None and resets_at <= now:
             continue
-        if name in warned and warned[name] == resets_at:
-            continue
         label = _RATE_LIMIT_LABELS.get(name) or name.replace("_", " ") + " limit"
+        by_label.setdefault(label, []).append((name, utilization, resets_at))
+    found: list[tuple[tuple[tuple[str, float | None], ...], str]] = []
+    for label, windows in by_label.items():
+        keys = tuple((name, resets_at) for name, _utilization, resets_at in windows)
+        if any(_warned_for(warned, key) for key in keys):
+            continue
+        known = [item for item in windows if item[1] is not None]
+        _name, utilization, resets_at = (
+            max(known, key=lambda item: item[1]) if known else windows[0]
+        )
         state = f"is {utilization:.0%} used" if utilization is not None else "is almost used up"
         when = _reset_label(resets_at, now)
         text = f"⚠️ Claude {label} {state}" + (f" — resets {when}" if when else "") + "."
-        found.append((name, resets_at, text))
+        found.append((keys, text))
     return found
 
 
@@ -2698,7 +2778,7 @@ def _model_fallback_notice(subtype: str, event: dict[str, Any]) -> str:
     if isinstance(content, str) and content.strip():
         return "⚠️ Claude Code: " + " ".join(content.split())[:300]
     original = event.get("originalModel") or event.get("original_model") or "Claude"
-    fallback = event.get("fallbackModel") or event.get("fallback_model")
+    fallback = event.get("fallbackModel") or event.get("fallback_model") or "another model"
     category = event.get("apiRefusalCategory") or event.get("api_refusal_category")
     why = f" ({category})" if category else ""
     if subtype == "model_refusal_no_fallback":
@@ -3490,6 +3570,8 @@ def run_control_requests(
     start; per-request failures come back as ``ClaudeCodeControlError`` items.
     """
 
+    if not requests:
+        return []
     claude_bin = (command or "").strip() or _resolve_claude_command()
     work_dir = cwd or str(Path.home())
     argv = [
@@ -3634,8 +3716,8 @@ class ClaudeCodeSession:
         self._last_rate_limit: dict[str, Any] = {}
         # User-facing notices (plan window warnings, model fallbacks) waiting
         # to be delivered with the next reply (see ``take_notices``).
-        # (text, plan window key or None) in arrival order.
-        self._pending_notices: list[tuple[str, tuple[str, float | None] | None]] = []
+        # (text, plan window keys; empty for other notices) in arrival order.
+        self._pending_notices: list[tuple[str, tuple[tuple[str, float | None], ...]]] = []
         self._notice_lock = threading.Lock()
         # Sum of every CLI turn's API-equivalent cost this session reported
         # (retried attempts included): callers diff it around a Hermes turn.
@@ -3688,27 +3770,55 @@ class ClaudeCodeSession:
         warnings (once per window cycle) and CLI model fallbacks.
 
         Only a caller that shows them to the user should take them: plan
-        warnings count as announced from here on.
+        warnings count as announced from here on. A plan warning whose window
+        has reset meanwhile is dropped (its figures are over).
         """
 
         with self._notice_lock:
             pending, self._pending_notices = self._pending_notices, []
-        keys = [key for _text, key in pending if key is not None]
-        deliverable: set[tuple[str, float | None]] = set(keys)
-        if keys:
+        now = time.time()
+        pending = [
+            (text, keys)
+            for text, keys in pending
+            if not any(reset is not None and reset <= now for _name, reset in keys)
+        ]
+        groups = [keys for _text, keys in pending if keys]
+        verdicts = [True] * len(groups)
+        if groups:
             try:
-                deliverable = _mark_limit_warnings_delivered(keys)
+                verdicts = _mark_limit_warnings_delivered(groups)
             except Exception:
                 _LOG.debug("Could not record delivered Claude plan warnings", exc_info=True)
-        return [text for text, key in pending if key is None or key in deliverable]
+        shown: list[str] = []
+        index = 0
+        for text, keys in pending:
+            if keys:
+                deliverable = verdicts[index]
+                index += 1
+                if not deliverable:
+                    continue
+            shown.append(text)
+        return shown
 
-    def _add_notice(self, text: str, key: tuple[str, float | None] | None = None) -> None:
+    def _add_notice(
+        self, text: str, keys: tuple[tuple[str, float | None], ...] = ()
+    ) -> None:
+        """Queue a notice; ``keys`` are the plan windows a warning is about.
+
+        A notice for a window already pending replaces it (the latest
+        figures); an identical text merges into the pending one.
+        """
+
         if not text:
             return
         with self._notice_lock:
-            if all(text != item and (key is None or key != item_key) for item, item_key in self._pending_notices):
-                self._pending_notices.append((text, key))
-                del self._pending_notices[:-_MAX_PENDING_NOTICES]
+            for index, (item, item_keys) in enumerate(self._pending_notices):
+                if item == text or any(key in item_keys for key in keys):
+                    merged = item_keys + tuple(key for key in keys if key not in item_keys)
+                    self._pending_notices[index] = (text, merged)
+                    return
+            self._pending_notices.append((text, tuple(keys)))
+            del self._pending_notices[:-_MAX_PENDING_NOTICES]
 
     def describe(self) -> dict[str, Any]:
         """A snapshot of the bound conversation for ``/claude status``.
@@ -3742,7 +3852,9 @@ class ClaudeCodeSession:
             "cost_total_usd": self._cost_total_usd,
         }
 
-    def reset_conversation(self, state_key: str | None = None) -> str | None:
+    def reset_conversation(
+        self, state_key: str | None = None, *, wait: float | None = None
+    ) -> str | None:
         """Drop the Claude-side conversation only (``/claude reset``).
 
         Hermes keeps its transcript; the next request starts a fresh Claude
@@ -3750,19 +3862,27 @@ class ClaudeCodeSession:
         (default: the bound one), forgets the binding, closes the warm
         process and lifts recorded subscription-limit blocks so the next call
         re-checks. Returns the dropped Claude session id, if any.
+
+        A request in flight finishes first; ``wait`` bounds that wait (None:
+        no bound) and ``TimeoutError`` reports it ran out.
         """
 
         key = state_key or self._state_key
-        with self._lock, _durable_transition_lock(key):
-            dropped = self._session_id
-            if key:
-                durable = _load_durable_state(key)
-                if durable is not None:
-                    dropped = dropped or durable.session_id
-                _delete_durable_state(key)
-            self._clear_binding()
-            self._discard_warm()
-            self._pending_discard_note = False
+        if not self._lock.acquire(timeout=-1 if wait is None else max(0.0, wait)):
+            raise TimeoutError("Claude Code is still finishing a request")
+        try:
+            with _durable_transition_lock(key):
+                dropped = self._session_id
+                if key:
+                    durable = _load_durable_state(key)
+                    if durable is not None:
+                        dropped = dropped or durable.session_id
+                    _delete_durable_state(key)
+                self._clear_binding()
+                self._discard_warm()
+                self._pending_discard_note = False
+        finally:
+            self._lock.release()
         clear_usage_limit_blocks()
         _LOG.info("Claude Code session %s dropped on request (/claude reset)", dropped or "-")
         return dropped
@@ -3805,6 +3925,8 @@ class ClaudeCodeSession:
         response payload or a ``ClaudeCodeControlError``.
         """
 
+        if not requests:
+            return []
         # Never wait behind a running request, and never touch the warm
         # process it may be using: a busy session answers from a throwaway.
         warm_can_answer = not any(subtype in _WARM_UNSERVED_CONTROL for subtype, _ in requests)
@@ -3826,7 +3948,10 @@ class ClaudeCodeSession:
                             on_timeout=lambda: _kill_process_group(warm.process),
                             on_event=self._control_event,
                         )
-                    except ClaudeCodeControlError:
+                    except Exception:
+                        # Taken off the idle list: it must be parked again or
+                        # closed, never left running unowned.
+                        _LOG.debug("Claude Code control exchange failed", exc_info=True)
                         results = None
                     if results is not None and not any(
                         isinstance(item, _ControlNoAnswer) for item in results
@@ -5702,7 +5827,7 @@ class ClaudeCodeSession:
         previous = self._last_rate_limit
         self._last_rate_limit = dict(info)
         try:
-            with _RATE_LIMIT_UPDATE_LOCK:
+            with _rate_limit_update():
                 snapshot = load_rate_limit_snapshot() or {}
                 now = time.time()
                 # Forget windows whose cycle is over.
@@ -5712,8 +5837,8 @@ class ClaudeCodeSession:
                     if not isinstance(reset, (int, float)) or reset > now
                 }
                 _save_rate_limit_snapshot(dict(info), warned)
-            for window, resets_at, text in _limit_warnings(info, warned, now):
-                self._add_notice(text, (window, resets_at))
+            for keys, text in _limit_warnings(info, warned, now):
+                self._add_notice(text, keys)
         except Exception:
             _LOG.debug("Could not persist the Claude Code rate limit snapshot", exc_info=True)
         status = str(info.get("status") or "")

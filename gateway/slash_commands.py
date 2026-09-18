@@ -3376,11 +3376,65 @@ class GatewaySlashCommandsMixin:
             return cc.do_stop(agent, running_agent)
         if sub == "reset" and running_agent is not None:
             return cc.BUSY_RESET_TEXT
+        stand_in = None
+        if agent is None:
+            # No agent loaded (e.g. right after a gateway restart): the saved
+            # Claude conversation is still the one the next message resumes.
+            stand_in = await self._claude_stand_in_agent(event)
+            agent = stand_in
         try:
             return await asyncio.to_thread(cc.RENDERERS[sub], agent)
         except Exception as exc:
             logger.warning("/claude %s failed: %s", sub, exc, exc_info=True)
             return f"⚠️ `/claude {sub}` failed: {exc}"
+        finally:
+            if stand_in is not None:
+                try:
+                    stand_in.client.close()
+                except Exception:
+                    pass
+
+    async def _claude_stand_in_agent(self, event: MessageEvent) -> Any:
+        """A minimal agent for ``/claude`` when none is loaded for the session.
+
+        It carries what finds the session's durable Claude Code state (the
+        bridge keys it ``<conversation root>|<session id>``) and a Claude Code
+        client of its own (no process until a control request needs one).
+        Read-only lookups: never creates a session. None without a session id.
+        """
+        from types import SimpleNamespace
+
+        from agent.claude_code_client import ClaudeCodeClient
+
+        session_key = self._session_key_for_source(event.source)
+        try:
+            session_id = await self.async_session_store.peek_session_id(session_key)
+        except Exception:
+            session_id = None
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        root = session_id
+        row: dict[str, Any] = {}
+        session_db = getattr(self, "_session_db", None)
+        if session_db is not None:
+            try:
+                root = await session_db.get_conversation_root(session_id) or session_id
+            except Exception:
+                root = session_id
+            try:
+                row = await session_db.get_session(session_id) or {}
+            except Exception:
+                row = {}
+        return SimpleNamespace(
+            provider="claude-code",
+            model=str(row.get("model") or "") if isinstance(row, dict) else "",
+            session_id=session_id,
+            _persist_disabled=False,
+            _conversation_root_id=lambda: root,
+            client=ClaudeCodeClient(),
+            context_compressor=None,
+            reasoning_config=None,
+        )
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality.

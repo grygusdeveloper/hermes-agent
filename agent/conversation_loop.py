@@ -206,17 +206,37 @@ def _sync_provider_context_window(agent, usage) -> None:
         pass
 
 
+def _shows_status_lines(agent) -> bool:
+    """Whether the agent's status lines reach the user: a gateway chat
+    (``status_callback``) or the interactive CLI. Delegate subagents and
+    cron jobs print them nowhere anyone reads."""
+
+    if callable(getattr(agent, "status_callback", None)):
+        return True
+    return str(getattr(agent, "platform", "") or "").strip().lower() == "cli"
+
+
 def _show_provider_notices(agent, usage) -> None:
     """Show the notices the Claude Code bridge attached to a response.
 
-    ``usage.hermes_notices``: a plan window at 90% or more (once per window
-    cycle) and a model fallback or refusal inside Claude Code. Shown as a
-    status line; the bridge's usage object is the only trusted source.
+    ``usage.hermes_claim_notices`` claims them: a plan window at 90% or more
+    (once per window cycle; claiming records it as announced) and a model
+    fallback or refusal inside Claude Code. Claimed and shown as status lines
+    only when the user sees this agent's status lines; otherwise they stay
+    pending for a reply that is seen. The bridge's usage object is the only
+    trusted source.
     """
 
     if not _is_claude_code_agent(agent):
         return
-    notices = getattr(usage, "hermes_notices", None)
+    claim = getattr(usage, "hermes_claim_notices", None)
+    if not callable(claim) or not _shows_status_lines(agent):
+        return
+    try:
+        notices = claim()
+    except Exception:
+        logger.debug("Claude Code notices could not be claimed", exc_info=True)
+        return
     if not isinstance(notices, (list, tuple)):
         return
     for notice in notices:

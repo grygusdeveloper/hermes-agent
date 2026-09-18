@@ -469,13 +469,18 @@ class ClaudeCodeClient:
 
         return self._claude_session.get_progress_snapshot()
 
-    def _take_notices(self, tools_offered: bool) -> list[str]:
-        """Notices for the reply (plan warnings, model fallbacks), only for
-        an agent's own calls: the conversation loop shows them. Auxiliary
-        calls (titles, compression, vision) offer no tools and leave them
-        pending, so a plan warning is never swallowed unseen."""
+    def _notice_claim(self, tools_offered: bool) -> Any:
+        """How the conversation loop claims the pending notices (plan
+        warnings, model fallbacks) of an agent's own call, or None.
 
-        return self._claude_session.take_notices() if tools_offered else []
+        Nothing is taken here: the loop claims them only when its agent shows
+        status lines to the user (a gateway chat, the CLI), so a delegate
+        subagent or a cron job never swallows a one-time plan warning, and
+        auxiliary calls (titles, compression, vision) offer no tools and get
+        no claim at all.
+        """
+
+        return self._claude_session.take_notices if tools_offered else None
 
     def control_requests(
         self,
@@ -609,7 +614,7 @@ class ClaudeCodeClient:
         usage = _completion_usage(
             last_usage,
             retry=self._claude_session.last_retry_usage,
-            notices=self._take_notices(bool(tools)),
+            claim_notices=self._notice_claim(bool(tools)),
         )
         assistant_message = SimpleNamespace(
             content=cleaned_text,
@@ -788,7 +793,7 @@ class ClaudeCodeClient:
                 usage=_completion_usage(
                     last_usage,
                     retry=self._claude_session.last_retry_usage,
-                    notices=self._take_notices(bool(run_kwargs.get("has_tools"))),
+                    claim_notices=self._notice_claim(bool(run_kwargs.get("has_tools"))),
                 ),
             )
         finally:
@@ -863,16 +868,17 @@ def _completion_usage(
     raw: dict[str, Any] | None,
     *,
     retry: dict[str, Any] | None = None,
-    notices: list[str] | tuple[str, ...] | None = None,
+    claim_notices: Any = None,
 ) -> Any:
     """Expose Claude Code result usage through the OpenAI-compatible facade.
 
     ``retry`` is the session's ``last_retry_usage`` (attempts the bridge
     retried past, see ``ClaudeCodeSession.last_retry_usage``). It rides along
     as ``hermes_retry_usage`` for token accounting and is never part of the
-    prompt-size fields. ``notices`` (``ClaudeCodeSession.take_notices``: plan
-    window warnings, model fallbacks) ride along as ``hermes_notices`` for
-    the conversation loop to show the user.
+    prompt-size fields. ``claim_notices`` (``ClaudeCodeSession.take_notices``:
+    plan window warnings, model fallbacks) rides along as
+    ``hermes_claim_notices``; the conversation loop calls it when it can show
+    the notices to the user.
     """
 
     usage = raw or {}
@@ -902,7 +908,7 @@ def _completion_usage(
         # The model's context window as Claude Code runs it (``modelUsage``);
         # the conversation loop syncs Hermes's compressor to it.
         context_window=_positive_int(usage.get("context_window")),
-        hermes_notices=tuple(notice for notice in notices or () if notice),
+        hermes_claim_notices=claim_notices if callable(claim_notices) else None,
     )
 
 
