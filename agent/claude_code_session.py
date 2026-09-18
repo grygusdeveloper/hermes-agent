@@ -2168,6 +2168,9 @@ class _InterruptContext(NamedTuple):
     base: tuple[tuple[str, str], ...]  # published fingerprints it continues
     fingerprints: tuple[tuple[str, str], ...]  # the run's whole request
     persisted: bool
+    # Checkpoints that are ancestors of the chain the run resumed (a rewind
+    # drops those of the branch it abandoned).
+    checkpoints: tuple[tuple[int, str], ...] = ()
 
 
 class _InterruptedTurn(NamedTuple):
@@ -2183,6 +2186,8 @@ class _InterruptedTurn(NamedTuple):
     base: tuple[tuple[str, str], ...]
     fingerprints: tuple[tuple[str, str], ...]
     marker: str
+    # Checkpoints still valid in the chain that ends at ``marker``.
+    checkpoints: tuple[tuple[int, str], ...] = ()
 
 
 class ClaudeCodeSessionExpired(RuntimeError):
@@ -2766,6 +2771,9 @@ class ClaudeCodeSession:
         # it (set while its reply is being read, see ``_run_turn``).
         self._interrupt_requested = False
         self._interruptible_process: subprocess.Popen[str] | None = None
+        # Identifies the turn being read (a warm process serves many turns):
+        # an interrupt's escalation only ever applies to its own turn.
+        self._interruptible_turn: object | None = None
         # One cancel event per run(), registered before it waits for the
         # locks: abort() cancels queued runs and runs between attempts too.
         self._run_cancels: set[threading.Event] = set()
@@ -2920,9 +2928,11 @@ class ClaudeCodeSession:
             if only_for is not None and self._active_run_cancel is not only_for:
                 return
             process = self._active_process
+            turn = self._interruptible_turn
             gentle = (
                 graceful
                 and process is not None
+                and turn is not None
                 and process is self._interruptible_process
                 and not self._abort_requested
             )
@@ -2935,11 +2945,11 @@ class ClaudeCodeSession:
         if process is None:
             return
         if gentle:
-            self._send_interrupt(process)
+            self._send_interrupt(process, turn)
         else:
             _kill_process_group(process)
 
-    def _send_interrupt(self, process: subprocess.Popen[str]) -> None:
+    def _send_interrupt(self, process: subprocess.Popen[str], turn: object) -> None:
         import uuid
 
         request = json.dumps(
@@ -2951,22 +2961,37 @@ class ClaudeCodeSession:
         )
 
         def _write() -> None:
+            with self._process_lock:
+                if self._interruptible_turn is not turn:
+                    # The turn ended meanwhile: never write into the next
+                    # turn's stdin.
+                    return
             try:
                 process.stdin.write(request + "\n")
                 process.stdin.flush()
             except Exception:
-                self._escalate_interrupt(process)
+                self._escalate_interrupt(process, turn)
 
         threading.Thread(target=_write, name="claude-code-interrupt", daemon=True).start()
-        timer = threading.Timer(_INTERRUPT_GRACE_SECONDS, self._escalate_interrupt, args=(process,))
+        timer = threading.Timer(
+            _INTERRUPT_GRACE_SECONDS, self._escalate_interrupt, args=(process, turn)
+        )
         timer.daemon = True
         timer.start()
 
-    def _escalate_interrupt(self, process: subprocess.Popen[str]) -> None:
-        """Kill ``process`` if its interrupted turn is still being read."""
+    def _escalate_interrupt(self, process: subprocess.Popen[str], turn: object) -> None:
+        """Kill ``process`` if the interrupted ``turn`` is still being read.
+
+        A warm process serves the next request right after an interrupted
+        turn ends (often well within the grace): that turn is never killed.
+        """
 
         with self._process_lock:
-            if self._interruptible_process is not process or self._abort_requested:
+            if (
+                self._interruptible_turn is not turn
+                or self._interruptible_process is not process
+                or self._abort_requested
+            ):
                 return
             self._abort_requested = True
         _LOG.info(
@@ -3195,7 +3220,7 @@ class ClaudeCodeSession:
                 prompt = f"{prompt}\n\n{time_line}"
             # A graceful interrupt of this run leaves it resumable.
             self._interrupt_context = _InterruptContext(
-                self._session_id, self._previous_messages, current, persist
+                self._session_id, self._previous_messages, current, persist, plan.checkpoints
             )
             try:
                 response, reasoning, session_id = self._execute_with_soft_limit_retry(
@@ -3323,10 +3348,13 @@ class ClaudeCodeSession:
             skipped("identity")
             return None
 
+        # An interrupted request (also a rewind, which does not extend the
+        # published history) continues right after its interruption.
+        resumed = self._plan_after_interrupt(messages, current, keepalive=keepalive)
+        if resumed is not None:
+            return resumed
+
         if prefix_ok:
-            resumed = self._plan_after_interrupt(messages, current, keepalive=keepalive)
-            if resumed is not None:
-                return resumed
             latest = (
                 checkpoints[-1][1]
                 if checkpoints and checkpoints[-1][0] == previous_count
@@ -3477,7 +3505,7 @@ class ClaudeCodeSession:
             prompt,
             images,
             interrupted.marker,
-            self._checkpoints,
+            interrupted.checkpoints,
             offset,
             _has_user_turn(current[count:]),
         )
@@ -3961,6 +3989,7 @@ class ClaudeCodeSession:
                 self._abort_requested = False
                 self._interrupt_requested = False
                 self._interruptible_process = None
+                self._interruptible_turn = None
                 self._active_run_cancel = None
                 self._request_active = False
 
@@ -4357,6 +4386,7 @@ class ClaudeCodeSession:
                 # being written would interleave with it on stdin.
                 with self._process_lock:
                     self._interruptible_process = process
+                    self._interruptible_turn = object()
 
             while True:
                 if timed_out.is_set():
@@ -4400,6 +4430,7 @@ class ClaudeCodeSession:
             watchdog.cancel()
             with self._process_lock:
                 self._interruptible_process = None
+                self._interruptible_turn = None
                 interrupted = self._interrupt_requested
             self._progress.end()
 
@@ -4498,7 +4529,11 @@ class ClaudeCodeSession:
                 parked = True
             if parked or context.persisted:
                 self._interrupted_turn = _InterruptedTurn(
-                    context.session_id, context.base, context.fingerprints, marker
+                    context.session_id,
+                    context.base,
+                    context.fingerprints,
+                    marker,
+                    context.checkpoints,
                 )
                 recorded = True
         if not parked:
@@ -4552,8 +4587,12 @@ class ClaudeCodeSession:
         if stdout.strip():
             detail_parts.append(stdout.strip()[-1000:])
         detail = "\n".join(detail_parts) if detail_parts else f"exit {returncode}"
-        if "--thinking-display" in detail and (
-            "unknown option" in detail.lower() or "allowed choices" in detail.lower()
+        # Argument errors are on stderr only: stdout holds the turn's events,
+        # and a reply that merely discusses these flags must not switch them
+        # off (or re-run the request).
+        argv_error = stderr.lower()
+        if "--thinking-display" in argv_error and (
+            "unknown option" in argv_error or "allowed choices" in argv_error
         ):
             global _thinking_display_supported
             _thinking_display_supported = False
@@ -4562,7 +4601,7 @@ class ClaudeCodeSession:
                 "stays hidden from now on"
             )
             raise _CliFlagRejected(f"Claude Code failed: {detail}")
-        if session_id and "--resume-session-at" in detail and "unknown option" in detail.lower():
+        if session_id and "--resume-session-at" in argv_error and "unknown option" in argv_error:
             global _resume_at_supported
             _resume_at_supported = False
             _LOG.warning(
