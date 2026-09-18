@@ -74,6 +74,9 @@ FAKE_CLI = textwrap.dedent(
     path = os.path.join(store, sid + ".json")
     chain = []
     write_log({"event": "spawn", "argv": argv})
+    if resume_at and os.environ.get("FAKE_CLAUDE_REJECT_RESUME_AT"):
+        sys.stderr.write("error: unknown option '--resume-session-at'\\n")
+        sys.exit(1)
     if "--resume" in argv:
         if not os.path.exists(path):
             sys.stderr.write("No conversation found with session ID: " + sid + "\\n")
@@ -109,12 +112,21 @@ FAKE_CLI = textwrap.dedent(
                  "result": "API Error: 500 boom", "session_id": sid})
             sys.stdout.flush()
             continue
+        if reply.get("rate_limit"):
+            out({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                 "result": "API Error: 429 rate_limit", "api_error_status": 429,
+                 "session_id": sid})
+            sys.stdout.flush()
+            continue
         text = reply.get("text", os.environ.get("FAKE_CLAUDE_REPLY", "Fake reply."))
         thinking_uuid, text_uuid = str(uuid.uuid4()), str(uuid.uuid4())
-        out({"type": "assistant", "uuid": thinking_uuid, "session_id": sid,
-             "message": {"content": [{"type": "thinking", "thinking": ""}]}})
-        out({"type": "assistant", "uuid": text_uuid, "session_id": sid,
-             "message": {"content": [{"type": "text", "text": text}]}})
+        # Older CLIs emit no chain uuid on assistant events.
+        shown = {} if reply.get("no_uuid") else {"uuid": thinking_uuid}
+        out(dict(shown, type="assistant", session_id=sid,
+                 message={"content": [{"type": "thinking", "thinking": ""}]}))
+        shown = {} if reply.get("no_uuid") else {"uuid": text_uuid}
+        out(dict(shown, type="assistant", session_id=sid,
+                 message={"content": [{"type": "text", "text": text}]}))
         chain.append({"uuid": thinking_uuid, "text": "(thinking)"})
         chain.append({"uuid": text_uuid, "text": "A: " + text})
         save()
@@ -161,7 +173,7 @@ def fake_cli(tmp_path, monkeypatch):
 
 def _env():
     keys = ("PATH", "FAKE_CLAUDE_LOG", "FAKE_CLAUDE_STORE", "FAKE_CLAUDE_SCRIPT",
-            "FAKE_CLAUDE_REPLY", "FAKE_CLAUDE_SLEEP")
+            "FAKE_CLAUDE_REPLY", "FAKE_CLAUDE_SLEEP", "FAKE_CLAUDE_REJECT_RESUME_AT")
     return {key: os.environ[key] for key in keys if key in os.environ}
 
 
@@ -240,6 +252,34 @@ def test_renderings_restore_tool_names_from_assistant_calls():
     assert "Tool Result (name=terminal, tool_call_id=c1):\na.txt" in prompt
     incremental, _ = _incremental_prompt_with_images(messages, 2)
     assert incremental == "Tool Result (name=terminal, tool_call_id=c1):\na.txt"
+
+
+def test_reused_call_ids_name_results_after_the_preceding_call():
+    """Regression: Claude reuses short ids (``g1``) across turns; a last-wins
+    id map labelled an old read_file result as the newest call's terminal."""
+
+    messages = [
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "content": "", "tool_calls": [_tool_call("g1", "read_file")]},
+        {"role": "tool", "tool_call_id": "g1", "content": "file body"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "run it twice"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            _tool_call("g1", "terminal"), _tool_call("g1", "process")]},
+        {"role": "tool", "tool_call_id": "g1", "content": "exit 0"},
+        {"role": "tool", "tool_call_id": "g1", "content": "pid 7"},
+    ]
+    _system, prompt, _images = _build_claude_code_request(messages)
+    headers = [line for line in prompt.splitlines() if line.startswith("Tool Result")]
+    assert headers == [
+        "Tool Result (name=read_file, tool_call_id=g1):",
+        "Tool Result (name=terminal, tool_call_id=g1):",
+        "Tool Result (name=process, tool_call_id=g1):",
+    ]
+    incremental, _ = _incremental_prompt_with_images(messages[:7], 3)
+    assert "Tool Result (name=terminal, tool_call_id=g1):\nexit 0" in incremental
+    incremental, _ = _incremental_prompt_with_images(messages, 7)
+    assert incremental == "Tool Result (name=process, tool_call_id=g1):\npid 7"
 
 
 def test_state_version_bump_ignores_old_states(tmp_path, monkeypatch):
@@ -657,6 +697,118 @@ def test_unknown_checkpoint_falls_back_to_a_fresh_session(fake_cli, monkeypatch)
     assert _arg(spawns[1]["argv"], "--resume-session-at") == UUID_A
     assert "--session-id" in spawns[2]["argv"]
     assert fake_cli.events("turn")[-1]["content"] == "FULL PROMPT"
+
+
+def _rewound_retry(session, cli):
+    """Turn A, turn B (+ a tool loop), then /retry of turn B."""
+
+    turn_a = [{"role": "system", "content": "rules"}, {"role": "user", "content": "u1"}]
+    _run(session, cli, turn_a)
+    turn_b = turn_a + [{"role": "assistant", "content": "F1"}, {"role": "user", "content": "u2"}]
+    _run(session, cli, turn_b)
+    _run(session, cli, _tool_turn(turn_b))
+    _run(session, cli, turn_b)
+    return turn_b
+
+
+def test_rewind_needs_resume_session_at(fake_cli, monkeypatch):
+    """Regression: without the flag a plain --resume loads the abandoned
+    branch, so sending only the rewound tail showed Claude both branches."""
+
+    import agent.claude_code_session as ccs
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    monkeypatch.setattr(ccs, "_resume_at_supported", False)
+    _rewound_retry(ClaudeCodeSession(), fake_cli)
+    turn = fake_cli.events("turn")[-1]
+    assert turn["content"] == "FULL PROMPT"
+    assert turn["context"] == ["FULL PROMPT"]
+
+
+def test_rewind_then_advance_stays_on_the_new_branch(fake_cli, monkeypatch):
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    session = ClaudeCodeSession()
+    turn_b = _rewound_retry(session, fake_cli)
+    turn_c = turn_b + [{"role": "assistant", "content": "Fake reply."}, {"role": "user", "content": "u3"}]
+    _run(session, fake_cli, turn_c)
+    context = fake_cli.events("turn")[-1]["context"]
+    assert not any("Tool Result" in entry for entry in context)
+    assert sum(entry == "User:\nu2" for entry in context) == 1
+    assert context[-1] == "User:\nu3"
+
+
+def test_cli_rejecting_resume_session_at_falls_back_then_resumes_plainly(fake_cli, monkeypatch):
+    import agent.claude_code_session as ccs
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    monkeypatch.setenv("FAKE_CLAUDE_REJECT_RESUME_AT", "1")
+    monkeypatch.setattr(ccs, "_resume_at_supported", True)
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run(session, fake_cli, history)
+    history += [{"role": "assistant", "content": "Fake reply."}, {"role": "user", "content": "more"}]
+    assert _run(session, fake_cli, history)[0] == "Fake reply."
+    assert ccs._resume_at_supported is False
+    history += [{"role": "assistant", "content": "Fake reply."}, {"role": "user", "content": "third"}]
+    _run(session, fake_cli, history)
+    spawns = fake_cli.events("spawn")
+    assert "--resume-session-at" in spawns[1]["argv"]  # rejected
+    assert "--session-id" in spawns[2]["argv"]  # fresh fallback
+    assert "--resume" in spawns[3]["argv"] and "--resume-session-at" not in spawns[3]["argv"]
+    assert fake_cli.events("turn")[-1]["content"] == "User:\nthird"
+
+
+def test_rate_limit_error_retry_resumes_at_the_checkpoint(fake_cli, monkeypatch):
+    """An is_error 429 on the warm process is retried cold at the checkpoint."""
+
+    monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
+    fake_cli.script({}, {"rate_limit": True}, {"text": "The listing shows one file."})
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run(session, fake_cli, history)
+    response, _ = _run(session, fake_cli, _tool_turn(history))
+    assert response == "The listing shows one file."
+    spawns = fake_cli.events("spawn")
+    assert len(spawns) == 2 and "--resume-session-at" in spawns[1]["argv"]
+    context = fake_cli.events("turn")[-1]["context"]
+    assert sum("Tool Result" in entry for entry in context) == 1
+
+
+def test_aborted_turn_is_dropped_on_retry(fake_cli):
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run(session, fake_cli, history)
+    fake_cli.script({"sleep": 5})
+    timer = threading.Timer(0.5, session.abort)
+    timer.start()
+    with pytest.raises(RuntimeError, match="aborted"):
+        _run(session, fake_cli, _tool_turn(history))
+    timer.join()
+    fake_cli.script({})
+    _run(session, fake_cli, _tool_turn(history))
+    context = fake_cli.events("turn")[-1]["context"]
+    assert sum("Tool Result" in entry for entry in context) == 1
+
+
+def test_stateless_retry_without_warm_process_goes_fresh_directly(fake_cli, monkeypatch):
+    """Regression: a soft-limit retry of a stateless (review-fork) session
+    spawned ``--no-session-persistence --resume``, which can never work."""
+
+    monkeypatch.setattr("agent.claude_code_session.time.sleep", lambda *_a, **_k: None)
+    banner = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
+    fake_cli.script({}, {"text": banner}, {"text": "Saved the preference to memory."})
+    fork = ClaudeCodeSession()
+    review = [{"role": "user", "content": "Review the conversation above"}]
+    _run(fork, fake_cli, review, state_key=None, keepalive=True)
+    review += [{"role": "assistant", "content": "", "tool_calls": [_tool_call("m1", "memory")]},
+               {"role": "tool", "tool_call_id": "m1", "content": "saved"}]
+    response, _ = _run(fork, fake_cli, review, state_key=None, keepalive=True)
+    assert response == "Saved the preference to memory."
+    spawns = fake_cli.events("spawn")
+    assert len(spawns) == 2
+    assert not any("--resume" in spawn["argv"] for spawn in spawns)
+    assert fake_cli.events("turn")[-1]["content"] == "FULL PROMPT"
+    fork.shutdown()
 
 
 # ---------------------------------------------------------------------------

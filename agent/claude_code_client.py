@@ -47,8 +47,7 @@ from agent.claude_code_session import (
     _HERMES_BACKEND_SYSTEM_PROMPT,
     ClaudeCodeSession,
     _render_content_collecting_images,
-    _tool_names_by_call_id,
-    _tool_result_name,
+    _ToolNameResolver,
 )
 from agent.portal_tags import get_bridge_state_key
 
@@ -167,15 +166,16 @@ def _build_claude_code_request(
 
     transcript: list[str] = []
     # Tool results reloaded from the session DB carry no ``name``; recover it
-    # from the assistant call so replays label results like live turns.
-    tool_names = _tool_names_by_call_id(messages)
+    # from the preceding assistant call so replays label results like live
+    # turns.
+    tool_names = _ToolNameResolver(messages[:index])
     for message in messages[index:]:
         if not isinstance(message, dict):
             continue
+        tool_name = tool_names.feed(message)
         role = str(message.get("role") or "unknown").strip().lower()
         if role == "tool":
             tool_call_id = message.get("tool_call_id") or message.get("id") or ""
-            tool_name = _tool_result_name(message, tool_names)
             rendered = _render_transcript_content(message.get("content"), images)
             meta = []
             if isinstance(tool_name, str) and tool_name.strip():

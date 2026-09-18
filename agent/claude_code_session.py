@@ -305,40 +305,45 @@ def _tool_call_id_and_name(call: Any) -> tuple[Any, Any]:
     return getattr(call, "id", None), getattr(getattr(call, "function", None), "name", None)
 
 
-def _tool_names_by_call_id(messages: list[dict[str, Any]]) -> dict[str, str]:
-    """Map assistant ``tool_calls`` ids to their function names.
+class _ToolNameResolver:
+    """Name tool results after the call that produced them.
 
     Tool results reloaded from the session DB carry no ``name``; renderings
-    recover it from the call that produced the result, so live and replayed
-    transcripts label results the same way.
+    recover it from the assistant ``tool_calls`` so live and replayed
+    transcripts label results the same way. Claude reuses short call ids
+    across turns (``call_1``, ``g1``), so the name must come from the nearest
+    *preceding* call with that id, not from any call anywhere in the history.
+    Feed every message in order; :meth:`feed` returns a tool result's name.
     """
 
-    names: dict[str, str] = {}
-    for message in messages:
+    def __init__(self, messages: list[dict[str, Any]] | tuple = ()) -> None:
+        # call id -> names of the latest assistant message's calls with that
+        # id, in call order (an id repeated within one batch is consumed in
+        # order by its results).
+        self._names: dict[str, list[str]] = {}
+        for message in messages:
+            self.feed(message)
+
+    def feed(self, message: Any) -> str:
         if not isinstance(message, dict):
-            continue
+            return ""
         calls = message.get("tool_calls")
-        if not isinstance(calls, list):
-            continue
-        for call in calls:
-            call_id, name = _tool_call_id_and_name(call)
-            if isinstance(call_id, str) and call_id and isinstance(name, str) and name.strip():
-                names[call_id] = name.strip()
-    return names
-
-
-def _tool_result_name(message: dict[str, Any], names: dict[str, str]) -> str:
-    """Best available tool name for a tool-result message."""
-
-    call_id = message.get("tool_call_id")
-    for candidate in (
-        message.get("name"),
-        message.get("tool_name"),
-        names.get(call_id) if isinstance(call_id, str) else None,
-    ):
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return ""
+        if isinstance(calls, list) and calls:
+            batch: dict[str, list[str]] = {}
+            for call in calls:
+                call_id, name = _tool_call_id_and_name(call)
+                if isinstance(call_id, str) and call_id and isinstance(name, str) and name.strip():
+                    batch.setdefault(call_id, []).append(name.strip())
+            self._names.update(batch)
+        if str(message.get("role") or "").lower() != "tool":
+            return ""
+        call_id = message.get("tool_call_id")
+        queue = self._names.get(call_id) if isinstance(call_id, str) else None
+        recovered = (queue.pop(0) if len(queue) > 1 else queue[0]) if queue else ""
+        for candidate in (message.get("name"), message.get("tool_name"), recovered):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return ""
 
 
 def _state_dir() -> Path:
@@ -738,12 +743,13 @@ def _incremental_prompt_with_images(
 
     parts: list[str] = []
     images: list[dict[str, Any]] = []
-    # Built over the whole history: a result's call usually precedes the
-    # incremental window.
-    tool_names = _tool_names_by_call_id(messages)
+    # Fed with the history before the window too: a result's call usually
+    # precedes the incremental window.
+    tool_names = _ToolNameResolver(messages[:previous_count])
     for message in messages[previous_count:]:
         if not isinstance(message, dict):
             continue
+        tool_name = tool_names.feed(message)
         role = str(message.get("role") or "").lower()
         # Claude Code already owns its prior assistant output in the server
         # session.  Re-sending it would duplicate context.
@@ -754,7 +760,6 @@ def _incremental_prompt_with_images(
             continue
         if role == "tool":
             tool_call_id = message.get("tool_call_id") or message.get("id") or ""
-            tool_name = _tool_result_name(message, tool_names)
             header = "Tool Result"
             meta_bits = []
             if isinstance(tool_name, str) and tool_name.strip():
@@ -1835,7 +1840,9 @@ class ClaudeCodeSession:
         # whose prefix, including Claude's reply to it, is still intact, and
         # send only what follows. The tail must hold no assistant message:
         # Claude would otherwise miss replies from the abandoned branch.
-        if self._session_persisted:
+        # Only with ``--resume-session-at``: a plain resume would load the
+        # abandoned branch too, and the re-sent tail would follow it.
+        if self._session_persisted and _resume_at_supported:
             for index in range(len(checkpoints) - 1, -1, -1):
                 count, checkpoint = checkpoints[index]
                 if count >= previous_count:
@@ -2271,6 +2278,14 @@ class ClaudeCodeSession:
                     self._discard_warm()
             else:
                 self._discard_warm()
+
+        if session_id and not persist:
+            # A --no-session-persistence conversation lives only inside its
+            # warm process; a new process cannot --resume it. Fail over to a
+            # fresh session instead of spawning a CLI that would say so.
+            raise ClaudeCodeSessionExpired(
+                "Claude Code stateless session is no longer warm; cannot resume it"
+            )
 
         argv = self._build_argv(
             claude_bin,
