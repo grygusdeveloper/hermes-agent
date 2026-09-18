@@ -69,6 +69,15 @@ Design invariants
   ``agent.portal_tags.get_bridge_state_key``); ``state_key=None`` calls are
   stateless: they run with ``--no-session-persistence``, never publish, and
   continue only inside their own warm process.
+* **Plan limits and notices** — every ``rate_limit_event`` is persisted
+  (``rate_limit.json`` next to the durable states) for ``/usage`` and
+  ``/status``. A plan window at 90 % or more (once per window cycle) and a
+  model fallback or refusal inside Claude Code become notices delivered with
+  the next reply (``take_notices``).
+* **Control requests** — ``get_usage``, ``get_context_usage``,
+  ``list_models`` (``/claude``, ``/usage``) are answered by the parked warm
+  process when the session is idle, else by a throwaway control-only process;
+  never a model turn.
 * **Tool protocol** — Claude emits ``<tool_call>{"id", "name", "arguments":
   {...}}</tool_call>`` blocks at the end of a reply and receives results as
   ``<tool_result id= name=>`` blocks. One parser (``_parse_claude_reply``)
@@ -1956,6 +1965,7 @@ class _TurnMonitor:
         self.compacted = False
         self.fallback_model: str | None = None
         self.fallback_session_wide = False
+        self.fallback_notice = ""
         # Uuid of the latest chain entry the CLI reported (assistant block or
         # the "[Request interrupted by user]" user entry).
         self.chain_uuid: str | None = None
@@ -2149,6 +2159,8 @@ class _TurnMonitor:
                 self.fallback_model = str(fallback)
                 self.fallback_session_wide = scope in (None, "session")
                 self._progress.notice(f"answered by {fallback} after a {subtype.replace('_', ' ')}")
+            # Shown to the user once the turn is delivered.
+            self.fallback_notice = _model_fallback_notice(subtype, event)
 
     def log(self, outcome: str, usage: dict[str, Any] | None = None) -> None:
         """One INFO line per CLI turn: spawn vs warm, latencies, tokens."""
@@ -2510,6 +2522,190 @@ def clear_usage_limit_blocks() -> None:
 
     with _USAGE_LIMIT_LOCK:
         _USAGE_LIMIT_BLOCKS.clear()
+
+
+# ---------------------------------------------------------------------------
+# Plan windows: the persisted snapshot and one-time warnings
+# ---------------------------------------------------------------------------
+
+# The latest ``rate_limit_info`` any bridge process saw, next to the durable
+# session states. Claude Code emits ``rate_limit_event`` only when the info
+# changes, so a warm process (or a new agent, or a restarted gateway) may not
+# see one for a while; ``/usage`` and ``/status`` read this copy.
+_RATE_LIMIT_FILE_NAME = "rate_limit.json"
+_RATE_LIMIT_FILE_LOCK = threading.Lock()
+# Held across a read-modify-write of the file (recording info, marking a
+# warning delivered) so this process's writers never drop each other's.
+_RATE_LIMIT_UPDATE_LOCK = threading.Lock()
+# A plan window at or above this utilization is announced once per window
+# cycle (until its reset), the way Claude Code's own UI warns. "Announced"
+# means shown to the user: a warning only counts once a reply carried it
+# (``ClaudeCodeSession.take_notices``), so an auxiliary call that saw the
+# window first cannot swallow it.
+_LIMIT_WARNING_UTILIZATION = 0.9
+_MAX_PENDING_NOTICES = 8
+
+
+def _rate_limit_path() -> Path:
+    return _state_dir() / _RATE_LIMIT_FILE_NAME
+
+
+def load_rate_limit_snapshot() -> dict[str, Any] | None:
+    """The persisted plan snapshot: ``{"info", "recorded_at", "warned"}``.
+
+    ``info`` is the CLI's last ``rate_limit_info``, ``recorded_at`` when it
+    arrived (epoch seconds) and ``warned`` the windows already announced
+    (window -> reset epoch). None when nothing was recorded or the file is
+    unreadable.
+    """
+
+    try:
+        with _RATE_LIMIT_FILE_LOCK:
+            payload = json.loads(_rate_limit_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("info"), dict):
+        return None
+    recorded_at = payload.get("recorded_at")
+    warned = payload.get("warned")
+    return {
+        "info": payload["info"],
+        "recorded_at": float(recorded_at) if isinstance(recorded_at, (int, float)) else None,
+        "warned": warned if isinstance(warned, dict) else {},
+    }
+
+
+def _save_rate_limit_snapshot(
+    info: dict[str, Any], warned: dict[str, Any], *, recorded_at: float | None = None
+) -> None:
+    directory = _state_dir()
+    path = _rate_limit_path()
+    encoded = json.dumps(
+        {
+            "info": info,
+            "recorded_at": time.time() if recorded_at is None else recorded_at,
+            "warned": warned,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    with _RATE_LIMIT_FILE_LOCK:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(encoded)
+            os.replace(temp, path)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _mark_limit_warnings_delivered(
+    keys: list[tuple[str, float | None]],
+) -> set[tuple[str, float | None]]:
+    """Record plan warnings as shown; returns the ones not already shown by
+    another session (those are dropped rather than repeated)."""
+
+    with _RATE_LIMIT_UPDATE_LOCK:
+        snapshot = load_rate_limit_snapshot()
+        if snapshot is None:
+            return set(keys)
+        warned = dict(snapshot["warned"])
+        fresh = {key for key in keys if key[0] not in warned or warned[key[0]] != key[1]}
+        if fresh:
+            warned.update(dict(fresh))
+            _save_rate_limit_snapshot(
+                snapshot["info"], warned, recorded_at=snapshot.get("recorded_at")
+            )
+        return fresh
+
+
+def _utilization(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
+def plan_windows(info: dict[str, Any] | None) -> dict[str, tuple[float | None, float | None]]:
+    """``window -> (utilization, reset epoch)`` of a ``rate_limit_info``.
+
+    Utilization is a fraction (1.0 = the window's allowance; extra usage can
+    take it past 1). ``unifiedWindows`` holds the session and weekly windows;
+    the info's own ``rateLimitType`` fills in a window it does not list.
+    """
+
+    windows: dict[str, tuple[float | None, float | None]] = {}
+    if not isinstance(info, dict):
+        return windows
+    unified = info.get("unifiedWindows")
+    if isinstance(unified, dict):
+        for name, window in unified.items():
+            if isinstance(name, str) and isinstance(window, dict):
+                windows[name] = (
+                    _utilization(window.get("utilization")),
+                    _epoch_seconds(window.get("resetsAt")),
+                )
+    kind = info.get("rateLimitType")
+    if isinstance(kind, str) and kind and kind not in windows:
+        windows[kind] = (_utilization(info.get("utilization")), _epoch_seconds(info.get("resetsAt")))
+    return windows
+
+
+def _limit_warnings(
+    info: dict[str, Any], warned: dict[str, Any], now: float
+) -> list[tuple[str, float | None, str]]:
+    """``(window, reset, text)`` for windows to announce now.
+
+    A window is announced when it is at ``_LIMIT_WARNING_UTILIZATION`` or
+    more, or when the CLI flags it (status ``allowed_warning``), once per
+    window cycle: ``warned`` maps a window to the reset it was announced for.
+    A rejected request is reported by the error path instead.
+    """
+
+    if info.get("status") == "rejected":
+        return []
+    flagged = info.get("rateLimitType") if info.get("status") == "allowed_warning" else None
+    found: list[tuple[str, float | None, str]] = []
+    for name, (utilization, resets_at) in plan_windows(info).items():
+        hot = utilization is not None and utilization >= _LIMIT_WARNING_UTILIZATION
+        if not hot and name != flagged:
+            continue
+        if resets_at is not None and resets_at <= now:
+            continue
+        if name in warned and warned[name] == resets_at:
+            continue
+        label = _RATE_LIMIT_LABELS.get(name) or name.replace("_", " ") + " limit"
+        state = f"is {utilization:.0%} used" if utilization is not None else "is almost used up"
+        when = _reset_label(resets_at, now)
+        text = f"⚠️ Claude {label} {state}" + (f" — resets {when}" if when else "") + "."
+        found.append((name, resets_at, text))
+    return found
+
+
+def _model_fallback_notice(subtype: str, event: dict[str, Any]) -> str:
+    """The user-facing line for a CLI model fallback or refusal event.
+
+    Claude Code's own ``content`` text is preferred ("Opus 5's safeguards
+    flagged this message… Switched to Opus 4.8"); it is CLI text, never the
+    model's.
+    """
+
+    content = event.get("content")
+    if isinstance(content, str) and content.strip():
+        return "⚠️ Claude Code: " + " ".join(content.split())[:300]
+    original = event.get("originalModel") or event.get("original_model") or "Claude"
+    fallback = event.get("fallbackModel") or event.get("fallback_model")
+    category = event.get("apiRefusalCategory") or event.get("api_refusal_category")
+    why = f" ({category})" if category else ""
+    if subtype == "model_refusal_no_fallback":
+        return f"⚠️ {original} declined this request{why}."
+    if subtype == "model_refusal_fallback":
+        return f"⚠️ {original} declined this request{why}; {fallback} answered instead."
+    return f"⚠️ {original} was unavailable; {fallback} answered instead."
 
 
 def _is_soft_limit_detail(detail: str) -> bool:
@@ -2880,14 +3076,19 @@ def _response_text_for_preamble_detection(text: str) -> str:
     return _parse_claude_reply(text).cleaned
 
 
-def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+def _build_subprocess_env(
+    base_env: dict[str, str] | None = None,
+    *,
+    defaults: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Build a child-process environment.
 
     Authentication is delegated to the already-authenticated Claude Code CLI
     (it reads its own OAuth/keychain state).  We never inject provider API
     keys.  Default path uses the Hermes scrubber with credentials stripped.
     There is no fail-open raw ``os.environ`` path — if the scrubber is
-    unavailable, raise.
+    unavailable, raise. ``defaults`` replaces ``_CLI_ENV_DEFAULTS`` (an
+    explicit value in the base environment or ``os.environ`` still wins).
     """
 
     if base_env is None:
@@ -2907,7 +3108,7 @@ def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, s
             "CLAUDE_API_KEY",
         }:
             env.pop(key, None)
-    for key, value in _CLI_ENV_DEFAULTS.items():
+    for key, value in (_CLI_ENV_DEFAULTS if defaults is None else defaults).items():
         env.setdefault(key, os.environ.get(key, value))
     return env
 
@@ -3021,6 +3222,346 @@ def _has_user_turn(fingerprints: tuple[tuple[str, str], ...]) -> bool:
     return any(role not in {"assistant", "tool"} for role, _digest in fingerprints)
 
 
+# ---------------------------------------------------------------------------
+# Control requests (no model turn)
+# ---------------------------------------------------------------------------
+
+# stream-json control requests Claude Code answers without a model call
+# (verified on 2.1.276): ``get_usage`` (plan windows, via the CLI's own
+# OAuth), ``get_context_usage`` (its view of the conversation's context),
+# ``list_models``, ``get_binary_version``. A parked warm process answers at
+# once (except ``get_usage``, see below); otherwise a throwaway control-only
+# process does (about 1-2 s).
+_CONTROL_TIMEOUT_SECONDS = 30.0
+_WARM_CONTROL_TIMEOUT_SECONDS = 10.0
+_CONTROL_SYSTEM_PROMPT = "Hermes control channel; no model turn is requested."
+# Claude Code counts the claude.ai usage lookup behind ``get_usage`` as
+# nonessential traffic: with CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 (the
+# bridge's default for model turns) it answers ``rate_limits: null`` (seen
+# on 2.1.276). Control-only processes run without that default, and warm
+# processes (spawned with it) never serve these requests.
+_CONTROL_ENV_DEFAULTS = {
+    key: value
+    for key, value in _CLI_ENV_DEFAULTS.items()
+    if key != "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+}
+_WARM_UNSERVED_CONTROL = frozenset({"get_usage"})
+
+
+class ClaudeCodeControlError(RuntimeError):
+    """A control request failed: the CLI answered with an error, or gave no
+    answer in time (or exited first)."""
+
+
+class _ControlNoAnswer(ClaudeCodeControlError):
+    """No answer before the timeout, or the CLI exited first."""
+
+
+def _exchange_control(
+    process: Any,
+    requests: list[tuple[str, dict[str, Any]]],
+    *,
+    timeout: float,
+    on_timeout: Any,
+    on_event: Any = None,
+) -> list[Any]:
+    """Write ``requests`` to a stream-json CLI and read their answers.
+
+    Returns one item per request: the ``response`` payload, or a
+    ``ClaudeCodeControlError``. Other events read meanwhile go to
+    ``on_event``. ``on_timeout`` must end the process (the blocked read then
+    sees EOF); no reader is left behind on a warm process's stdout.
+    """
+
+    import uuid
+
+    ids: list[str] = []
+    lines: list[str] = []
+    for subtype, fields in requests:
+        request_id = f"hermes-{subtype}-{uuid.uuid4().hex[:8]}"
+        ids.append(request_id)
+        lines.append(
+            json.dumps(
+                {
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": {"subtype": subtype, **(fields or {})},
+                }
+            )
+        )
+    answers: dict[str, Any] = {}
+    timed_out = threading.Event()
+    state_lock = threading.Lock()
+    finished = [False]
+
+    def _expire() -> None:
+        with state_lock:
+            if finished[0]:
+                return
+            timed_out.set()
+        try:
+            on_timeout()
+        except Exception:
+            pass
+
+    timer = threading.Timer(max(0.05, float(timeout)), _expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        try:
+            process.stdin.write("\n".join(lines) + "\n")
+            process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise ClaudeCodeControlError(f"Claude Code control channel closed: {exc}") from exc
+        pending = set(ids)
+        while pending and not timed_out.is_set():
+            try:
+                line = process.stdout.readline()
+            except (OSError, ValueError):
+                line = ""
+            if not line:
+                break
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "control_response":
+                response = event.get("response")
+                request_id = response.get("request_id") if isinstance(response, dict) else None
+                if request_id in pending:
+                    pending.discard(request_id)
+                    answers[request_id] = response
+            elif on_event is not None:
+                try:
+                    on_event(event)
+                except Exception:
+                    pass
+    finally:
+        with state_lock:
+            finished[0] = True
+        timer.cancel()
+    results: list[Any] = []
+    for request_id, (subtype, _fields) in zip(ids, requests):
+        response = answers.get(request_id)
+        if response is None:
+            results.append(
+                _ControlNoAnswer(
+                    f"Claude Code did not answer {subtype} "
+                    + ("in time" if timed_out.is_set() else "(the CLI exited)")
+                )
+            )
+        elif response.get("subtype") == "success":
+            payload = response.get("response")
+            results.append(payload if isinstance(payload, dict) else {})
+        else:
+            results.append(
+                ClaudeCodeControlError(
+                    f"Claude Code refused {subtype}: {str(response.get('error') or 'error')[:300]}"
+                )
+            )
+    return results
+
+
+# ``claude auth status --json`` fields that are safe to show in a chat: no
+# email, organization or token material.
+_AUTH_STATUS_FIELDS = ("loggedIn", "authMethod", "apiProvider", "subscriptionType")
+
+
+def claude_cli_diagnostics(
+    command: str | None = None,
+    *,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Local health facts about the Claude Code CLI for ``/claude doctor``.
+
+    ``{"command", "path", "version", "auth", "errors"}``: the configured
+    command, the binary it resolves to (symlinks followed: Claude Code keeps
+    versions side by side), ``claude --version`` and the non-secret fields of
+    ``claude auth status --json``. Never reads credential files.
+    """
+
+    import shutil
+
+    claude_bin = (command or "").strip() or _resolve_claude_command()
+    facts: dict[str, Any] = {
+        "command": claude_bin,
+        "path": None,
+        "version": None,
+        "auth": {},
+        "errors": [],
+    }
+    found = shutil.which(claude_bin)
+    if found:
+        facts["path"] = os.path.realpath(found)
+    else:
+        facts["errors"].append(f"'{claude_bin}' not found on PATH or not executable")
+        return facts
+    run_env = _build_subprocess_env(env)
+    for args, key in ((["--version"], "version"), (["auth", "status", "--json"], "auth")):
+        try:
+            done = subprocess.run(
+                [claude_bin, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=run_env,
+                cwd=cwd or str(Path.home()),
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            facts["errors"].append(f"claude {' '.join(args)}: {exc}")
+            continue
+        output = (done.stdout or "").strip()
+        if key == "version":
+            if output:
+                facts["version"] = output.splitlines()[0][:120]
+            if done.returncode != 0:
+                facts["errors"].append(f"claude --version exited {done.returncode}")
+            continue
+        try:
+            payload = json.loads(output) if output else {}
+        except ValueError:
+            payload = {}
+        if isinstance(payload, dict) and payload:
+            facts["auth"] = {name: payload[name] for name in _AUTH_STATUS_FIELDS if name in payload}
+        else:
+            facts["errors"].append(
+                f"claude auth status exited {done.returncode} without a JSON status"
+            )
+    return facts
+
+
+def bridge_diagnostics() -> dict[str, Any]:
+    """This process's bridge state for ``/claude doctor``: optional CLI flags
+    still in use, warm processes, subscription-limit blocks, state files."""
+
+    with _WARM_LOCK:
+        parked = len(_WARM_IDLE)
+    with _USAGE_LIMIT_LOCK:
+        blocks = {model: entry[0] for model, entry in _USAGE_LIMIT_BLOCKS.items()}
+    directory = _state_dir()
+    try:
+        states = sum(
+            1 for path in directory.glob("*.json") if path.name != _RATE_LIMIT_FILE_NAME
+        )
+    except OSError:
+        states = 0
+    return {
+        "flags": {
+            "--thinking-display": _thinking_display_supported,
+            "--thinking": _thinking_mode_supported,
+            "--resume-session-at": _resume_at_supported,
+        },
+        "warm_parked": parked,
+        "warm_cap": _max_warm_processes(),
+        "keepalive_seconds": _keepalive_seconds(),
+        "usage_limit_blocks": blocks,
+        "state_dir": str(directory),
+        "state_files": states,
+    }
+
+
+def run_control_requests(
+    requests: list[tuple[str, dict[str, Any]]],
+    *,
+    command: str | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    model: str | None = None,
+    resume_session_id: str | None = None,
+    timeout: float = _CONTROL_TIMEOUT_SECONDS,
+    on_event: Any = None,
+) -> list[Any]:
+    """Answer ``requests`` from a throwaway control-only CLI process.
+
+    No user message is sent, so no model turn runs, and the process persists
+    nothing (``--no-session-persistence``). ``resume_session_id`` loads that
+    conversation first (``--resume <sid> --fork-session``: the original is
+    only read), for ``get_context_usage``; it must be looked up from the
+    working directory the conversation ran in (Claude Code stores sessions per
+    project directory). Raises ``ClaudeCodeLaunchError`` when the CLI cannot
+    start; per-request failures come back as ``ClaudeCodeControlError`` items.
+    """
+
+    claude_bin = (command or "").strip() or _resolve_claude_command()
+    work_dir = cwd or str(Path.home())
+    argv = [
+        claude_bin,
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--system-prompt",
+        _CONTROL_SYSTEM_PROMPT,
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--no-session-persistence",
+    ]
+    if model:
+        argv += ["--model", _validate_flag_size(str(model))]
+    if resume_session_id:
+        argv += [
+            "--resume",
+            _require_uuid_session_id(resume_session_id, where="control-resume"),
+            "--fork-session",
+        ]
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            cwd=work_dir,
+            env=_build_subprocess_env(env, defaults=_CONTROL_ENV_DEFAULTS),
+            start_new_session=True,
+        )
+    except OSError as exc:
+        if not _is_launch_failure(exc):
+            raise
+        raise ClaudeCodeLaunchError(
+            f"Claude Code CLI not launchable at '{claude_bin}' "
+            f"({exc.strerror or type(exc).__name__})."
+        ) from exc
+    try:
+        return _exchange_control(
+            process,
+            requests,
+            timeout=timeout,
+            on_timeout=lambda: _kill_process_group(process),
+            on_event=on_event,
+        )
+    except ClaudeCodeControlError as exc:
+        # The CLI exited before reading the requests (bad flags, a session
+        # that cannot be resumed).
+        return [exc for _request in requests]
+    finally:
+        try:
+            process.stdin.close()
+        except Exception:
+            pass
+        threading.Thread(
+            target=_reap_process_group,
+            args=(process,),
+            kwargs={"grace_seconds": 2.0},
+            name="claude-code-control-reap",
+            daemon=True,
+        ).start()
+
+
 class ClaudeCodeSession:
     """One collision-free Claude Code conversation bound to one Hermes client.
 
@@ -3091,6 +3632,14 @@ class ClaudeCodeSession:
         # tool-call repair): accounting only, never context size.
         self._last_retry_usage: dict[str, Any] = {}
         self._last_rate_limit: dict[str, Any] = {}
+        # User-facing notices (plan window warnings, model fallbacks) waiting
+        # to be delivered with the next reply (see ``take_notices``).
+        # (text, plan window key or None) in arrival order.
+        self._pending_notices: list[tuple[str, tuple[str, float | None] | None]] = []
+        self._notice_lock = threading.Lock()
+        # Sum of every CLI turn's API-equivalent cost this session reported
+        # (retried attempts included): callers diff it around a Hermes turn.
+        self._cost_total_usd = 0.0
         self._warm: _WarmProcess | None = None
         self._progress = _Progress()
         # Per-turn log context set by the retry loop ("turn=2 reason=…").
@@ -3123,6 +3672,195 @@ class ClaudeCodeSession:
         """Most recent ``rate_limit_info`` reported by the Claude Code CLI."""
 
         return dict(self._last_rate_limit)
+
+    @property
+    def cost_total_usd(self) -> float:
+        """API-equivalent cost of every CLI turn this session ran (USD).
+
+        Claude Code reports it even on a subscription, where nothing is
+        billed per token; the gateway footer shows a Hermes turn's share.
+        """
+
+        return self._cost_total_usd
+
+    def take_notices(self) -> list[str]:
+        """Pop the notices to show with the reply just produced: plan window
+        warnings (once per window cycle) and CLI model fallbacks.
+
+        Only a caller that shows them to the user should take them: plan
+        warnings count as announced from here on.
+        """
+
+        with self._notice_lock:
+            pending, self._pending_notices = self._pending_notices, []
+        keys = [key for _text, key in pending if key is not None]
+        deliverable: set[tuple[str, float | None]] = set(keys)
+        if keys:
+            try:
+                deliverable = _mark_limit_warnings_delivered(keys)
+            except Exception:
+                _LOG.debug("Could not record delivered Claude plan warnings", exc_info=True)
+        return [text for text, key in pending if key is None or key in deliverable]
+
+    def _add_notice(self, text: str, key: tuple[str, float | None] | None = None) -> None:
+        if not text:
+            return
+        with self._notice_lock:
+            if all(text != item and (key is None or key != item_key) for item, item_key in self._pending_notices):
+                self._pending_notices.append((text, key))
+                del self._pending_notices[:-_MAX_PENDING_NOTICES]
+
+    def describe(self) -> dict[str, Any]:
+        """A snapshot of the bound conversation for ``/claude status``.
+
+        Never prompt or answer text: ids, model, counts, the warm process and
+        the last call's usage.
+        """
+
+        warm = self._warm
+        warm_alive = warm is not None and warm.alive()
+        with _WARM_LOCK:
+            parked = warm_alive and _WARM_IDLE.get(id(warm)) is warm
+        return {
+            "session_id": self._session_id,
+            "persisted": self._session_persisted,
+            "state_key": self._state_key,
+            "model": self._bound_model,
+            "effort": self._bound_effort,
+            "checkpoints": len(self._checkpoints),
+            "messages": len(self._previous_messages),
+            "interrupted": self._interrupted_turn is not None,
+            "warm": (
+                {"parked": parked, "turns": warm.turns, "pid": getattr(warm.process, "pid", None)}
+                if warm_alive
+                else None
+            ),
+            "busy": self._request_active,
+            "progress": self._progress.snapshot(),
+            "last_usage": dict(self._last_usage),
+            "rate_limit": dict(self._last_rate_limit),
+            "cost_total_usd": self._cost_total_usd,
+        }
+
+    def reset_conversation(self, state_key: str | None = None) -> str | None:
+        """Drop the Claude-side conversation only (``/claude reset``).
+
+        Hermes keeps its transcript; the next request starts a fresh Claude
+        Code session from it. Deletes the durable state of ``state_key``
+        (default: the bound one), forgets the binding, closes the warm
+        process and lifts recorded subscription-limit blocks so the next call
+        re-checks. Returns the dropped Claude session id, if any.
+        """
+
+        key = state_key or self._state_key
+        with self._lock, _durable_transition_lock(key):
+            dropped = self._session_id
+            if key:
+                durable = _load_durable_state(key)
+                if durable is not None:
+                    dropped = dropped or durable.session_id
+                _delete_durable_state(key)
+            self._clear_binding()
+            self._discard_warm()
+            self._pending_discard_note = False
+        clear_usage_limit_blocks()
+        _LOG.info("Claude Code session %s dropped on request (/claude reset)", dropped or "-")
+        return dropped
+
+    def conversation_ref(self, state_key: str | None = None) -> dict[str, Any] | None:
+        """``{"session_id", "model", "persisted"}`` of the conversation, or
+        None: the bound one, else the durable state of ``state_key``."""
+
+        if self._session_id:
+            return {
+                "session_id": self._session_id,
+                "model": self._bound_model,
+                "persisted": self._session_persisted,
+            }
+        key = state_key or self._state_key
+        durable = _load_durable_state(key) if key else None
+        if durable is None:
+            return None
+        return {"session_id": durable.session_id, "model": durable.model, "persisted": True}
+
+    def control_requests(
+        self,
+        requests: list[tuple[str, dict[str, Any]]],
+        *,
+        command: str | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        conversation: bool = False,
+        state_key: str | None = None,
+        timeout: float = _CONTROL_TIMEOUT_SECONDS,
+    ) -> list[Any]:
+        """Answer stream-json control requests without a model turn.
+
+        The parked warm process answers when the session is idle (it holds
+        the conversation in memory, and it is parked again unchanged);
+        otherwise a throwaway control-only process does. ``conversation``
+        asks for the conversation's own view (``get_context_usage``): the
+        throwaway process then loads it read-only (see
+        :func:`run_control_requests`). Returns one item per request: the
+        response payload or a ``ClaudeCodeControlError``.
+        """
+
+        # Never wait behind a running request, and never touch the warm
+        # process it may be using: a busy session answers from a throwaway.
+        warm_can_answer = not any(subtype in _WARM_UNSERVED_CONTROL for subtype, _ in requests)
+        if warm_can_answer and self._lock.acquire(blocking=False):
+            try:
+                warm = self._warm
+                if (
+                    warm is not None
+                    and not self._request_active
+                    and warm.alive()
+                    and (not conversation or (self._session_id and warm.session_id == self._session_id))
+                    and warm.take()
+                ):
+                    try:
+                        results: list[Any] | None = _exchange_control(
+                            warm.process,
+                            requests,
+                            timeout=min(timeout, _WARM_CONTROL_TIMEOUT_SECONDS),
+                            on_timeout=lambda: _kill_process_group(warm.process),
+                            on_event=self._control_event,
+                        )
+                    except ClaudeCodeControlError:
+                        results = None
+                    if results is not None and not any(
+                        isinstance(item, _ControlNoAnswer) for item in results
+                    ):
+                        if warm.alive():
+                            warm.park(_keepalive_seconds())
+                        else:
+                            self._discard_warm()
+                        return results
+                    # Its stdout may still carry a late answer: never reuse it.
+                    _LOG.info("Claude Code warm process did not answer a control request; closing it")
+                    self._discard_warm()
+            finally:
+                self._lock.release()
+        ref = self.conversation_ref(state_key) if conversation else None
+        if conversation and (ref is None or not ref.get("persisted")):
+            return [
+                ClaudeCodeControlError("no Claude Code conversation is saved for this session yet")
+                for _request in requests
+            ]
+        return run_control_requests(
+            requests,
+            command=command,
+            cwd=cwd,
+            env=env,
+            model=(ref or {}).get("model") or self._bound_model,
+            resume_session_id=(ref or {}).get("session_id"),
+            timeout=timeout,
+            on_event=self._control_event,
+        )
+
+    def _control_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "rate_limit_event":
+            self._record_rate_limit(event.get("rate_limit_info"))
 
     def get_progress_snapshot(self) -> dict[str, Any]:
         """What the current request is doing (``{"active", "description",
@@ -4895,6 +5633,7 @@ class ClaudeCodeSession:
             # The fallback model's window is not the conversation's.
             self._last_usage.pop("context_window", None)
             self._last_usage.pop("max_output_tokens", None)
+        self._add_notice(monitor.fallback_notice)
         warm.turns += 1
         warm.session_id = sid
         warm.tip = self._last_turn_checkpoint
@@ -4962,6 +5701,21 @@ class ClaudeCodeSession:
             return
         previous = self._last_rate_limit
         self._last_rate_limit = dict(info)
+        try:
+            with _RATE_LIMIT_UPDATE_LOCK:
+                snapshot = load_rate_limit_snapshot() or {}
+                now = time.time()
+                # Forget windows whose cycle is over.
+                warned = {
+                    name: reset
+                    for name, reset in dict(snapshot.get("warned") or {}).items()
+                    if not isinstance(reset, (int, float)) or reset > now
+                }
+                _save_rate_limit_snapshot(dict(info), warned)
+            for window, resets_at, text in _limit_warnings(info, warned, now):
+                self._add_notice(text, (window, resets_at))
+        except Exception:
+            _LOG.debug("Could not persist the Claude Code rate limit snapshot", exc_info=True)
         status = str(info.get("status") or "")
         windows = info.get("unifiedWindows")
         hot = []
@@ -5093,6 +5847,7 @@ class ClaudeCodeSession:
         if isinstance(cumulative, (int, float)):
             usage["_cumulative_cost_usd"] = float(cumulative)
             usage["total_cost_usd"] = max(0.0, float(cumulative) - cost_offset)
+            self._cost_total_usd += usage["total_cost_usd"]
         self._last_usage = usage
         return response, reasoning, result_session_id
 

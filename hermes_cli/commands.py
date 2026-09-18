@@ -18,7 +18,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from utils import is_truthy_value
 from hermes_constants import INDICATOR_STYLES
@@ -210,6 +210,15 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]",
                busy_policy="reject", busy_handler="codex-runtime"),
+    # Claude Code bridge (provider claude-code): usable only while the
+    # session runs on a Claude Code model; the gateway handler gates it and
+    # hides it from /help elsewhere. Mid-turn everything but reset runs.
+    CommandDef("claude", "Claude Code: status, plan limits, context, models, stop, reset, doctor, handoff",
+               "Configuration",
+               args_hint="[status|usage|context|models|stop|reset|doctor|handoff]",
+               subcommands=("status", "usage", "context", "models", "stop", "reset",
+                            "doctor", "handoff"),
+               gateway_only=True, busy_policy="dispatch", busy_handler="claude"),
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
@@ -570,12 +579,19 @@ def _requires_argument(args_hint: str) -> bool:
     return args_hint.strip().startswith("<")
 
 
-def gateway_help_lines() -> list[str]:
-    """Generate gateway help text lines from the registry."""
+def gateway_help_lines(hidden: Iterable[str] = ()) -> list[str]:
+    """Generate gateway help text lines from the registry.
+
+    ``hidden`` names commands the caller's session cannot use (e.g.
+    ``claude`` outside a Claude Code session); they are left out.
+    """
     overrides = _resolve_config_gates()
+    hidden_names = frozenset(hidden or ())
     lines: list[str] = []
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
+            continue
+        if cmd.name in hidden_names:
             continue
         args = f" {cmd.args_hint}" if cmd.args_hint else ""
         alias_parts: list[str] = []
@@ -1300,7 +1316,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+#   - claude: Claude Code bridge controls, only for claude-code sessions;
+#     reached via /hermes claude on Slack. Added at the 50-cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "claude"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

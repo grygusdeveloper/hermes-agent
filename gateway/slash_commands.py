@@ -1193,6 +1193,19 @@ class GatewaySlashCommandsMixin:
             lines.append(model_line)
         if context_line:
             lines.append(context_line)
+        if provider_name.lower() == "claude-code":
+            try:
+                from gateway.claude_code_commands import claude_session, plan_line
+
+                _plan = plan_line(
+                    claude_session(status_agent)
+                    if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL
+                    else None
+                )
+            except Exception:
+                _plan = ""
+            if _plan:
+                lines.append(_plan)
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
@@ -2152,7 +2165,13 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _telegramize_command_mentions
         from hermes_cli.slash_exec import CommandContext, execute_command
 
-        reply = execute_command("help", CommandContext(surface="gateway"))
+        reply = execute_command(
+            "help",
+            CommandContext(
+                surface="gateway",
+                options={"hidden_commands": await self._session_hidden_commands(event)},
+            ),
+        )
         return _telegramize_command_mentions(
             reply.text,
             getattr(getattr(event, "source", None), "platform", None),
@@ -2170,7 +2189,10 @@ class GatewaySlashCommandsMixin:
             CommandContext(
                 surface="gateway",
                 args=event.get_command_args(),
-                options={"page_size": page_size},
+                options={
+                    "page_size": page_size,
+                    "hidden_commands": await self._session_hidden_commands(event),
+                },
             ),
         )
         return _telegramize_command_mentions(
@@ -3250,6 +3272,115 @@ class GatewaySlashCommandsMixin:
 
         prefix = "✓" if result.success else "✗"
         return f"{prefix} {result.message}"
+
+    def _session_agent_for_key(self, session_key: str) -> tuple[Any, Any]:
+        """``(agent, running_agent)`` of a session: the agent running a turn
+        (mid-turn), else the cached one (between turns)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        running = self._running_agents.get(session_key)
+        running_agent = running if running and running is not _AGENT_PENDING_SENTINEL else None
+        agent = running_agent
+        if agent is None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                try:
+                    with cache_lock:
+                        cached = cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+                except Exception:
+                    agent = None
+        return agent, running_agent
+
+    async def _session_provider(self, event: MessageEvent, agent: Any = None) -> str:
+        """The provider a session runs on: its agent, else its /model override,
+        else its SessionDB billing row, else the configured default.
+
+        Read-only: never creates a session for the source (``/help`` asks).
+        """
+        from gateway.claude_code_commands import session_provider
+
+        if agent is not None:
+            provider = session_provider(agent)
+            if provider:
+                return provider
+        session_key = self._session_key_for_source(event.source)
+        try:
+            state = self._peek_session_state(session_key)
+            override = state.conversation.model_override if state else None
+        except Exception:
+            override = None
+        if not isinstance(override, dict):
+            try:
+                override = await self.async_session_store.get_model_override(session_key)
+            except Exception:
+                override = None
+        if isinstance(override, dict) and override.get("provider"):
+            return str(override["provider"]).strip().lower()
+        if getattr(self, "_session_db", None) is not None:
+            try:
+                session_id = await self.async_session_store.peek_session_id(session_key)
+                row = await self._session_db.get_session(session_id) if isinstance(session_id, str) else None
+                if isinstance(row, dict) and row.get("billing_provider"):
+                    return str(row["billing_provider"]).strip().lower()
+            except Exception:
+                pass
+        try:
+            from gateway.run import _load_gateway_config
+
+            model_cfg = (_load_gateway_config() or {}).get("model") or {}
+            if isinstance(model_cfg, dict) and model_cfg.get("provider"):
+                return str(model_cfg["provider"]).strip().lower()
+        except Exception:
+            pass
+        return ""
+
+    async def _session_hidden_commands(self, event: MessageEvent) -> tuple[str, ...]:
+        """Commands /help and /commands leave out for this session:
+        ``/claude`` unless the session runs on Claude Code."""
+        from gateway.claude_code_commands import CLAUDE_CODE_PROVIDER
+
+        try:
+            agent, _running = self._session_agent_for_key(
+                self._session_key_for_source(event.source)
+            )
+            provider = await self._session_provider(event, agent)
+        except Exception:
+            return ()
+        return () if provider == CLAUDE_CODE_PROVIDER else ("claude",)
+
+    async def _handle_claude_command(self, event: MessageEvent) -> str:
+        """Handle /claude — Claude Code bridge views and controls.
+
+        Subcommands: status (default), usage, context, models, stop, reset,
+        doctor, handoff (see gateway/claude_code_commands.py). Only for a
+        session whose provider is claude-code. Control requests run off the
+        event loop and never start a model turn.
+        """
+        from gateway import claude_code_commands as cc
+
+        sub = cc.parse_subcommand(event.get_command_args())
+        if sub in {"help", "?"}:
+            return cc.help_text()
+        if sub not in cc.SUBCOMMANDS:
+            return f"Unknown `/claude {sub}`.\n\n" + cc.help_text()
+        agent, running_agent = self._session_agent_for_key(
+            self._session_key_for_source(event.source)
+        )
+        provider = await self._session_provider(event, agent)
+        if provider != cc.CLAUDE_CODE_PROVIDER:
+            return cc.not_claude_text(provider)
+        if sub == "stop":
+            return cc.do_stop(agent, running_agent)
+        if sub == "reset" and running_agent is not None:
+            return cc.BUSY_RESET_TEXT
+        try:
+            return await asyncio.to_thread(cc.RENDERERS[sub], agent)
+        except Exception as exc:
+            logger.warning("/claude %s failed: %s", sub, exc, exc_info=True)
+            return f"⚠️ `/claude {sub}` failed: {exc}"
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality.
@@ -6075,12 +6206,24 @@ class GatewaySlashCommandsMixin:
         credits_lines: list[str] = []
         if provider:
             try:
-                account_snapshot = await asyncio.to_thread(
-                    fetch_account_usage,
-                    provider,
-                    base_url=base_url,
-                    api_key=api_key,
-                )
+                if str(provider).strip().lower() == "claude-code":
+                    # Claude plan windows from Claude Code itself (a
+                    # control-only CLI process, never a model turn); the
+                    # limits it last reported when it cannot be asked.
+                    from agent.account_usage import fetch_claude_code_account_usage
+                    from gateway.claude_code_commands import claude_client
+
+                    _cc_agent = agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
+                    account_snapshot = await asyncio.to_thread(
+                        fetch_claude_code_account_usage, claude_client(_cc_agent)
+                    )
+                else:
+                    account_snapshot = await asyncio.to_thread(
+                        fetch_account_usage,
+                        provider,
+                        base_url=base_url,
+                        api_key=api_key,
+                    )
             except Exception:
                 account_snapshot = None
             if account_snapshot:

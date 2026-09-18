@@ -6292,6 +6292,23 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_usage(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/usage")
 
+        @tree.command(name="claude", description="Claude Code sessions: status, plan limits, context, stop, reset")
+        @discord.app_commands.describe(action="What to show or do. Leave empty for status.")
+        @discord.app_commands.choices(action=[
+            # One entry per /claude subcommand; the gateway handler answers
+            # only in sessions that run on a Claude Code model.
+            discord.app_commands.Choice(name="status — model, session, last call", value="status"),
+            discord.app_commands.Choice(name="usage — plan limits and resets", value="usage"),
+            discord.app_commands.Choice(name="context — Hermes vs Claude Code count", value="context"),
+            discord.app_commands.Choice(name="models — models Claude Code offers", value="models"),
+            discord.app_commands.Choice(name="stop — stop the current reply", value="stop"),
+            discord.app_commands.Choice(name="reset — drop the Claude-side session", value="reset"),
+            discord.app_commands.Choice(name="doctor — CLI version and login", value="doctor"),
+            discord.app_commands.Choice(name="handoff — continue in a terminal", value="handoff"),
+        ])
+        async def slash_claude(interaction: discord.Interaction, action: str = ""):
+            await self._run_simple_slash(interaction, f"/claude {action}".strip())
+
         @tree.command(name="help", description="Show available commands")
         async def slash_help(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/help")

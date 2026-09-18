@@ -1843,8 +1843,11 @@ Supported fields:
 | `context_pct` | Last-call context occupancy as a percent | `5%` |
 | `latency` | Wall-clock duration of the turn | `22s`, `1m05s` |
 | `cwd` | Home-relative working directory | `~` |
+| `cache` | Prompt-cache reads of the last call (provider-reported) | `cache 97%` |
+| `plan` | Subscription plan windows (provider-reported) | `5h 28% · 7d 41%` |
+| `cost` | API-equivalent cost of the turn (provider-reported) | `≈$0.42` |
 
-The default field set is `["model", "context_pct", "cwd"]`. `latency` is opt-in — add it to `fields` to use it. Fields whose data is unavailable are skipped silently rather than rendering an empty slot.
+The default field set is `["model", "context_pct", "cwd"]`. `latency`, `cache`, `plan` and `cost` are opt-in — add them to `fields` to use them. `cache`, `plan` and `cost` come from the provider; today the Claude Code bridge (`claude-code`) reports them. Fields whose data is unavailable are skipped silently rather than rendering an empty slot.
 
 The `/footer` slash command toggles this at runtime in any session.
 

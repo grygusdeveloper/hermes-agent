@@ -147,7 +147,7 @@ def _exec_help(ctx: CommandContext) -> CommandReply:
 
     lines = [
         t("gateway.help.header"),
-        *gateway_help_lines(),
+        *gateway_help_lines(hidden=ctx.options.get("hidden_commands") or ()),
     ]
     try:
         from agent.skill_commands import get_skill_commands
@@ -184,7 +184,8 @@ def _exec_commands(ctx: CommandContext) -> CommandReply:
         requested_page = 1
 
     # Build combined entry list: built-in commands + skill commands
-    entries = list(gateway_help_lines())
+    # (``hidden_commands``: ones this session cannot use, e.g. /claude).
+    entries = list(gateway_help_lines(hidden=ctx.options.get("hidden_commands") or ()))
     try:
         from agent.skill_commands import get_skill_commands
         skill_cmds = get_skill_commands()

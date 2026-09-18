@@ -206,6 +206,24 @@ def _sync_provider_context_window(agent, usage) -> None:
         pass
 
 
+def _show_provider_notices(agent, usage) -> None:
+    """Show the notices the Claude Code bridge attached to a response.
+
+    ``usage.hermes_notices``: a plan window at 90% or more (once per window
+    cycle) and a model fallback or refusal inside Claude Code. Shown as a
+    status line; the bridge's usage object is the only trusted source.
+    """
+
+    if not _is_claude_code_agent(agent):
+        return
+    notices = getattr(usage, "hermes_notices", None)
+    if not isinstance(notices, (list, tuple)):
+        return
+    for notice in notices:
+        if isinstance(notice, str) and notice.strip():
+            agent._emit_status(notice.strip())
+
+
 def _account_retry_usage(agent, usage) -> None:
     """Count a provider's retried-past attempts in the session's token totals.
 
@@ -3939,6 +3957,7 @@ def run_conversation(
                                 agent.session_id, total_tokens, e,
                             )
                     _account_retry_usage(agent, response.usage)
+                    _show_provider_notices(agent, response.usage)
 
                     if agent.verbose_logging:
                         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")

@@ -2,6 +2,7 @@ from hermes_state import AsyncSessionDB
 """Tests for gateway /usage command — agent cache lookup and output fields."""
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -237,3 +238,41 @@ class TestUsageContextBreakdown:
         # Zero-token category is dropped, not rendered.
         assert "Conversation" not in result
 
+
+
+class TestUsageClaudeCode:
+    """/usage on Claude Code: plan windows asked from the CLI (no credentials)."""
+
+    @pytest.mark.asyncio
+    async def test_claude_code_plan_windows_come_from_the_session_client(self, monkeypatch):
+        import agent.account_usage as account_usage
+        from agent.claude_code_session import ClaudeCodeSession
+
+        asked = []
+
+        def control_requests(requests, timeout=None):
+            asked.append(requests)
+            return [{
+                "subscription_type": "max",
+                "rate_limits": {
+                    "five_hour": {"utilization": 35, "resets_at": "2099-01-01T16:00:00+00:00"},
+                    "seven_day": {"utilization": 63, "resets_at": "2099-01-02T16:00:00+00:00"},
+                },
+            }]
+
+        agent = _make_mock_agent(provider="claude-code", model="claude-opus-5")
+        agent.get_rate_limit_state.return_value = None
+        agent.client = SimpleNamespace(
+            _claude_session=ClaudeCodeSession(), control_requests=control_requests
+        )
+        runner = _make_runner(SK, cached_agent=agent)
+        runner._context_breakdown_lines = lambda _agent, _source: []
+        monkeypatch.setattr(account_usage, "_claude_usage_cache", None)
+        monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])
+
+        result = await runner._handle_usage_command(MagicMock())
+
+        assert asked == [[("get_usage", {"skip_behaviors": True})]]
+        assert "Provider: claude-code (Max)" in result
+        assert "Current session (5h): 65% remaining (35% used)" in result
+        assert "Current week: 37% remaining (63% used)" in result

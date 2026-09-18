@@ -16,9 +16,15 @@ Available fields:
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
     cwd          — home-relative working dir (``~``)
+    cache        — prompt-cache reads of the last call (``cache 97%``)
+    plan         — subscription plan windows (``5h 28% · 7d 41%``)
+    cost         — API-equivalent cost of the turn (``≈$0.42``)
 
-``latency`` is opt-in: it is NOT in the default field set, so a footer whose
-``fields`` are unset renders exactly as before.
+``latency``, ``cache``, ``plan`` and ``cost`` are opt-in: they are NOT in the
+default field set, so a footer whose ``fields`` are unset renders exactly as
+before. ``cache``, ``plan`` and ``cost`` come from the provider (``provider_meta``;
+today the Claude Code bridge) and are skipped for providers that report none,
+e.g. ``fields: [model, context_pct, cache, plan, latency]``.
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -108,6 +114,13 @@ def _format_latency(seconds: float) -> str:
     return f"{m}m{sec:02d}s"
 
 
+def _meta_number(meta: dict[str, Any], key: str) -> Optional[float]:
+    value = meta.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
 def format_runtime_footer(
     *,
     model: Optional[str],
@@ -116,12 +129,16 @@ def format_runtime_footer(
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    provider_meta: Optional[dict[str, Any]] = None,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
     Fields are skipped silently when their underlying data is missing — a
     partially-populated footer is better than a line with ``?%`` or empty slots.
+    ``provider_meta`` carries provider-reported extras: ``cache_pct``,
+    ``plan_5h``/``plan_7d`` (utilization fractions) and ``turn_cost_usd``.
     """
+    meta = provider_meta if isinstance(provider_meta, dict) else {}
     parts: list[str] = []
     for field in fields:
         if field == "model":
@@ -141,6 +158,22 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "cache":
+            pct = _meta_number(meta, "cache_pct")
+            if pct is not None:
+                parts.append(f"cache {max(0, min(100, round(pct)))}%")
+        elif field == "plan":
+            windows = [
+                f"{label} {round(value * 100)}%"
+                for key, label in (("plan_5h", "5h"), ("plan_7d", "7d"))
+                if (value := _meta_number(meta, key)) is not None
+            ]
+            if windows:
+                parts.append(" · ".join(windows))
+        elif field == "cost":
+            cost = _meta_number(meta, "turn_cost_usd")
+            if cost is not None:
+                parts.append(f"≈${cost:.2f}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -157,6 +190,7 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    provider_meta: Optional[dict[str, Any]] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -178,4 +212,5 @@ def build_footer_line(
         cwd=cwd,
         turn_seconds=turn_seconds,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        provider_meta=provider_meta,
     )

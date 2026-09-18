@@ -1678,10 +1678,17 @@ def _collect_auto_append_media_tags(
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        # The result's own tool name first: when a provider reused a call id
+        # in one turn, the id map names only the last call with that id.
+        own_name = msg.get("tool_name") or msg.get("name")
+        tool_name = (
+            own_name
+            if isinstance(own_name, str) and own_name
+            else tool_name_by_call_id.get(call_id)
+        )
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
@@ -1709,6 +1716,27 @@ def _collect_auto_append_media_tags(
             has_voice_directive = True
 
     return media_tags, has_voice_directive
+
+
+def _claude_code_cost_total(agent: Any) -> Optional[float]:
+    """Running API-equivalent cost of the agent's Claude Code session, or None."""
+    try:
+        from gateway.claude_code_commands import cost_total
+
+        return cost_total(agent)
+    except Exception:
+        return None
+
+
+def _claude_code_footer_meta(agent: Any, cost_before: Optional[float]) -> Optional[dict]:
+    """Claude-only runtime-footer fields (cache %, plan windows, turn cost)."""
+    try:
+        from gateway.claude_code_commands import footer_meta
+
+        return footer_meta(agent, cost_before=cost_before)
+    except Exception:
+        logger.debug("Claude Code footer fields failed", exc_info=True)
+        return None
 
 
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
@@ -5648,6 +5676,9 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        # Claude Code reports an API-equivalent cost per CLI call; the footer
+        # shows this turn's share (see gateway/claude_code_commands.py).
+        _claude_cost_before = _claude_code_cost_total(agent)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -5734,6 +5765,7 @@ class TurnRunner:
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
+        _provider_meta = _claude_code_footer_meta(_agent, _claude_cost_before)
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -5870,6 +5902,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "provider_meta": _provider_meta,
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -5947,6 +5980,7 @@ class TurnRunner:
             "output_tokens": _output_toks,
             "model": _resolved_model,
             "context_length": _context_length,
+            "provider_meta": _provider_meta,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
@@ -14577,6 +14611,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "steer": self._busy_steer_command,
                 "egress": self._busy_egress_command,
                 "goal": self._busy_goal_command,
+                "claude": self._busy_claude_command,
             }.get(handler_key)
             if special is not None:
                 return await special(event, quick_key, source)
@@ -14794,6 +14829,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
+
+    async def _busy_claude_command(self, event: MessageEvent, quick_key: str, source):
+        # /claude is inspection and control while a turn runs (status,
+        # usage, context, models, doctor, handoff, and stop, which interrupts
+        # Claude's reply gracefully); only reset must wait for the turn.
+        from gateway.claude_code_commands import (
+            BUSY_RESET_TEXT,
+            BUSY_SAFE_SUBCOMMANDS,
+            SUBCOMMANDS,
+            parse_subcommand,
+        )
+
+        _sub = parse_subcommand(event.get_command_args())
+        if _sub in SUBCOMMANDS and _sub not in BUSY_SAFE_SUBCOMMANDS:
+            return BUSY_RESET_TEXT
+        return await self._handle_claude_command(event)
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
         # /goal is safe mid-run for status/pause/clear/wait (inspection
@@ -15784,6 +15835,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
+
+        if canonical == "claude":
+            return await self._handle_claude_command(event)
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -18473,6 +18527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    provider_meta=agent_result.get("provider_meta"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

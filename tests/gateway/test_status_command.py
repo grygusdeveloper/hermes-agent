@@ -488,3 +488,64 @@ async def test_context_all_appends_expanded_listings():
     assert "Use /context all" not in result
 
 
+
+
+@pytest.mark.asyncio
+async def test_status_command_shows_claude_plan_windows_for_claude_code():
+    from agent.claude_code_session import ClaudeCodeSession
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    claude = ClaudeCodeSession()
+    reset = time.time() + 3600
+    claude._record_rate_limit({
+        "status": "allowed",
+        "unifiedWindows": {
+            "five_hour": {"utilization": 0.28, "resetsAt": reset},
+            "seven_day": {"utilization": 0.41, "resetsAt": reset + 86400},
+        },
+    })
+    running_agent = SimpleNamespace(
+        model="claude-opus-5",
+        provider="claude-code",
+        client=SimpleNamespace(_claude_session=claude),
+        context_compressor=SimpleNamespace(last_prompt_tokens=1_000, context_length=1_000_000),
+        interrupt=MagicMock(),
+    )
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "Claude plan: 5h 28% · week 41% (as of " in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_has_no_claude_line_for_other_providers():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._running_agents[build_session_key(_make_source())] = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        context_compressor=SimpleNamespace(last_prompt_tokens=1, context_length=10),
+        interrupt=MagicMock(),
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "Claude plan" not in result

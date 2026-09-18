@@ -469,6 +469,38 @@ class ClaudeCodeClient:
 
         return self._claude_session.get_progress_snapshot()
 
+    def _take_notices(self, tools_offered: bool) -> list[str]:
+        """Notices for the reply (plan warnings, model fallbacks), only for
+        an agent's own calls: the conversation loop shows them. Auxiliary
+        calls (titles, compression, vision) offer no tools and leave them
+        pending, so a plan warning is never swallowed unseen."""
+
+        return self._claude_session.take_notices() if tools_offered else []
+
+    def control_requests(
+        self,
+        requests: list[tuple[str, dict[str, Any]]],
+        *,
+        conversation: bool = False,
+        state_key: str | None = None,
+        timeout: float | None = None,
+    ) -> list[Any]:
+        """Stream-json control requests (``get_usage``, ``get_context_usage``,
+        ``list_models``, ...) for this client's Claude Code conversation,
+        answered by its warm process or a throwaway control-only CLI; never a
+        model turn. See ``ClaudeCodeSession.control_requests``."""
+
+        extra: dict[str, Any] = {"timeout": timeout} if timeout else {}
+        return self._claude_session.control_requests(
+            requests,
+            command=self._claude_command,
+            cwd=self._claude_cwd,
+            env=_build_subprocess_env(),
+            conversation=conversation,
+            state_key=state_key,
+            **extra,
+        )
+
     def close(self) -> None:
         if self._owns_claude_session:
             self._claude_session.shutdown()
@@ -574,7 +606,11 @@ class ClaudeCodeClient:
             stop_reason=last_usage.get("stop_reason"),
         )
 
-        usage = _completion_usage(last_usage, retry=self._claude_session.last_retry_usage)
+        usage = _completion_usage(
+            last_usage,
+            retry=self._claude_session.last_retry_usage,
+            notices=self._take_notices(bool(tools)),
+        )
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -750,7 +786,9 @@ class ClaudeCodeClient:
                 choices=[],
                 model=model,
                 usage=_completion_usage(
-                    last_usage, retry=self._claude_session.last_retry_usage
+                    last_usage,
+                    retry=self._claude_session.last_retry_usage,
+                    notices=self._take_notices(bool(run_kwargs.get("has_tools"))),
                 ),
             )
         finally:
@@ -821,13 +859,20 @@ def _tools_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _completion_usage(raw: dict[str, Any] | None, *, retry: dict[str, Any] | None = None) -> Any:
+def _completion_usage(
+    raw: dict[str, Any] | None,
+    *,
+    retry: dict[str, Any] | None = None,
+    notices: list[str] | tuple[str, ...] | None = None,
+) -> Any:
     """Expose Claude Code result usage through the OpenAI-compatible facade.
 
     ``retry`` is the session's ``last_retry_usage`` (attempts the bridge
     retried past, see ``ClaudeCodeSession.last_retry_usage``). It rides along
     as ``hermes_retry_usage`` for token accounting and is never part of the
-    prompt-size fields.
+    prompt-size fields. ``notices`` (``ClaudeCodeSession.take_notices``: plan
+    window warnings, model fallbacks) ride along as ``hermes_notices`` for
+    the conversation loop to show the user.
     """
 
     usage = raw or {}
@@ -857,6 +902,7 @@ def _completion_usage(raw: dict[str, Any] | None, *, retry: dict[str, Any] | Non
         # The model's context window as Claude Code runs it (``modelUsage``);
         # the conversation loop syncs Hermes's compressor to it.
         context_window=_positive_int(usage.get("context_window")),
+        hermes_notices=tuple(notice for notice in notices or () if notice),
     )
 
 

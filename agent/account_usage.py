@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -881,6 +882,240 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+# ---------------------------------------------------------------------------
+# Claude Code (the Claude subscription behind the local CLI)
+# ---------------------------------------------------------------------------
+
+# Plan windows as Claude Code's ``get_usage`` names them (utilization in
+# percent) and as ``rate_limit_info.unifiedWindows`` does (as a fraction).
+_CLAUDE_WINDOW_LABELS: tuple[tuple[str, str], ...] = (
+    ("five_hour", "Current session (5h)"),
+    ("seven_day", "Current week"),
+    ("seven_day_opus", "Opus week"),
+    ("seven_day_sonnet", "Sonnet week"),
+    ("seven_day_overage_included", "Week incl. extra usage"),
+)
+# ``get_usage`` asks claude.ai; /usage and /claude usage reuse an answer this
+# long instead of starting the CLI again.
+_CLAUDE_USAGE_CACHE_SECONDS = 60.0
+_claude_usage_cache: Optional[tuple[float, AccountUsageSnapshot]] = None
+
+
+def _claude_money(amount: Any, decimals: Any) -> Optional[float]:
+    if not _is_finite_num(amount):
+        return None
+    places = decimals if isinstance(decimals, int) and not isinstance(decimals, bool) else 2
+    return float(amount) / (10 ** max(0, min(places, 6)))
+
+
+def _claude_extra_usage_detail(extra: Any) -> Optional[str]:
+    if not isinstance(extra, dict):
+        return None
+    currency = str(extra.get("currency") or "USD")
+    used = _claude_money(extra.get("used_credits"), extra.get("decimal_places"))
+    limit = _claude_money(extra.get("monthly_limit"), extra.get("decimal_places"))
+    amounts = f"{used:.2f} / {limit:.2f} {currency}" if used is not None and limit is not None else ""
+    if extra.get("is_enabled"):
+        return f"Extra usage: {amounts}" if amounts else "Extra usage: on"
+    reason = str(extra.get("disabled_reason") or "").replace("_", " ").strip()
+    if not reason and not amounts:
+        return None
+    state = f"off ({reason})" if reason else "off"
+    return f"Extra usage: {state}" + (f" · {amounts} used" if amounts else "")
+
+
+def _claude_model_scoped_windows(limits: dict[str, Any]) -> list[tuple[str, float, Any]]:
+    """``(model name, used percent, resets_at)`` of per-model weekly limits.
+
+    ``model_scoped`` lists them when present; otherwise the ``limits`` rows
+    of kind ``weekly_scoped`` name the model in ``scope.model``.
+    """
+
+    found: list[tuple[str, float, Any]] = []
+    for scoped in limits.get("model_scoped") or []:
+        if isinstance(scoped, dict) and _is_finite_num(scoped.get("utilization")):
+            name = str(scoped.get("display_name") or "Model").strip()
+            found.append((name, float(scoped["utilization"]), scoped.get("resets_at")))
+    if found:
+        return found
+    for row in limits.get("limits") or []:
+        if not isinstance(row, dict) or row.get("kind") != "weekly_scoped":
+            continue
+        if not _is_finite_num(row.get("percent")):
+            continue
+        scope = row.get("scope") if isinstance(row.get("scope"), dict) else {}
+        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        name = str(model.get("display_name") or model.get("id") or "Model").strip()
+        found.append((name, float(row["percent"]), row.get("resets_at")))
+    return found
+
+
+def _claude_plan_label(subscription_type: Any) -> Optional[str]:
+    return _title_case_slug(subscription_type) if isinstance(subscription_type, str) else None
+
+
+def build_claude_code_usage_snapshot(
+    usage: Optional[dict[str, Any]] = None,
+    *,
+    rate_limit: Optional[dict[str, Any]] = None,
+    recorded_at: Optional[float] = None,
+    note: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    """Claude plan windows for /usage.
+
+    ``usage`` is Claude Code's ``get_usage`` answer (live: session and weekly
+    windows, per-model weekly limits, extra usage, plan). Without it,
+    ``rate_limit`` is the CLI's last ``rate_limit_info`` (session and weekly
+    windows as of ``recorded_at``). ``note`` explains why live data is
+    missing. None when neither says anything.
+    """
+
+    windows: list[AccountUsageWindow] = []
+    details: list[str] = []
+    if isinstance(usage, dict):
+        limits = usage.get("rate_limits") if isinstance(usage.get("rate_limits"), dict) else {}
+        for key, label in _CLAUDE_WINDOW_LABELS:
+            window = limits.get(key)
+            if isinstance(window, dict) and _is_finite_num(window.get("utilization")):
+                windows.append(
+                    AccountUsageWindow(
+                        label=label,
+                        used_percent=float(window["utilization"]),
+                        reset_at=_parse_dt(window.get("resets_at")),
+                    )
+                )
+        for name, used, resets_at in _claude_model_scoped_windows(limits):
+            windows.append(
+                AccountUsageWindow(label=f"{name} week", used_percent=used, reset_at=_parse_dt(resets_at))
+            )
+        extra = _claude_extra_usage_detail(limits.get("extra_usage"))
+        if extra:
+            details.append(extra)
+        unavailable = None
+        if usage.get("rate_limits_available") is False:
+            unavailable = "Claude Code reports no plan limits for this account"
+        if not windows and not details and not unavailable:
+            return None
+        return AccountUsageSnapshot(
+            provider="claude-code",
+            source="claude_code_get_usage",
+            fetched_at=_utc_now(),
+            title="Claude plan limits",
+            plan=_claude_plan_label(usage.get("subscription_type")),
+            windows=tuple(windows),
+            details=tuple(details),
+            unavailable_reason=unavailable,
+        )
+
+    if not isinstance(rate_limit, dict) or not rate_limit:
+        if not note:
+            return None
+        return AccountUsageSnapshot(
+            provider="claude-code",
+            source="claude_code_rate_limit",
+            fetched_at=_utc_now(),
+            title="Claude plan limits",
+            unavailable_reason=note,
+        )
+    from agent.claude_code_session import _RATE_LIMIT_LABELS, plan_windows
+
+    labels = dict(_CLAUDE_WINDOW_LABELS)
+    for key, (utilization, resets_at) in plan_windows(rate_limit).items():
+        if utilization is None:
+            continue
+        windows.append(
+            AccountUsageWindow(
+                label=labels.get(key) or key.replace("_", " ").capitalize(),
+                used_percent=utilization * 100.0,
+                reset_at=_parse_dt(resets_at),
+            )
+        )
+    status = str(rate_limit.get("status") or "")
+    if status and status != "allowed":
+        kind = str(rate_limit.get("rateLimitType") or "")
+        label = _RATE_LIMIT_LABELS.get(kind) or kind.replace("_", " ")
+        details.append(f"Status: {status.replace('_', ' ')}" + (f" ({label})" if label else ""))
+    overage = str(rate_limit.get("overageStatus") or "")
+    if overage:
+        reason = str(rate_limit.get("overageDisabledReason") or "").replace("_", " ")
+        details.append(f"Extra usage: {overage.replace('_', ' ')}" + (f" ({reason})" if reason else ""))
+    if recorded_at:
+        stamp = datetime.fromtimestamp(float(recorded_at), tz=timezone.utc).astimezone()
+        details.append(f"As reported by Claude Code at {stamp.strftime('%Y-%m-%d %H:%M %Z')}")
+    if note:
+        details.append(f"Live numbers unavailable: {note}")
+    if not windows and not details:
+        return None
+    return AccountUsageSnapshot(
+        provider="claude-code",
+        source="claude_code_rate_limit",
+        fetched_at=_utc_now(),
+        title="Claude plan limits",
+        windows=tuple(windows),
+        details=tuple(details),
+    )
+
+
+def fetch_claude_code_account_usage(
+    client: Any = None,
+    *,
+    timeout: float = 30.0,
+    use_cache: bool = True,
+) -> Optional[AccountUsageSnapshot]:
+    """Claude plan windows from Claude Code itself (no credentials read).
+
+    Asks the CLI (``get_usage`` control request; ``client``'s warm process
+    when it is idle, else a throwaway control-only process, never a model
+    turn). When that fails, falls back to the CLI's last reported
+    ``rate_limit_info``: ``client``'s session, else the persisted copy.
+    """
+
+    global _claude_usage_cache
+    now = time.monotonic()
+    cached = _claude_usage_cache
+    if use_cache and cached is not None and now - cached[0] < _CLAUDE_USAGE_CACHE_SECONDS:
+        return cached[1]
+    from agent import claude_code_session as ccs
+
+    request = [("get_usage", {"skip_behaviors": True})]
+    note: Optional[str] = None
+    try:
+        if client is not None and callable(getattr(client, "control_requests", None)):
+            answer = client.control_requests(request, timeout=timeout)[0]
+        else:
+            from agent.claude_code_client import _build_subprocess_env, _resolve_command
+
+            answer = ccs.run_control_requests(
+                request,
+                command=_resolve_command(),
+                env=_build_subprocess_env(),
+                timeout=timeout,
+            )[0]
+    except Exception as exc:  # launch failures, OS errors
+        answer = exc
+    if isinstance(answer, dict):
+        snapshot = build_claude_code_usage_snapshot(answer)
+        if snapshot is not None:
+            _claude_usage_cache = (now, snapshot)
+            return snapshot
+        note = "Claude Code returned no plan data"
+    else:
+        note = str(answer)[:200]
+        logger.debug("claude-code ▸ get_usage failed: %s", note)
+
+    # Every session persists what it records, so the file is at least as
+    # recent as any session's copy (another profile may have written later).
+    info: dict[str, Any] = {}
+    recorded_at: Optional[float] = None
+    persisted = ccs.load_rate_limit_snapshot()
+    if persisted is not None:
+        info, recorded_at = dict(persisted["info"]), persisted.get("recorded_at")
+    else:
+        session = getattr(client, "_claude_session", None)
+        info = dict(getattr(session, "last_rate_limit", {}) or {}) if session is not None else {}
+    return build_claude_code_usage_snapshot(rate_limit=info, recorded_at=recorded_at, note=note)
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -897,6 +1132,8 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        if normalized == "claude-code":
+            return fetch_claude_code_account_usage()
     except Exception:
         return None
     return None

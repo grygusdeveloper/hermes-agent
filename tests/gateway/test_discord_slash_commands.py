@@ -295,6 +295,22 @@ async def test_registers_native_topics_slash_command_with_count(adapter):
 
 
 @pytest.mark.asyncio
+async def test_registers_native_claude_slash_command_with_actions(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "claude" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["claude"](interaction, action="usage")
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/claude usage")
+
+    adapter._run_simple_slash.reset_mock()
+    await adapter._client.tree.commands["claude"](interaction)
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/claude")
+
+
+@pytest.mark.asyncio
 async def test_registers_native_favorites_slash_command_with_count(adapter):
     adapter._run_simple_slash = AsyncMock()
     adapter._register_slash_commands()
