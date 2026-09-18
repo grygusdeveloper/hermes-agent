@@ -663,7 +663,14 @@ def init_agent(
             base_url = CURSOR_MARKER_BASE_URL
     except Exception:
         pass
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if agent.provider == "claude-code" or str(base_url or "").strip().lower().startswith(
+        "acp://claude-code"
+    ):
+        # The Claude Code bridge only implements chat.completions. A stale
+        # api_mode inherited from another provider (e.g. codex_responses)
+        # makes every call fail with "no attribute 'responses'".
+        agent.api_mode = "chat_completions"
+    elif api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"

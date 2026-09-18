@@ -23618,6 +23618,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
+        # A credential-less override lands on top of the config runtime. When
+        # it names a different provider, the config runtime's api_mode belongs
+        # to that other provider (e.g. openai-codex's codex_responses) and must
+        # not leak onto the override provider — clear it so AIAgent re-derives
+        # the mode from the override provider/base_url.
+        override_provider = override.get("provider")
+        if (
+            override_provider
+            and override.get("api_mode") is None
+            and override_provider != runtime_kwargs.get("provider")
+        ):
+            runtime_kwargs["api_mode"] = None
         for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool", "command"):
             val = override.get(key)
             if val is not None:
