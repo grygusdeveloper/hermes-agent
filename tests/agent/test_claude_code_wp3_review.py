@@ -109,3 +109,49 @@ def test_interrupted_rewind_continues_without_the_abandoned_branch(fake_cli):
         assert old_branch not in spawn["argv"]
     assert "A: a2" not in fake_cli.events("turn")[-1]["context"]
     session.shutdown()
+
+
+def _deaf_cli(tmp_path):
+    """A CLI that never reads stdin: a large request blocks in write()."""
+
+    import sys
+
+    launcher = tmp_path / "deaf-claude"
+    launcher.write_text(f"#!/bin/sh\nexec {sys.executable} -c 'import time; time.sleep(30)'\n")
+    launcher.chmod(0o755)
+    return str(launcher)
+
+
+def _execute_large(session, command, timeout_seconds):
+    return session._execute(
+        "x" * 400_000, session_id=None, model="opus", effort=None,
+        timeout_seconds=timeout_seconds, cwd="/tmp", env={"PATH": "/usr/bin:/bin"},
+        command=command, keepalive=True,
+    )
+
+
+def test_timeout_while_the_request_is_written_reports_a_timeout(tmp_path):
+    session = ClaudeCodeSession()
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="timed out"):
+        _execute_large(session, _deaf_cli(tmp_path), 0.3)
+    assert time.monotonic() - started < 8.0
+
+
+def test_abort_while_the_request_is_written_reports_an_abort(tmp_path):
+    session = ClaudeCodeSession()
+    box = {}
+
+    def target():
+        try:
+            _execute_large(session, _deaf_cli(tmp_path), 30)
+        except BaseException as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    time.sleep(0.8)  # blocked writing the request
+    session.abort()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert "aborted" in str(box["exc"])

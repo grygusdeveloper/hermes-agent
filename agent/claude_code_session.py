@@ -4365,6 +4365,18 @@ class ClaudeCodeSession:
                 if keep_seconds <= 0:
                     stdin.close()
             except Exception as exc:
+                if timed_out.is_set() or self._abort_requested:
+                    # Killed while the request was being written (a CLI not
+                    # reading stdin): report the timeout/abort itself, never
+                    # replay the request in a new process.
+                    warm.close()
+                    _reap_process_group(process, grace_seconds=2.0)
+                    monitor.log("timeout" if timed_out.is_set() else "aborted")
+                    raise RuntimeError(
+                        "Claude Code request timed out"
+                        if timed_out.is_set()
+                        else "Claude Code request aborted"
+                    ) from exc
                 if reused:
                     raise _WarmProcessGone(str(exc)) from exc
                 # A CLI that rejects its arguments (an unknown flag, an
