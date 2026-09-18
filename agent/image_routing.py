@@ -429,14 +429,20 @@ def _lookup_supports_vision(
         return override
     if not provider or not model:
         return None
+    # The Claude Code bridge serves Anthropic's Claude models and forwards
+    # images as native base64 image blocks. Look capabilities up under
+    # Anthropic; CLI aliases (opus/sonnet/haiku) are all vision-capable.
+    caps_provider = "anthropic" if provider.strip().lower() == "claude-code" else provider
     caps = None
     try:
         from agent.models_dev import get_model_capabilities
-        caps = get_model_capabilities(provider, model)
+        caps = get_model_capabilities(caps_provider, model)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, model, exc)
     if caps is not None:
         return bool(caps.supports_vision)
+    if caps_provider != provider:
+        return True
 
     base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and (provider or "").strip().lower() == "ollama":

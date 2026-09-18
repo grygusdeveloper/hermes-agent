@@ -376,10 +376,124 @@ def _validate_flag_size(text: str, limit: int = _INLINE_FLAG_LIMIT_BYTES) -> str
     return text
 
 
-def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> str:
+# ---------------------------------------------------------------------------
+# Native image transport
+# ---------------------------------------------------------------------------
+
+# Claude accepts base64 image blocks inside the stream-json user message.
+# Remote URLs are not forwarded: the Anthropic API fetches them server-side and
+# many hosts refuse that download, which fails the whole turn.
+_SUPPORTED_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+_MAX_IMAGES_PER_REQUEST = 8
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_DATA_URL_RE = re.compile(r"^data:(image/[a-z0-9.+-]+);base64,(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _image_url_from_part(part: dict[str, Any]) -> str | None:
+    kind = str(part.get("type") or "").lower()
+    if kind not in {"image_url", "input_image"}:
+        return None
+    raw = part.get("image_url")
+    if isinstance(raw, dict):
+        raw = raw.get("url")
+    return raw if isinstance(raw, str) else ""
+
+
+def _image_block_or_note(part: dict[str, Any]) -> tuple[dict[str, Any] | None, str] | None:
+    """Convert one content part to ``(anthropic_image_block|None, note)``.
+
+    Returns ``None`` when the part is not an image at all.
+    """
+
+    kind = str(part.get("type") or "").lower()
+    if kind == "image":
+        source = part.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64":
+            media_type = str(source.get("media_type") or "").lower()
+            data = source.get("data")
+            if media_type in _SUPPORTED_IMAGE_TYPES and isinstance(data, str) and data:
+                if len(data) * 3 // 4 > _MAX_IMAGE_BYTES:
+                    return None, "image omitted: larger than 5 MB"
+                return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}, ""
+        return None, "image omitted: unsupported image source"
+    url = _image_url_from_part(part)
+    if url is None:
+        return None
+    match = _DATA_URL_RE.match(url.strip())
+    if match:
+        media_type = match.group(1).lower()
+        if media_type == "image/jpg":
+            media_type = "image/jpeg"
+        data = re.sub(r"\s+", "", match.group(2))
+        if media_type not in _SUPPORTED_IMAGE_TYPES:
+            return None, f"image omitted: unsupported type {media_type}"
+        if len(data) * 3 // 4 > _MAX_IMAGE_BYTES:
+            return None, "image omitted: larger than 5 MB"
+        return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}, ""
+    if url.startswith(("http://", "https://")):
+        return None, f"image URL, not attached: {url}"
+    return None, "image omitted: unsupported image reference"
+
+
+def _render_content_collecting_images(content: Any, images: list[dict[str, Any]]) -> str:
+    """Render message content to text, moving image parts into ``images``.
+
+    Each attached image leaves a numbered ``[Image #n]`` marker in the text so
+    the model can relate it to the labelled image block sent after the text.
+    """
+
+    if not isinstance(content, list):
+        return _render_content(content)
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, dict):
+            converted = _image_block_or_note(item)
+            if converted is not None:
+                block, note = converted
+                if block is not None:
+                    images.append(block)
+                    parts.append(f"[Image #{len(images)}]")
+                else:
+                    parts.append(f"[{note}]")
+                continue
+            text = item.get("text")
+            if text not in (None, ""):
+                parts.append(str(text))
+        elif item not in (None, ""):
+            parts.append(str(item))
+    return "\n".join(parts)
+
+
+def _user_message_content(text: str, images: list[dict[str, Any]] | None) -> Any:
+    """Build stream-json user content: plain text, or text + labelled images."""
+
+    if not images:
+        return text
+    kept_from = max(0, len(images) - _MAX_IMAGES_PER_REQUEST)
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    if kept_from:
+        blocks.append(
+            {
+                "type": "text",
+                "text": (
+                    f"(Images #1-#{kept_from} are not re-sent; only the "
+                    f"{_MAX_IMAGES_PER_REQUEST} most recent images are attached.)"
+                ),
+            }
+        )
+    for index in range(kept_from, len(images)):
+        blocks.append({"type": "text", "text": f"Image #{index + 1}:"})
+        blocks.append(images[index])
+    return blocks
+
+
+def _incremental_prompt_with_images(
+    messages: list[dict[str, Any]], previous_count: int
+) -> tuple[str, list[dict[str, Any]]]:
     """Render only the new non-assistant messages for a resumed session."""
 
     parts: list[str] = []
+    images: list[dict[str, Any]] = []
     for message in messages[previous_count:]:
         if not isinstance(message, dict):
             continue
@@ -388,7 +502,7 @@ def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> 
         # session.  Re-sending it would duplicate context.
         if role == "assistant":
             continue
-        rendered = _render_content(message.get("content"))
+        rendered = _render_content_collecting_images(message.get("content"), images)
         if not rendered and role != "tool":
             continue
         if role == "tool":
@@ -409,7 +523,280 @@ def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> 
             "user": "User",
         }.get(role, role.title() or "Context")
         parts.append(f"{label}:\n{rendered}")
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), images
+
+
+def _incremental_prompt(messages: list[dict[str, Any]], previous_count: int) -> str:
+    """Text-only view of :func:`_incremental_prompt_with_images`."""
+
+    return _incremental_prompt_with_images(messages, previous_count)[0]
+
+
+# ---------------------------------------------------------------------------
+# System prompt transport
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT_FILE_MAX_AGE_SECONDS = 24 * 3600
+
+
+def _system_prompt_file(system_prompt: str) -> str:
+    """Persist ``system_prompt`` to a private content-addressed file.
+
+    ``--system-prompt-file`` keeps large Hermes system prompts (persona,
+    memory, skills, tool schemas) out of argv. Files are named by content hash
+    so every turn of a conversation reuses the same file.
+    """
+
+    directory = _state_dir() / "system-prompts"
+    digest = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+    path = directory / f"{digest}.txt"
+    with _STATE_LOCK:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        if path.exists():
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
+            return str(path)
+        temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(system_prompt)
+        os.replace(temp, path)
+        cutoff = time.time() - _SYSTEM_PROMPT_FILE_MAX_AGE_SECONDS
+        for stale in directory.glob("*.txt"):
+            try:
+                if stale != path and stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+            except OSError:
+                pass
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# Live streaming gate
+# ---------------------------------------------------------------------------
+
+# A reply is only a candidate soft-limit banner (<= 600 chars, containing a
+# banner marker) or stalled preamble (<= 350 chars, tool turns only) while it
+# is short. Prose starts streaming once it is past the relevant bound; a banner
+# marker defers streaming to the absolute 600-char bound. Once streaming has
+# committed, the attempt is accepted as the answer (never retried), so the user
+# never sees text that is later retried away or duplicated.
+_STREAM_COMMIT_CHARS = 600
+_STREAM_COMMIT_CHARS_WITH_TOOLS = 350
+_STREAM_COMMIT_CHARS_NO_TOOLS = 80
+# Hold back enough tail to never emit a partial "<tool_call>" / '{"id":' opener.
+_STREAM_HOLDBACK_CHARS = 16
+_TOOL_MARKUP_RE = re.compile(r'<tool_call|\{\s*"id"\s*:')
+
+
+class _StreamGate:
+    """Forward validated prose deltas; never raw tool-call markup.
+
+    Emitted text is always a prefix of the final cleaned answer (text outside
+    tool-call blocks, stripped) so the consumer's concatenated deltas equal the
+    non-streaming ``message.content``.
+    """
+
+    def __init__(
+        self,
+        emit: Any,
+        commit_chars: int | None = None,
+        *,
+        had_tools: bool = True,
+    ) -> None:
+        self._emit = emit
+        if commit_chars is None:
+            commit_chars = (
+                _STREAM_COMMIT_CHARS_WITH_TOOLS if had_tools else _STREAM_COMMIT_CHARS_NO_TOOLS
+            )
+        self._commit_chars = commit_chars
+        self._raw = ""
+        self._emitted = ""
+        self._closed = False
+        self.committed = False
+
+    def feed(self, delta: str) -> None:
+        if self._closed or not delta:
+            return
+        self._raw += delta
+        match = _TOOL_MARKUP_RE.search(self._raw)
+        if match is not None:
+            safe = self._raw[: match.start()].strip()
+            self._closed = True
+        else:
+            safe = self._raw[: max(0, len(self._raw) - _STREAM_HOLDBACK_CHARS)].lstrip()
+        if not self.committed:
+            threshold = self._commit_chars
+            lower = safe.lower()
+            if any(marker in lower for marker in _SOFT_LIMIT_MARKERS):
+                threshold = max(threshold, _STREAM_COMMIT_CHARS)
+            if len(safe) <= threshold:
+                return
+            self.committed = True
+        self._send(safe)
+
+    def finish(self, response: str) -> None:
+        """Emit whatever of the validated final answer was not streamed yet."""
+
+        from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+        _calls, cleaned = _extract_tool_calls_from_text(response or "")
+        if cleaned:
+            self._send(cleaned)
+
+    def _send(self, safe: str) -> None:
+        if len(safe) <= len(self._emitted) or not safe.startswith(self._emitted):
+            return
+        chunk = safe[len(self._emitted):]
+        self._emitted = safe
+        try:
+            self._emit(chunk)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Warm (persistent) Claude Code processes
+# ---------------------------------------------------------------------------
+
+_KEEPALIVE_DEFAULT_SECONDS = 90.0
+_MAX_WARM_DEFAULT = 3
+_WARM_LOCK = threading.Lock()
+_WARM_IDLE: "dict[int, _WarmProcess]" = {}
+
+
+def _keepalive_seconds() -> float:
+    """Idle lifetime of a warm process; ``<= 0`` disables warm reuse."""
+
+    raw = os.getenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "").strip()
+    if not raw:
+        return _KEEPALIVE_DEFAULT_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return _KEEPALIVE_DEFAULT_SECONDS
+
+
+def _max_warm_processes() -> int:
+    raw = os.getenv("HERMES_CLAUDE_CODE_MAX_WARM", "").strip()
+    try:
+        return max(0, int(raw)) if raw else _MAX_WARM_DEFAULT
+    except ValueError:
+        return _MAX_WARM_DEFAULT
+
+
+class _WarmProcessGone(RuntimeError):
+    """A parked process died before producing any output for the new turn."""
+
+
+class _WarmProcess:
+    """One ``claude -p`` stream-json process that can serve several turns.
+
+    ``--input-format stream-json`` keeps reading user messages from stdin and
+    emits one ``result`` event per turn, so the tool loop of a Hermes turn can
+    reuse a single process instead of paying CLI start-up per model call.
+    """
+
+    def __init__(self, process: subprocess.Popen[str], *, session_id: str | None, identity: tuple) -> None:
+        self.process = process
+        self.session_id = session_id
+        self.identity = identity
+        self.fingerprints: tuple[tuple[str, str], ...] = ()
+        self.cost_total = 0.0
+        self.turns = 0
+        self._stderr: list[str] = []
+        self._stderr_lock = threading.Lock()
+        self._idle_timer: threading.Timer | None = None
+        self._closed = False
+        err = getattr(process, "stderr", None)
+        if err is not None and callable(getattr(err, "__iter__", None)):
+            threading.Thread(
+                target=self._drain_stderr, args=(err,), name="claude-code-stderr", daemon=True
+            ).start()
+
+    def _drain_stderr(self, stream: Any) -> None:
+        try:
+            for line in stream:
+                with self._stderr_lock:
+                    self._stderr.append(line)
+                    if len(self._stderr) > 400:
+                        del self._stderr[:200]
+        except Exception:
+            pass
+
+    def stderr_tail(self) -> str:
+        with self._stderr_lock:
+            return "".join(self._stderr)[-2000:]
+
+    def alive(self) -> bool:
+        return not self._closed and self.process.poll() is None
+
+    def park(self, seconds: float) -> None:
+        """Mark idle and schedule expiry; evict the oldest idle beyond the cap."""
+
+        evicted: list[_WarmProcess] = []
+        with _WARM_LOCK:
+            _WARM_IDLE.pop(id(self), None)
+            _WARM_IDLE[id(self)] = self
+            cap = _max_warm_processes()
+            while len(_WARM_IDLE) > cap:
+                oldest_key = next(iter(_WARM_IDLE))
+                evicted.append(_WARM_IDLE.pop(oldest_key))
+            timer = threading.Timer(seconds, self._expire)
+            timer.daemon = True
+            self._idle_timer = timer
+        for item in evicted:
+            item.close()
+        if self in evicted:
+            return
+        timer.start()
+
+    def take(self) -> bool:
+        """Claim the idle process for a new turn; False if it expired meanwhile."""
+
+        with _WARM_LOCK:
+            owned = _WARM_IDLE.pop(id(self), None) is self
+            timer = self._idle_timer
+            self._idle_timer = None
+        if timer is not None:
+            timer.cancel()
+        return owned and self.alive()
+
+    def _expire(self) -> None:
+        with _WARM_LOCK:
+            if _WARM_IDLE.get(id(self)) is not self:
+                return
+            _WARM_IDLE.pop(id(self), None)
+        self.close()
+
+    def close(self) -> None:
+        with _WARM_LOCK:
+            _WARM_IDLE.pop(id(self), None)
+            timer = self._idle_timer
+            self._idle_timer = None
+            if self._closed:
+                return
+            self._closed = True
+        if timer is not None:
+            timer.cancel()
+        process = self.process
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except Exception:
+            pass
+
+        def _reap() -> None:
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                pass
+            _reap_process_group(process, grace_seconds=2.0)
+
+        threading.Thread(target=_reap, name="claude-code-warm-reap", daemon=True).start()
 
 
 class ClaudeCodeSessionExpired(RuntimeError):
@@ -751,8 +1138,9 @@ class ClaudeCodeSession:
     * First turn: no ``session_id`` -> launches ``claude`` with a fresh
       ``--session-id`` UUID, sends the complete formatted prompt over stdin,
       and records the returned ``session_id`` + message fingerprints.
-    * Later turns: ``session_id`` known and prefix matches -> launches with
-      ``--resume <session_id>`` and sends only the incremental new messages.
+    * Later turns: ``session_id`` known and prefix matches -> sends only the
+      incremental new messages, to the still-running warm process when one is
+      parked for this conversation, otherwise via ``--resume <session_id>``.
     * Prefix mismatch (``/new``, compression, transcript repair) -> starts a
       fresh session.
     * Expired/invalid server session -> retries once as a fresh conversation
@@ -772,6 +1160,8 @@ class ClaudeCodeSession:
         self._abort_requested = False
         self._request_active = False
         self._last_usage: dict[str, Any] = {}
+        self._last_rate_limit: dict[str, Any] = {}
+        self._warm: _WarmProcess | None = None
 
     @property
     def last_usage(self) -> dict[str, Any]:
@@ -779,6 +1169,12 @@ class ClaudeCodeSession:
 
         with self._lock:
             return dict(self._last_usage)
+
+    @property
+    def last_rate_limit(self) -> dict[str, Any]:
+        """Most recent ``rate_limit_info`` reported by the Claude Code CLI."""
+
+        return dict(self._last_rate_limit)
 
     def reset(self) -> None:
         with self._lock:
@@ -791,6 +1187,19 @@ class ClaudeCodeSession:
             self._bound_effort = None
             self._bound_tools_digest = ""
             self._last_usage = {}
+            self._discard_warm()
+
+    def shutdown(self) -> None:
+        """Abort any in-flight request and stop the parked warm process."""
+
+        self.abort()
+        self._discard_warm()
+
+    def _discard_warm(self) -> None:
+        warm = self._warm
+        self._warm = None
+        if warm is not None:
+            warm.close()
 
     def abort(self) -> None:
         """Terminate the in-flight Claude Code process group without waiting.
@@ -862,20 +1271,26 @@ class ClaudeCodeSession:
         state_key: str | None = None,
         command: str | None = None,
         on_text_chunk: Any = None,
+        on_reasoning_chunk: Any = None,
+        system_prompt: str | None = None,
+        prompt_images: list[dict[str, Any]] | None = None,
     ) -> tuple[str, str]:
         """Return ``(response, reasoning)`` using the durable Claude Code session.
 
-        ``prompt_text`` is the *complete* formatted prompt (system + tools +
-        transcript) used for a fresh session or an expired-session retry.
-        ``messages`` drives incremental continuation.
-        ``command`` is the resolved Claude Code CLI binary path (required for
-        exact executable selection; falls back to env/PATH resolution only
-        when omitted).
+        ``prompt_text`` is the *complete* formatted transcript used for a fresh
+        session or an expired-session retry (``prompt_images`` are its image
+        blocks). ``system_prompt`` is the Hermes system contract passed through
+        ``--system-prompt-file``. ``messages`` drives incremental continuation.
+        ``on_text_chunk`` receives validated prose deltas (never tool-call
+        markup); ``on_reasoning_chunk`` receives live thinking deltas.
         """
 
         current = _message_fingerprint(messages)
         normalized_effort = effort.strip() if isinstance(effort, str) and effort.strip() else None
         normalized_tools = tools_digest if isinstance(tools_digest, str) else ""
+        # Only the main conversation keeps a warm process between model calls;
+        # one-off auxiliary calls (titles, compression) exit immediately.
+        keepalive = bool(state_key)
         with self._lock, _durable_transition_lock(state_key):
             self._last_usage = {}
             # Always reload durable state under the lease before dispatch so a
@@ -907,6 +1322,14 @@ class ClaudeCodeSession:
                 self._bound_effort = None
                 self._bound_tools_digest = ""
                 self._state_key = state_key
+            # A parked process only knows the conversation it produced. If the
+            # durable state moved on (another process advanced it, /new, etc.)
+            # its in-memory history is stale — drop it and --resume instead.
+            if self._warm is not None and (
+                self._warm.session_id != self._session_id
+                or self._warm.fingerprints != self._previous_messages
+            ):
+                self._discard_warm()
             previous_count = len(self._previous_messages)
             identity_matches = (
                 self._bound_model == model
@@ -929,58 +1352,7 @@ class ClaudeCodeSession:
                     previous_count,
                     len(current),
                 )
-            if can_resume:
-                incremental = _incremental_prompt(messages, previous_count)
-                if incremental:
-                    try:
-                        response, reasoning, session_id = self._execute_with_soft_limit_retry(
-                            incremental,
-                            session_id=self._session_id,
-                            model=model,
-                            effort=normalized_effort,
-                            timeout_seconds=timeout_seconds,
-                            cwd=cwd,
-                            env=env,
-                            command=command,
-                            on_text_chunk=on_text_chunk,
-                            had_tools=bool(normalized_tools),
-                        )
-                    except ClaudeCodeSessionExpired:
-                        # Expired/invalid server session: retry once as a fresh
-                        # conversation with the complete prompt.
-                        self._session_id = None
-                        self._previous_messages = ()
-                        self._bound_model = None
-                        self._bound_effort = None
-                        self._bound_tools_digest = ""
-                        if state_key:
-                            _delete_durable_state(state_key)
-                    else:
-                        resolved_session_id = _require_uuid_session_id(
-                            session_id or self._session_id or "",
-                            where="resume",
-                        )
-                        self._session_id = resolved_session_id
-                        self._previous_messages = current
-                        self._bound_model = model
-                        self._bound_effort = normalized_effort
-                        self._bound_tools_digest = normalized_tools
-                        if state_key:
-                            _save_durable_state(
-                                state_key,
-                                resolved_session_id,
-                                self._previous_messages,
-                                model=model,
-                                effort=normalized_effort,
-                                tools_digest=normalized_tools,
-                            )
-                        return response, reasoning
-
-            # Prompt body travels over stdin — do NOT apply argv flag-size
-            # limits to it.  Only short CLI flags are size-checked in _execute.
-            response, reasoning, session_id = self._execute_with_soft_limit_retry(
-                prompt_text,
-                session_id=None,
+            call_kwargs = dict(
                 model=model,
                 effort=normalized_effort,
                 timeout_seconds=timeout_seconds,
@@ -990,28 +1362,99 @@ class ClaudeCodeSession:
                 on_text_chunk=on_text_chunk,
                 had_tools=bool(normalized_tools),
             )
+            if on_reasoning_chunk is not None:
+                call_kwargs["on_reasoning_chunk"] = on_reasoning_chunk
+            if system_prompt:
+                call_kwargs["system_prompt"] = system_prompt
+            if keepalive:
+                call_kwargs["keepalive"] = True
+            if can_resume:
+                incremental, incremental_images = _incremental_prompt_with_images(
+                    messages, previous_count
+                )
+                if incremental:
+                    try:
+                        response, reasoning, session_id = self._execute_with_soft_limit_retry(
+                            _user_message_content(incremental, incremental_images),
+                            session_id=self._session_id,
+                            **call_kwargs,
+                        )
+                    except ClaudeCodeSessionExpired:
+                        # Expired/invalid server session: retry once as a fresh
+                        # conversation with the complete prompt.
+                        self._session_id = None
+                        self._previous_messages = ()
+                        self._bound_model = None
+                        self._bound_effort = None
+                        self._bound_tools_digest = ""
+                        self._discard_warm()
+                        if state_key:
+                            _delete_durable_state(state_key)
+                    else:
+                        resolved_session_id = _require_uuid_session_id(
+                            session_id or self._session_id or "",
+                            where="resume",
+                        )
+                        self._publish(
+                            state_key,
+                            resolved_session_id,
+                            current,
+                            model=model,
+                            effort=normalized_effort,
+                            tools_digest=normalized_tools,
+                        )
+                        return response, reasoning
+
+            # Prompt body travels over stdin — do NOT apply argv flag-size
+            # limits to it.  Only short CLI flags are size-checked in _execute.
+            response, reasoning, session_id = self._execute_with_soft_limit_retry(
+                _user_message_content(prompt_text, prompt_images),
+                session_id=None,
+                **call_kwargs,
+            )
             resolved_session_id = _require_uuid_session_id(
                 session_id, where="fresh"
             )
-            self._session_id = resolved_session_id
-            self._previous_messages = current
-            self._bound_model = model
-            self._bound_effort = normalized_effort
-            self._bound_tools_digest = normalized_tools
-            if state_key:
-                _save_durable_state(
-                    state_key,
-                    self._session_id,
-                    self._previous_messages,
-                    model=model,
-                    effort=normalized_effort,
-                    tools_digest=normalized_tools,
-                )
+            self._publish(
+                state_key,
+                resolved_session_id,
+                current,
+                model=model,
+                effort=normalized_effort,
+                tools_digest=normalized_tools,
+            )
             return response, reasoning
+
+    def _publish(
+        self,
+        state_key: str | None,
+        session_id: str,
+        fingerprints: tuple[tuple[str, str], ...],
+        *,
+        model: str,
+        effort: str | None,
+        tools_digest: str,
+    ) -> None:
+        self._session_id = session_id
+        self._previous_messages = fingerprints
+        self._bound_model = model
+        self._bound_effort = effort
+        self._bound_tools_digest = tools_digest
+        if self._warm is not None and self._warm.session_id == session_id:
+            self._warm.fingerprints = fingerprints
+        if state_key:
+            _save_durable_state(
+                state_key,
+                session_id,
+                fingerprints,
+                model=model,
+                effort=effort,
+                tools_digest=tools_digest,
+            )
 
     def _execute_with_soft_limit_retry(
         self,
-        prompt_text: str,
+        prompt_text: Any,
         *,
         session_id: str | None,
         model: str,
@@ -1021,8 +1464,11 @@ class ClaudeCodeSession:
         env: dict[str, str] | None,
         command: str | None = None,
         on_text_chunk: Any = None,
+        on_reasoning_chunk: Any = None,
         max_attempts: int = 3,
         had_tools: bool = False,
+        system_prompt: str | None = None,
+        keepalive: bool = False,
     ) -> tuple[str, str, str]:
         """Run one CLI request, retrying soft notices and incomplete preambles.
 
@@ -1031,8 +1477,9 @@ class ClaudeCodeSession:
         backoff. Only after retries exhaust raise a clear provider error for
         Hermes to surface.
 
-        Streaming is deferred until a validated answer is confirmed so a
-        banner/preamble can never become the live Discord answer.
+        Prose streams live only once an attempt is too long to be a banner or
+        preamble (see ``_StreamGate``); shorter answers are emitted after they
+        validate, so a banner/preamble never becomes the live answer.
         """
 
         last_notice = ""
@@ -1040,6 +1487,28 @@ class ClaudeCodeSession:
         next_session_id = session_id
         attempts = max(1, int(max_attempts))
         for attempt in range(1, attempts + 1):
+            gate = (
+                _StreamGate(on_text_chunk, had_tools=had_tools)
+                if on_text_chunk is not None
+                else None
+            )
+            extra: dict[str, Any] = {}
+            if gate is not None or on_reasoning_chunk is not None:
+
+                def _on_event(kind: str, text: str, _gate: _StreamGate | None = gate) -> None:
+                    if kind == "text" and _gate is not None:
+                        _gate.feed(text)
+                    elif kind == "thinking" and on_reasoning_chunk is not None:
+                        try:
+                            on_reasoning_chunk(text)
+                        except Exception:
+                            pass
+
+                extra["on_event"] = _on_event
+            if system_prompt:
+                extra["system_prompt"] = system_prompt
+            if keepalive:
+                extra["keepalive"] = True
             try:
                 response, reasoning, sid = self._execute(
                     next_prompt,
@@ -1050,10 +1519,13 @@ class ClaudeCodeSession:
                     cwd=cwd,
                     env=env,
                     command=command,
-                    # Never live-stream until the attempt is validated.
-                    on_text_chunk=None,
+                    **extra,
                 )
             except ClaudeCodeSoftLimitNotice as exc:
+                if gate is not None and gate.committed:
+                    # Part of this answer already reached the user; a retry
+                    # would duplicate it. Surface the failure instead.
+                    raise RuntimeError(f"Claude Code stream interrupted: {exc}") from exc
                 last_notice = str(exc)
                 if attempt >= attempts:
                     raise RuntimeError(
@@ -1063,6 +1535,11 @@ class ClaudeCodeSession:
                     ) from exc
                 time.sleep(min(2.0 * attempt, 6.0))
                 continue
+
+            if gate is not None and gate.committed:
+                # Already shown live: this attempt is the answer.
+                gate.finish(response)
+                return response, reasoning, sid
 
             if _is_soft_limit_notice(response):
                 last_notice = response.strip()
@@ -1099,12 +1576,9 @@ class ClaudeCodeSession:
                 next_prompt = _PROGRESS_CONTINUATION_PROMPT
                 continue
 
-            # Confirmed non-notice answer — emit once for stream consumers.
-            if on_text_chunk is not None and response:
-                try:
-                    on_text_chunk(response)
-                except Exception:
-                    pass
+            # Confirmed answer — flush whatever was not streamed live.
+            if gate is not None and response:
+                gate.finish(response)
             return response, reasoning, sid
 
         raise RuntimeError(
@@ -1114,7 +1588,7 @@ class ClaudeCodeSession:
 
     def _execute(
         self,
-        prompt_text: str,
+        prompt_text: Any,
         *,
         session_id: str | None,
         model: str,
@@ -1123,7 +1597,9 @@ class ClaudeCodeSession:
         cwd: str | None,
         env: dict[str, str] | None,
         command: str | None = None,
-        on_text_chunk: Any = None,
+        on_event: Any = None,
+        system_prompt: str | None = None,
+        keepalive: bool = False,
     ) -> tuple[str, str, str]:
         """Run one request with an abort latch scoped to this exact call."""
 
@@ -1142,7 +1618,9 @@ class ClaudeCodeSession:
                 cwd=cwd,
                 env=env,
                 command=command,
-                on_text_chunk=on_text_chunk,
+                on_event=on_event,
+                system_prompt=system_prompt,
+                keepalive=keepalive,
             )
             with self._process_lock:
                 if self._abort_requested:
@@ -1157,27 +1635,16 @@ class ClaudeCodeSession:
                 self._abort_requested = False
                 self._request_active = False
 
-    def _execute_active(
+    def _build_argv(
         self,
-        prompt_text: str,
+        claude_bin: str,
         *,
         session_id: str | None,
         model: str,
         effort: str | None,
-        timeout_seconds: float,
-        cwd: str | None,
-        env: dict[str, str] | None,
-        command: str | None = None,
-        on_text_chunk: Any = None,
-    ) -> tuple[str, str, str]:
-        """Launch ``claude`` with stream-json stdin and parse the event stream live.
-
-        Returns ``(response_text, reasoning_text, session_id)``.
-        When ``on_text_chunk`` is provided it is called with each assistant
-        text fragment as it arrives (live stream path).
-        """
-
-        claude_bin = (command or "").strip() or _resolve_claude_command()
+        system_prompt: str | None,
+        stream_partials: bool,
+    ) -> list[str]:
         argv = [
             claude_bin,
             "-p",
@@ -1188,11 +1655,21 @@ class ClaudeCodeSession:
             "--output-format",
             "stream-json",
             "--verbose",
-            # Replace Claude Code's native coding-assistant persona with the
-            # Hermes backend contract. The full Hermes system prompt remains
-            # inside the structured conversation payload.
-            "--system-prompt",
-            _validate_flag_size(_HERMES_BACKEND_SYSTEM_PROMPT),
+        ]
+        if stream_partials:
+            # Token-level text/thinking deltas as ``stream_event`` lines.
+            argv.append("--include-partial-messages")
+        if system_prompt:
+            # Replace Claude Code's native coding-agent persona with the full
+            # Hermes contract (persona, policies, tool protocol + schemas) in
+            # the real system slot. A file keeps it out of argv.
+            argv += ["--system-prompt-file", _system_prompt_file(system_prompt)]
+        else:
+            argv += [
+                "--system-prompt",
+                _validate_flag_size(_HERMES_BACKEND_SYSTEM_PROMPT),
+            ]
+        argv += [
             # Disable ALL native Claude Code tools so every tool call remains
             # under Hermes logging, permissions, MCP, and approvals.
             "--tools",
@@ -1221,8 +1698,36 @@ class ClaudeCodeSession:
             import uuid
 
             argv += ["--session-id", str(uuid.uuid4())]
+        return argv
 
-        process_env = _build_subprocess_env(env)
+    def _execute_active(
+        self,
+        prompt_text: Any,
+        *,
+        session_id: str | None,
+        model: str,
+        effort: str | None,
+        timeout_seconds: float,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        command: str | None = None,
+        on_event: Any = None,
+        system_prompt: str | None = None,
+        keepalive: bool = False,
+    ) -> tuple[str, str, str]:
+        """Send one user turn to ``claude`` and parse its stream-json events.
+
+        ``prompt_text`` is the stream-json user ``content``: a string, or a
+        list of text/image blocks. Returns ``(response, reasoning, session_id)``.
+        """
+
+        claude_bin = (command or "").strip() or _resolve_claude_command()
+        work_dir = cwd or str(Path.home())
+        system_digest = (
+            hashlib.sha256(system_prompt.encode("utf-8")).hexdigest() if system_prompt else ""
+        )
+        identity = (claude_bin, str(model), effort or "", work_dir, system_digest)
+        keep_seconds = _keepalive_seconds() if keepalive else 0.0
         input_payload = (
             json.dumps(
                 {
@@ -1233,6 +1738,42 @@ class ClaudeCodeSession:
             )
             + "\n"
         )
+
+        # Reuse the parked process when it holds exactly this conversation.
+        warm = self._warm
+        if warm is not None:
+            if (
+                session_id
+                and keep_seconds > 0
+                and warm.session_id == session_id
+                and warm.identity == identity
+                and warm.take()
+            ):
+                try:
+                    return self._run_turn(
+                        warm,
+                        input_payload,
+                        session_id=session_id,
+                        timeout_seconds=timeout_seconds,
+                        on_event=on_event,
+                        keep_seconds=keep_seconds,
+                        reused=True,
+                    )
+                except _WarmProcessGone:
+                    _LOG.info("Claude Code warm process exited while idle; resuming in a new process")
+                    self._discard_warm()
+            else:
+                self._discard_warm()
+
+        argv = self._build_argv(
+            claude_bin,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            system_prompt=system_prompt,
+            stream_partials=on_event is not None,
+        )
+        process_env = _build_subprocess_env(env)
 
         with self._process_lock:
             if self._abort_requested:
@@ -1245,7 +1786,7 @@ class ClaudeCodeSession:
                     stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
-                    cwd=cwd or str(Path.home()),
+                    cwd=work_dir,
                     env=process_env,
                     start_new_session=True,
                 )
@@ -1261,144 +1802,262 @@ class ClaudeCodeSession:
         use_live = callable(getattr(stdin, "write", None)) and callable(
             getattr(stdout_stream, "readline", None)
         )
-
-        stdout = ""
-        stderr = ""
-
         if use_live:
-            stderr_chunks: list[str] = []
-            stdout_lines: list[str] = []
-            timed_out = threading.Event()
-
-            def _stderr_reader() -> None:
-                err = getattr(process, "stderr", None)
-                if err is None:
-                    return
-                try:
-                    for line in err:
-                        stderr_chunks.append(line)
-                except Exception:
-                    pass
-
-            def _timeout_watchdog() -> None:
-                # Unblock a hung readline() by aborting the process group and
-                # closing pipes — deadline checks alone cannot run while blocked.
-                timed_out.set()
-                try:
-                    self.abort()
-                except Exception:
-                    pass
-
-            err_thread = threading.Thread(target=_stderr_reader, daemon=True)
-            err_thread.start()
-            # Enforce the caller timeout even when readline() is blocked.
-            # Small grace covers scheduling jitter; do not add the large batch
-            # drain allowance here or hung children evade the contract.
-            watchdog = threading.Timer(
-                max(0.05, float(timeout_seconds) + 5.0), _timeout_watchdog
+            # Only real subprocesses are parked; test doubles run one turn.
+            can_park = keep_seconds > 0 and isinstance(process, subprocess.Popen)
+            warm = _WarmProcess(process, session_id=session_id, identity=identity)
+            return self._run_turn(
+                warm,
+                input_payload,
+                session_id=session_id,
+                timeout_seconds=timeout_seconds,
+                on_event=on_event,
+                keep_seconds=keep_seconds if can_park else 0.0,
+                reused=False,
             )
-            watchdog.daemon = True
-            watchdog.start()
+
+        # Batch path (unit-test doubles exposing only communicate()).
+        try:
+            stdout, stderr = process.communicate(
+                input=input_payload,
+                timeout=timeout_seconds + 30,
+            )
+        except subprocess.TimeoutExpired:
+            self.abort()
+            _reap_process_group(process, grace_seconds=5.0)
+            raise RuntimeError("Claude Code request timed out")
+        if self._abort_requested:
+            _reap_process_group(process, grace_seconds=2.0)
+            raise RuntimeError("Claude Code request aborted")
+        stdout = stdout or ""
+        stderr = stderr or ""
+        if process.returncode not in (0, None):
+            self._raise_process_failure(process.returncode, stdout, stderr, session_id)
+        return self._parse_turn(stdout, session_id, cost_offset=0.0)
+
+    def _run_turn(
+        self,
+        warm: _WarmProcess,
+        input_payload: str,
+        *,
+        session_id: str | None,
+        timeout_seconds: float,
+        on_event: Any,
+        keep_seconds: float,
+        reused: bool,
+    ) -> tuple[str, str, str]:
+        """Write one user message to ``warm`` and read events up to ``result``."""
+
+        process = warm.process
+        with self._process_lock:
+            if self._abort_requested:
+                warm.close()
+                raise RuntimeError("Claude Code request aborted before launch")
+            self._active_process = process
+        stdin = process.stdin
+        stdout_stream = process.stdout
+        timed_out = threading.Event()
+
+        def _timeout_watchdog() -> None:
+            # Unblock a hung readline() by aborting the process group and
+            # closing pipes — deadline checks alone cannot run while blocked.
+            timed_out.set()
+            try:
+                self.abort()
+            except Exception:
+                pass
+
+        # Enforce the caller timeout even when readline() is blocked.
+        # Small grace covers scheduling jitter; do not add the large batch
+        # drain allowance here or hung children evade the contract.
+        watchdog = threading.Timer(max(0.05, float(timeout_seconds) + 5.0), _timeout_watchdog)
+        watchdog.daemon = True
+        watchdog.start()
+        lines: list[str] = []
+        saw_result = False
+        try:
             try:
                 stdin.write(input_payload)
-                stdin.close()
+                flush = getattr(stdin, "flush", None)
+                if callable(flush):
+                    flush()
+                if keep_seconds <= 0:
+                    stdin.close()
             except Exception as exc:
-                watchdog.cancel()
+                if reused:
+                    raise _WarmProcessGone(str(exc)) from exc
                 self.abort()
                 _reap_process_group(process, grace_seconds=2.0)
                 raise RuntimeError(f"Claude Code failed writing stdin: {exc}") from exc
 
-            try:
-                while True:
-                    if timed_out.is_set():
-                        _reap_process_group(process, grace_seconds=5.0)
-                        raise RuntimeError("Claude Code request timed out")
-                    if self._abort_requested and not timed_out.is_set():
-                        _reap_process_group(process, grace_seconds=2.0)
-                        raise RuntimeError("Claude Code request aborted")
-                    line = stdout_stream.readline()
-                    if line == "":
-                        break
-                    stdout_lines.append(line)
-                    if on_text_chunk is not None and line.strip().startswith("{"):
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            event = None
-                        if isinstance(event, dict) and event.get("type") == "assistant":
-                            message = event.get("message") or {}
-                            if isinstance(message, dict):
-                                for block in message.get("content") or []:
-                                    if (
-                                        isinstance(block, dict)
-                                        and block.get("type") == "text"
-                                    ):
-                                        chunk = str(block.get("text") or "")
-                                        if chunk:
-                                            try:
-                                                on_text_chunk(chunk)
-                                            except Exception:
-                                                pass
+            while True:
+                if timed_out.is_set():
+                    break
+                if self._abort_requested:
+                    break
+                line = stdout_stream.readline()
+                if line == "":
+                    break
+                lines.append(line)
+                stripped = line.strip()
+                if not stripped.startswith("{"):
+                    continue
                 try:
-                    process.wait(timeout=5)
-                except Exception:
-                    self.abort()
-                    _reap_process_group(process, grace_seconds=2.0)
-            finally:
-                watchdog.cancel()
-                err_thread.join(timeout=2)
-            if timed_out.is_set():
-                _reap_process_group(process, grace_seconds=5.0)
-                raise RuntimeError("Claude Code request timed out")
-            stdout = "".join(stdout_lines)
-            stderr = "".join(stderr_chunks)
-        else:
-            # Batch path (also used by unit-test doubles exposing communicate()).
-            try:
-                stdout, stderr = process.communicate(
-                    input=input_payload,
-                    timeout=timeout_seconds + 30,
-                )
-            except subprocess.TimeoutExpired:
-                self.abort()
-                _reap_process_group(process, grace_seconds=5.0)
-                raise RuntimeError("Claude Code request timed out")
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                if event_type == "stream_event":
+                    if on_event is not None:
+                        self._dispatch_stream_event(event.get("event"), on_event)
+                elif event_type == "rate_limit_event":
+                    self._record_rate_limit(event.get("rate_limit_info"))
+                elif event_type == "result":
+                    saw_result = True
+                    break
+        finally:
+            watchdog.cancel()
 
+        if timed_out.is_set():
+            warm.close()
+            _reap_process_group(process, grace_seconds=5.0)
+            raise RuntimeError("Claude Code request timed out")
         if self._abort_requested:
+            warm.close()
             _reap_process_group(process, grace_seconds=2.0)
             raise RuntimeError("Claude Code request aborted")
 
-        stdout = stdout or ""
-        stderr = stderr or ""
-
-        if process.returncode not in (0, None) and process.returncode != 0:
-            detail_parts = []
-            if stderr.strip():
-                detail_parts.append(stderr.strip()[-1000:])
-            if stdout.strip():
-                detail_parts.append(stdout.strip()[-1000:])
-            detail = "\n".join(detail_parts) if detail_parts else f"exit {process.returncode}"
-            if session_id and _is_expired_session_error(detail):
-                raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
-            # Rate-limit / spend-limit notices arrive as exit 1 with
-            # is_error:true and a 429 / rate_limit signal.  These are
-            # transient — convert to a retryable exception so the soft-limit
-            # retry handler can re-attempt instead of killing the turn.
-            if _is_soft_limit_detail(detail):
-                raise ClaudeCodeSoftLimitNotice(detail)
-            raise RuntimeError(
-                f"Claude Code failed (exit {process.returncode}): {detail}"
-            )
+        stdout = "".join(lines)
+        if not saw_result:
+            # EOF: the process exited. A parked process that died while idle
+            # (no output for this turn) is safely replayed in a new process.
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                self.abort()
+                _reap_process_group(process, grace_seconds=2.0)
+            warm.close()
+            if reused and not stdout.strip():
+                raise _WarmProcessGone("warm Claude Code process exited")
+            stderr = warm.stderr_tail()
+            if process.returncode not in (0, None):
+                self._raise_process_failure(process.returncode, stdout, stderr, session_id)
+            # Clean exit without a result: let the strict parser explain it.
+            return self._parse_turn(stdout, session_id, cost_offset=warm.cost_total)
 
         try:
+            response, reasoning, sid = self._parse_turn(
+                stdout, session_id, cost_offset=warm.cost_total
+            )
+        except BaseException:
+            warm.close()
+            raise
+        warm.turns += 1
+        warm.session_id = sid
+        total_cost = self._last_usage.get("_cumulative_cost_usd")
+        if isinstance(total_cost, (int, float)):
+            warm.cost_total = float(total_cost)
+        if keep_seconds > 0 and warm.alive():
+            self._warm = warm
+            warm.park(keep_seconds)
+        else:
+            warm.close()
+        return response, reasoning, sid
+
+    def _dispatch_stream_event(self, event: Any, on_event: Any) -> None:
+        if not isinstance(event, dict) or event.get("type") != "content_block_delta":
+            return
+        delta = event.get("delta")
+        if not isinstance(delta, dict):
+            return
+        delta_type = delta.get("type")
+        try:
+            if delta_type == "text_delta":
+                text = delta.get("text")
+                if isinstance(text, str) and text:
+                    on_event("text", text)
+            elif delta_type == "thinking_delta":
+                text = delta.get("thinking")
+                if isinstance(text, str) and text:
+                    on_event("thinking", text)
+        except Exception:
+            pass
+
+    def _record_rate_limit(self, info: Any) -> None:
+        if not isinstance(info, dict):
+            return
+        previous = self._last_rate_limit
+        self._last_rate_limit = dict(info)
+        status = str(info.get("status") or "")
+        windows = info.get("unifiedWindows")
+        hot = []
+        if isinstance(windows, dict):
+            for name, window in windows.items():
+                if isinstance(window, dict):
+                    utilization = window.get("utilization")
+                    if isinstance(utilization, (int, float)) and utilization >= 0.9:
+                        hot.append(f"{name}={utilization:.0%}")
+        if (status and status != "allowed") or hot:
+            if (previous.get("status"), previous.get("resetsAt")) != (
+                info.get("status"),
+                info.get("resetsAt"),
+            ) or hot:
+                _LOG.warning(
+                    "Claude Code rate limit: status=%s type=%s resets_at=%s %s",
+                    status or "?",
+                    info.get("rateLimitType"),
+                    info.get("resetsAt"),
+                    " ".join(hot),
+                )
+
+    def _raise_process_failure(
+        self,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        session_id: str | None,
+    ) -> None:
+        detail_parts = []
+        if stderr.strip():
+            detail_parts.append(stderr.strip()[-1000:])
+        if stdout.strip():
+            detail_parts.append(stdout.strip()[-1000:])
+        detail = "\n".join(detail_parts) if detail_parts else f"exit {returncode}"
+        if session_id and _is_expired_session_error(detail):
+            raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
+        # Rate-limit / spend-limit notices arrive as exit 1 with
+        # is_error:true and a 429 / rate_limit signal.  These are
+        # transient — convert to a retryable exception so the soft-limit
+        # retry handler can re-attempt instead of killing the turn.
+        if _is_soft_limit_detail(detail):
+            raise ClaudeCodeSoftLimitNotice(detail)
+        raise RuntimeError(f"Claude Code failed (exit {returncode}): {detail}")
+
+    def _parse_turn(
+        self,
+        stdout: str,
+        session_id: str | None,
+        *,
+        cost_offset: float,
+    ) -> tuple[str, str, str]:
+        try:
             response, reasoning, result_session_id = _parse_stream_json_output(stdout)
-            self._last_usage = _parse_stream_json_usage(stdout)
         except ClaudeCodeSessionExpired:
             raise
         except RuntimeError as exc:
             if session_id and _is_expired_session_error(str(exc)):
                 raise ClaudeCodeSessionExpired(str(exc)) from exc
             raise
+        usage = _parse_stream_json_usage(stdout)
+        # ``total_cost_usd`` is cumulative for the lifetime of one CLI
+        # process; report this turn's share.
+        cumulative = usage.get("total_cost_usd")
+        if isinstance(cumulative, (int, float)):
+            usage["_cumulative_cost_usd"] = float(cumulative)
+            usage["total_cost_usd"] = max(0.0, float(cumulative) - cost_offset)
+        self._last_usage = usage
         return response, reasoning, result_session_id
 
 

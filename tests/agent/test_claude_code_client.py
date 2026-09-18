@@ -636,9 +636,12 @@ class TestClaudeCodeClient:
                 ],
                 tool_choice="auto",
             )
-        assert "SYSTEM_CANON" in seen["prompt"]
+        # Hermes system messages and tool schemas travel in the real system
+        # slot; the stdin prompt carries the conversation transcript.
+        assert "SYSTEM_CANON" in seen["kwargs"]["system_prompt"]
+        assert "terminal" in seen["kwargs"]["system_prompt"]
         assert "USER_CANON" in seen["prompt"]
-        assert "terminal" in seen["prompt"]
+        assert "SYSTEM_CANON" not in seen["prompt"]
         assert seen["kwargs"]["model"] == "opus"
         # Without an active conversation context, state_key is None even when
         # tools are present; durability is gated on both tools and context.

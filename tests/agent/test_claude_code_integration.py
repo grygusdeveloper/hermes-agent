@@ -271,6 +271,11 @@ def test_tools_flag_disables_all_native_tools_live():
         "--verbose",
         "--tools",
         "",
+        # Production also isolates MCP: without these, claude.ai connectors
+        # (e.g. Claude Docs) still load and appear in the init tool list.
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
         "--effort",
         "low",
     ]

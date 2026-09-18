@@ -57,12 +57,12 @@ def test_claude_code_prompt_requires_efficient_tool_only_turns():
         ],
     )
     assert "FINALITY RULE" in prompt
-    assert "Do not add narration before or after tool calls" in prompt
+    assert "Do not narrate every trivial call" in prompt
     assert "Independent calls may be emitted together" in prompt
     assert "every tool listed below remains available" in prompt
     assert "natural, thoughtful collaborator" in prompt
-    assert "do not default to an audit-report voice" in prompt
-    assert "bold mini-heading" in prompt
+    assert "compliance form, code-review template" in prompt
+    assert "Use bold labels sparingly" in prompt
 
 
 def test_progress_retry_continues_same_session_instead_of_replaying(monkeypatch):

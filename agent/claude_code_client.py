@@ -8,13 +8,16 @@ argv-bound prompt.
 
 Key differences from the Copilot ACP bridge
 -------------------------------------------
-* **stream-json stdin** — the complete canonical Hermes request (system
-  prompt, tool schemas, full transcript) travels as a JSON user-message object
-  on stdin, never as an ``execve`` argument.  There is no ``MAX_ARG_STRLEN``
-  ceiling.
+* **Real system slot** — the Hermes system prompt, tool protocol and tool
+  schemas travel via ``--system-prompt-file``; the transcript (with native
+  base64 image blocks) travels as a stream-json user message on stdin, never
+  as an ``execve`` argument.  There is no ``MAX_ARG_STRLEN`` ceiling.
 * **Durable session continuation** — one Claude Code ``session_id`` per cached
-  Hermes model client; later turns resume it with ``--resume`` and send only
-  the incremental new messages.
+  Hermes model client; later turns send only the incremental new messages,
+  to a warm process kept alive between the model calls of a tool loop, or via
+  ``--resume`` in a new process.
+* **Live streaming** — ``--include-partial-messages`` thinking deltas stream
+  as reasoning; prose streams once it cannot be a retried banner/preamble.
 * **Distinct identity** — provider ``claude-code``, base marker
   ``acp://claude-code``.  Does not reuse, relabel, or replace ``copilot-acp``
   or the Antigravity command.
@@ -39,12 +42,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent.claude_code_session import ClaudeCodeSession
+from agent.claude_code_session import (
+    _HERMES_BACKEND_SYSTEM_PROMPT,
+    ClaudeCodeSession,
+    _render_content_collecting_images,
+)
 from agent.portal_tags import get_conversation_context
 
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-_PROMPT_FORMAT_VERSION = 4
+_PROMPT_FORMAT_VERSION = 5
 
 # Tool-call extraction shared with the Copilot ACP bridge (same <tool_call> shape).
 from agent.copilot_acp_client import (  # noqa: E402
@@ -53,22 +60,32 @@ from agent.copilot_acp_client import (  # noqa: E402
 )
 
 
-def _format_messages_as_prompt(
+def _render_transcript_content(content: Any, images: list[dict[str, Any]]) -> str:
+    if isinstance(content, list):
+        return _render_content_collecting_images(content, images).strip()
+    return _render_message_content(content)
+
+
+def _build_claude_code_request(
     messages: list[dict[str, Any]],
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
-) -> str:
-    """Canonical Hermes→Claude-Code prompt with full tool-call linkage.
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Split a Hermes request into ``(system_prompt, transcript, images)``.
 
-    Unlike the ACP flattener, assistant ``tool_calls`` and tool-result
-    ``name``/``tool_call_id`` are preserved so fresh/expired full replays
-    remain semantically complete.
+    The system prompt carries the backend contract, the tool protocol + tool
+    schemas and Hermes's own leading system messages, so Claude receives them
+    in the real system slot (``--system-prompt-file``). The transcript keeps
+    assistant ``tool_calls`` and tool-result ``name``/``tool_call_id`` linkage
+    so fresh/expired full replays remain semantically complete. Image parts
+    become native image blocks, referenced from the text as ``[Image #n]``.
     """
 
     import json
 
     sections: list[str] = [
+        _HERMES_BACKEND_SYSTEM_PROMPT,
         "You are the active reasoning model inside Hermes.",
         "Hermes, not Claude Code, owns all tool execution. Claude Code native tools are "
         "intentionally disabled; every tool listed below remains available through Hermes.",
@@ -90,6 +107,8 @@ def _format_messages_as_prompt(
         "optional and should add a real visual cue, never decorate every line. Keep simple "
         "conversation as natural prose rather than forcing a rigid report template. Lead "
         "with the useful conclusion, not process commentary.",
+        "IMAGE RULE: Images attached to a message are sent as native image inputs labelled "
+        "'Image #n:' and referenced in the transcript as [Image #n]. Look at them directly.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
@@ -123,15 +142,35 @@ def _format_messages_as_prompt(
     if tool_choice is not None:
         sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
 
+    images: list[dict[str, Any]] = []
+    leading_system: list[str] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict):
+            index += 1
+            continue
+        if str(message.get("role") or "").strip().lower() != "system":
+            break
+        rendered = _render_message_content(message.get("content"))
+        if rendered:
+            leading_system.append(rendered)
+        index += 1
+    if leading_system:
+        sections.append(
+            "Hermes system instructions (authoritative policy for this conversation):\n\n"
+            + "\n\n".join(leading_system)
+        )
+
     transcript: list[str] = []
-    for message in messages:
+    for message in messages[index:]:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").strip().lower()
         if role == "tool":
             tool_call_id = message.get("tool_call_id") or message.get("id") or ""
             tool_name = message.get("name") or ""
-            rendered = _render_message_content(message.get("content"))
+            rendered = _render_transcript_content(message.get("content"), images)
             meta = []
             if isinstance(tool_name, str) and tool_name.strip():
                 meta.append(f"name={tool_name.strip()}")
@@ -145,8 +184,7 @@ def _format_messages_as_prompt(
         if role not in {"system", "user", "assistant"}:
             role = "context"
 
-        content = message.get("content")
-        rendered = _render_message_content(content)
+        rendered = _render_transcript_content(message.get("content"), images)
         tool_calls = message.get("tool_calls")
         call_blocks: list[str] = []
         if tool_calls:
@@ -185,11 +223,28 @@ def _format_messages_as_prompt(
         }.get(role, role.title())
         transcript.append(f"{label}:\n" + "\n".join(body_parts))
 
+    prompt_sections: list[str] = []
     if transcript:
-        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+        prompt_sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+    prompt_sections.append("Continue the conversation from the latest user request.")
 
-    sections.append("Continue the conversation from the latest user request.")
-    return "\n\n".join(section.strip() for section in sections if section and section.strip())
+    system_prompt = "\n\n".join(s.strip() for s in sections if s and s.strip())
+    prompt_text = "\n\n".join(s.strip() for s in prompt_sections if s and s.strip())
+    return system_prompt, prompt_text, images
+
+
+def _format_messages_as_prompt(
+    messages: list[dict[str, Any]],
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+) -> str:
+    """Flat text view of :func:`_build_claude_code_request` (system + transcript)."""
+
+    system_prompt, prompt_text, _images = _build_claude_code_request(
+        messages, model=model, tools=tools, tool_choice=tool_choice
+    )
+    return system_prompt + "\n\n" + prompt_text
 
 
 class _ClaudeCodeChatCompletions:
@@ -243,7 +298,7 @@ class ClaudeCodeClient:
 
     def close(self) -> None:
         if self._owns_claude_session:
-            self._claude_session.abort()
+            self._claude_session.shutdown()
         proc: subprocess.Popen[str] | None
         with self._active_process_lock:
             proc = self._active_process
@@ -271,7 +326,7 @@ class ClaudeCodeClient:
         stream: bool = False,
         **kwargs: Any,
     ) -> Any:
-        prompt_text = _format_messages_as_prompt(
+        system_prompt, prompt_text, prompt_images = _build_claude_code_request(
             messages or [],
             model=model,
             tools=tools,
@@ -300,19 +355,7 @@ class ClaudeCodeClient:
         # overwrite the main session's conversation mapping.
         state_key = get_conversation_context() if tools else None
 
-        if stream:
-            return self._stream_chat_completion(
-                prompt_text=prompt_text,
-                messages=messages or [],
-                model=model or "sonnet",
-                effort=effort,
-                tools_digest=tools_digest,
-                timeout_seconds=_effective_timeout,
-                state_key=state_key,
-            )
-
-        response_text, reasoning_text = self._claude_session.run(
-            prompt_text,
+        run_kwargs: dict[str, Any] = dict(
             messages=messages or [],
             model=model or "sonnet",
             effort=effort,
@@ -322,7 +365,19 @@ class ClaudeCodeClient:
             env=_build_subprocess_env(),
             state_key=state_key,
             command=self._claude_command,
+            system_prompt=system_prompt,
         )
+        if prompt_images:
+            run_kwargs["prompt_images"] = prompt_images
+
+        if stream:
+            return self._stream_chat_completion(
+                prompt_text=prompt_text,
+                run_kwargs=run_kwargs,
+                model=model or "sonnet",
+            )
+
+        response_text, reasoning_text = self._claude_session.run(prompt_text, **run_kwargs)
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
@@ -347,18 +402,15 @@ class ClaudeCodeClient:
         self,
         *,
         prompt_text: str,
-        messages: list[dict[str, Any]],
+        run_kwargs: dict[str, Any],
         model: str,
-        effort: str | None,
-        tools_digest: str,
-        timeout_seconds: float,
-        state_key: str | None,
     ):
-        """Yield OpenAI-style stream chunks as Claude Code assistant text arrives.
+        """Yield OpenAI-style stream chunks as Claude Code output arrives.
 
-        Contract: concatenated ``delta.content`` over the whole stream equals the
-        non-streaming ``cleaned_text`` (no raw ``<tool_call>`` markup, no
-        duplicated prose on the finish chunk).
+        Thinking streams live as ``reasoning_content``. Prose streams live once
+        the session's gate has validated the attempt (never raw ``<tool_call>``
+        markup). Contract: concatenated ``delta.content`` over the whole stream
+        equals the non-streaming ``cleaned_text``.
         """
 
         import queue
@@ -367,26 +419,21 @@ class ClaudeCodeClient:
         done = object()
         error_box: dict[str, BaseException] = {}
 
-        def on_chunk(raw_text: str) -> None:
-            # Never live-stream raw tool-call markup. Emit cleaned prose only.
-            _tools, cleaned = _extract_tool_calls_from_text(raw_text)
-            if cleaned and cleaned.strip():
-                q.put(("text", cleaned))
+        def on_text(text: str) -> None:
+            if text:
+                q.put(("text", text))
+
+        def on_reasoning(text: str) -> None:
+            if text:
+                q.put(("reasoning", text))
 
         def worker() -> None:
             try:
                 response_text, reasoning_text = self._claude_session.run(
                     prompt_text,
-                    messages=messages,
-                    model=model,
-                    effort=effort,
-                    tools_digest=tools_digest,
-                    timeout_seconds=timeout_seconds,
-                    cwd=self._claude_cwd,
-                    env=_build_subprocess_env(),
-                    state_key=state_key,
-                    command=self._claude_command,
-                    on_text_chunk=on_chunk,
+                    on_text_chunk=on_text,
+                    on_reasoning_chunk=on_reasoning,
+                    **run_kwargs,
                 )
                 q.put(("final", response_text, reasoning_text))
             except BaseException as exc:  # noqa: BLE001 — surface to consumer
@@ -397,7 +444,27 @@ class ClaudeCodeClient:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
+        def _chunk(*, content=None, reasoning=None, tool_calls=None, finish_reason=None, role="assistant"):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(
+                            role=role,
+                            content=content,
+                            tool_calls=tool_calls,
+                            reasoning_content=reasoning,
+                            reasoning=reasoning,
+                        ),
+                        finish_reason=finish_reason,
+                    )
+                ],
+                model=model,
+                usage=None,
+            )
+
         emitted_text: list[str] = []
+        streamed_reasoning = False
         final_text = ""
         final_reasoning = ""
         try:
@@ -405,27 +472,15 @@ class ClaudeCodeClient:
                 item = q.get()
                 if item is done:
                     break
-                if isinstance(item, tuple) and item and item[0] == "text":
-                    chunk_text = item[1]
-                    emitted_text.append(chunk_text)
-                    yield SimpleNamespace(
-                        choices=[
-                            SimpleNamespace(
-                                index=0,
-                                delta=SimpleNamespace(
-                                    role="assistant",
-                                    content=chunk_text,
-                                    tool_calls=None,
-                                    reasoning_content=None,
-                                    reasoning=None,
-                                ),
-                                finish_reason=None,
-                            )
-                        ],
-                        model=model,
-                        usage=None,
-                    )
-                elif isinstance(item, tuple) and item and item[0] == "final":
+                if not (isinstance(item, tuple) and item):
+                    continue
+                if item[0] == "text":
+                    emitted_text.append(item[1])
+                    yield _chunk(content=item[1])
+                elif item[0] == "reasoning":
+                    streamed_reasoning = True
+                    yield _chunk(reasoning=item[1])
+                elif item[0] == "final":
                     final_text = item[1] or ""
                     final_reasoning = item[2] or ""
             if error_box.get("exc"):
@@ -433,37 +488,11 @@ class ClaudeCodeClient:
 
             tool_calls, cleaned = _extract_tool_calls_from_text(final_text or "")
             already = "".join(emitted_text)
-            # Emit any cleaned remainder not already streamed (no duplication).
-            if cleaned and cleaned != already:
-                if already and cleaned.startswith(already):
-                    remainder = cleaned[len(already) :]
-                elif already:
-                    # Divergent live vs final — prefer authoritative cleaned once.
-                    remainder = cleaned if not already else ""
-                    if not remainder and cleaned != already:
-                        # Replace semantics: stream cleaned as single corrective only
-                        # when nothing useful was emitted.
-                        remainder = cleaned if not already.strip() else ""
-                else:
-                    remainder = cleaned
-                if remainder:
-                    yield SimpleNamespace(
-                        choices=[
-                            SimpleNamespace(
-                                index=0,
-                                delta=SimpleNamespace(
-                                    role="assistant",
-                                    content=remainder,
-                                    tool_calls=None,
-                                    reasoning_content=final_reasoning or None,
-                                    reasoning=final_reasoning or None,
-                                ),
-                                finish_reason=None,
-                            )
-                        ],
-                        model=model,
-                        usage=None,
-                    )
+            # Safety net: emit any cleaned remainder the session did not stream.
+            if cleaned and cleaned != already and cleaned.startswith(already):
+                yield _chunk(content=cleaned[len(already):])
+            # Reasoning reaches the consumer exactly once: live, or here.
+            late_reasoning = None if streamed_reasoning else (final_reasoning or None)
 
             finish = "tool_calls" if tool_calls else "stop"
             if tool_calls:
@@ -480,41 +509,12 @@ class ClaudeCodeClient:
                             ),
                         )
                     )
-                yield SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            index=0,
-                            delta=SimpleNamespace(
-                                role="assistant",
-                                content=None,  # never re-emit prose on finish
-                                tool_calls=deltas,
-                                reasoning_content=final_reasoning or None,
-                                reasoning=final_reasoning or None,
-                            ),
-                            finish_reason=finish,
-                        )
-                    ],
-                    model=model,
-                    usage=None,
-                )
+                # Never re-emit prose on the finish chunk.
+                yield _chunk(tool_calls=deltas, reasoning=late_reasoning, finish_reason=finish)
             else:
-                yield SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            index=0,
-                            delta=SimpleNamespace(
-                                role=None,
-                                content=None,
-                                tool_calls=None,
-                                reasoning_content=None,
-                                reasoning=None,
-                            ),
-                            finish_reason=finish,
-                        )
-                    ],
-                    model=model,
-                    usage=None,
-                )
+                if late_reasoning:
+                    yield _chunk(reasoning=late_reasoning)
+                yield _chunk(role=None, finish_reason=finish)
             yield SimpleNamespace(
                 choices=[],
                 model=model,
