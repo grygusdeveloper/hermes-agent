@@ -30,7 +30,17 @@ Design invariants
   already-authenticated Claude Code CLI; this module never reads, passes, or
   logs credentials.
 * **Cancellation / timeout / cleanup** — every request owns its process via a
-  process-group latch; aborts and timeouts kill the whole group and reap it.
+  process-group latch. ``abort`` never blocks: it cancels every run of the
+  session (in flight, between attempts, queued), interrupts a warm process's
+  turn gracefully (stream-json ``interrupt``; the process stays parked and
+  the next request continues after the interruption) and otherwise signals
+  the group first. It never closes a pipe another thread is reading.
+  Timeouts kill the whole group and reap it.
+* **Streaming and liveness** — every process runs with
+  ``--include-partial-messages`` and ``--thinking-display summarized``. A
+  per-turn monitor forwards text/thinking deltas, re-streams (dropped API
+  connections), liveness ticks and a progress snapshot for the gateway
+  heartbeat, logs CLI system events and one latency line per turn.
 * **Expired-session recovery** — a missing/expired server session is detected
   and retried once as a fresh conversation with the complete prompt.
 * **Rewindable continuity** — every published turn records a *checkpoint*:
@@ -104,6 +114,50 @@ _last_state_prune = 0.0
 # If an installed CLI rejects it, stop passing it for the rest of the process
 # and resume plainly, as before checkpoints existed.
 _resume_at_supported = True
+# ``--thinking-display`` is a hidden Claude Code flag (2.1.276; the Agent SDK
+# passes it too). Opus 5 and newer models default to *omitted* thinking, so
+# without it every thinking block reaches Hermes empty: no live reasoning, no
+# reasoning in the session DB. Only these values are accepted; anything else
+# makes the CLI exit 1. Override with HERMES_CLAUDE_CODE_THINKING_DISPLAY
+# (``off`` sends no flag). Turned off for the process if a CLI rejects it.
+_THINKING_DISPLAY_CHOICES = frozenset({"summarized", "omitted"})
+_thinking_display_supported = True
+# A graceful interrupt (stream-json ``control_request`` "interrupt") ends the
+# turn and keeps the warm process; the CLI answers within ~100 ms. If the turn
+# has not ended after this grace, the process group is killed.
+_INTERRUPT_GRACE_SECONDS = 1.5
+# Child environment defaults (names verified in the Claude Code 2.1.276
+# binary). A value already set in Hermes's own environment wins.
+_CLI_ENV_DEFAULTS = {
+    # "Essential traffic only": no telemetry, update checks or other
+    # background calls; measured ~0.4 s faster to system/init per spawn.
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "DISABLE_TELEMETRY": "1",
+    # Hermes owns compaction. Claude Code compacting its copy on its own
+    # (~967k tokens on 1M-window models) would silently desync it from the
+    # transcript Hermes keeps resuming; manual /compact stays available.
+    "DISABLE_AUTO_COMPACT": "1",
+    # The 1-hour prompt cache (Claude Code's automatic choice on a
+    # subscription within its limits), pinned: Discord replies often come
+    # more than 5 minutes apart.
+    "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h",
+}
+
+
+def _thinking_display() -> str | None:
+    """The ``--thinking-display`` value to send, or None for no flag."""
+
+    if not _thinking_display_supported:
+        return None
+    value = os.getenv("HERMES_CLAUDE_CODE_THINKING_DISPLAY", "").strip().lower() or "summarized"
+    return value if value in _THINKING_DISPLAY_CHOICES else None
+
+
+def _graceful_interrupts() -> bool:
+    raw = os.getenv("HERMES_CLAUDE_CODE_GRACEFUL_INTERRUPT", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 # Sent into the session when Hermes re-sends exactly the request it already
 # published: the user asked for a new answer (/retry), or Hermes rejected the
@@ -1004,8 +1058,8 @@ def _mask_code(text: str) -> str:
     return "".join(pieces)
 
 
-def _inside_open_fence(text: str) -> bool:
-    """True when ``text`` ends inside a fenced code block."""
+def _open_fence_closer(text: str) -> str:
+    """The fence that closes the code block ``text`` ends inside, or ""."""
 
     fence: tuple[str, int] | None = None
     for line in text.splitlines(keepends=True):
@@ -1013,7 +1067,13 @@ def _inside_open_fence(text: str) -> bool:
             fence = _fence_opened(line)
         elif line.endswith("\n") and _closes_fence(line, fence):
             fence = None
-    return fence is not None
+    return fence[0] * fence[1] if fence is not None else ""
+
+
+def _inside_open_fence(text: str) -> bool:
+    """True when ``text`` ends inside a fenced code block."""
+
+    return bool(_open_fence_closer(text))
 
 
 class _ToolCallFailure(NamedTuple):
@@ -1340,18 +1400,38 @@ _STREAM_HOLDBACK_CHARS = 16
 # (the gate cannot know yet whether the span closes) and are released by
 # finish(). Only fenced blocks stream through.
 _TOOL_MARKUP_RE = re.compile(r"</?tool_call(?![A-Za-z0-9_])")
+# A tag that certainly opens a call: the JSON object has started. The prose
+# before it is a progress sentence and is shown right away.
+_TOOL_CALL_PREVIEW_RE = re.compile(r"<tool_call(?:\s[^>]*)?>\s*\{")
+# ...and one that certainly does not (a closing tag, or other text after ">").
+_TOOL_CALL_NOT_OPENER_RE = re.compile(r"</|<tool_call(?:\s[^>]*)?>\s*[^\s{]")
+_PREVIEW_LOOKAHEAD_CHARS = 64
+# Shown between the part of an answer the user already saw and the full
+# answer, when Claude Code abandoned the message it was streaming (a dropped
+# API connection makes it re-stream the whole message) or the final text does
+# not continue what was shown.
+_STREAM_RESTART_SEPARATOR = "\n\n⚠ Connection to Claude dropped — retrying the answer:\n\n"
+_STREAM_DIVERGED_SEPARATOR = "\n\n⚠ The streamed text above was incomplete; full answer:\n\n"
 
 
 class _StreamGate:
     """Forward validated prose deltas; never raw tool-call markup.
 
-    Emitted text is always a prefix of the final cleaned answer (the prose
-    before the tool calls, see :func:`_parse_claude_reply`) so the consumer's
-    concatenated deltas equal the non-streaming ``message.content``.
+    Emitted text is always a prefix of the final answer's cleaned text (the
+    prose before the tool calls, see :func:`_parse_claude_reply`) so the
+    consumer's concatenated deltas equal the non-streaming ``message.content``.
 
-    A repair turn continues a reply whose prose was already shown: its gate
-    starts from that ``prefix`` with the earlier gate's ``emitted`` text and
-    ``committed`` state, so nothing is sent twice.
+    The answer is ``head + attempt``: ``head`` is text that precedes this CLI
+    attempt in the final answer. A repair turn continues a reply whose prose
+    was already shown, so its gate starts from that ``prefix`` with the earlier
+    gate's ``emitted`` text and ``committed`` state and nothing is sent twice.
+    When Claude Code abandons the message it is streaming (see
+    :meth:`restart`), what was shown becomes the head, followed by a visible
+    separator.
+
+    Work per delta is proportional to the delta, not to the answer: only the
+    not-yet-emitted tail is kept as a string, and markup is searched in new
+    text only.
     """
 
     def __init__(
@@ -1370,61 +1450,193 @@ class _StreamGate:
                 _STREAM_COMMIT_CHARS_WITH_TOOLS if had_tools else _STREAM_COMMIT_CHARS_NO_TOOLS
             )
         self._commit_chars = commit_chars
-        self._raw = prefix
-        self._scan_from = len(prefix)
-        self._emitted = emitted
-        self._closed = False
+        # Without tools there is no protocol: markup is plain text.
+        self._had_tools = had_tools
         self.committed = committed
+        # The prose before a tool call was shown ahead of the call itself.
+        self.previewed = False
+        self._emitted_parts: list[str] = [emitted] if emitted else []
+        self._emitted_size = len(emitted)
+        self._reset(prefix)
+
+    def _reset(self, head: str) -> None:
+        self._head = head
+        # Absolute offsets into the answer text (head + attempt so far).
+        self._size = len(head)
+        self._scan_from = len(head)
+        lead = len(head) - len(head.lstrip())
+        self._emit_end = min(len(head), lead + self._emitted_size) if self._emitted_size else 0
+        # The answer text from ``_emit_end`` on: everything not emitted yet.
+        self._pending = head[self._emit_end:]
+        self._closed = False
+        self._markup: int | None = None
+        self._after_markup = ""
+        self._preview_open = False
 
     @property
     def emitted(self) -> str:
-        return self._emitted
+        if len(self._emitted_parts) > 1:
+            self._emitted_parts = ["".join(self._emitted_parts)]
+        return self._emitted_parts[0] if self._emitted_parts else ""
+
+    def answer(self, attempt: str) -> str:
+        """The full answer text for this attempt's reply."""
+
+        return self._head + (attempt or "")
 
     def feed(self, delta: str) -> None:
-        if self._closed or not delta:
+        if not delta:
             return
-        self._raw += delta
-        markup = self._markup_offset()
+        if self._closed:
+            if self._preview_open:
+                self._after_markup = (self._after_markup + delta)[:_PREVIEW_LOOKAHEAD_CHARS]
+                self._check_preview()
+            return
+        self._size += len(delta)
+        self._pending += delta
+        markup = self._find_markup() if self._had_tools else None
         if markup is not None:
-            safe = self._raw[:markup].strip()
             self._closed = True
-        else:
-            # Trailing whitespace waits too: the final answer is stripped, so
-            # whitespace right before a tool call must never be emitted.
-            safe = self._raw[: max(0, len(self._raw) - _STREAM_HOLDBACK_CHARS)].strip()
+            self._markup = markup
+            if self.committed:
+                self._emit_until(markup)
+                return
+            self._preview_open = True
+            self._after_markup = self._pending[markup - self._emit_end :][
+                :_PREVIEW_LOOKAHEAD_CHARS
+            ]
+            self._check_preview()
+            return
+        limit = self._size - _STREAM_HOLDBACK_CHARS
         if not self.committed:
-            if len(safe) <= self._commit_chars:
+            # Nothing of this attempt was emitted yet (it would have
+            # committed), so its text is the tail of ``_pending``.
+            start = max(0, len(self._head) - self._emit_end)
+            own = self._pending[start : max(start, limit - self._emit_end)].strip()
+            if len(own) <= self._commit_chars:
                 return
             self.committed = True
-        self._send(safe)
+        # Trailing whitespace waits too: the final answer is stripped, so
+        # whitespace right before a tool call must never be emitted.
+        self._emit_until(limit)
 
-    def _markup_offset(self) -> int | None:
+    def _find_markup(self) -> int | None:
         """Offset of the first tool-call tag outside a fenced code block."""
 
         while True:
-            match = _TOOL_MARKUP_RE.search(self._raw, self._scan_from)
+            base = self._scan_from
+            if base >= self._emit_end:
+                window = self._pending[base - self._emit_end :]
+            else:  # pragma: no cover - defensive: scanning never lags emission
+                window = self._text_before(self._size)[base:]
+            match = _TOOL_MARKUP_RE.search(window)
             if match is None:
                 # A tag may still be arriving: rescan the held-back tail.
-                self._scan_from = max(
-                    self._scan_from, len(self._raw) - _STREAM_HOLDBACK_CHARS
-                )
+                self._scan_from = max(self._scan_from, self._size - _STREAM_HOLDBACK_CHARS)
                 return None
-            if not _inside_open_fence(self._raw[: match.start()]):
-                return match.start()
-            self._scan_from = match.end()
+            offset = base + match.start()
+            if not _inside_open_fence(self._text_before(offset)):
+                return offset
+            self._scan_from = base + match.end()
 
-    def finish(self, response: str) -> None:
-        """Emit whatever of the validated final answer was not streamed yet."""
+    def _text_before(self, offset: int) -> str:
+        """Answer text up to ``offset`` (only needed when a tag was found)."""
 
-        cleaned = _parse_claude_reply(response or "").cleaned
-        if cleaned:
-            self._send(cleaned)
+        # The emitted text is the answer from its first non-blank character
+        # up to ``_emit_end``; blanks stand in for the stripped lead.
+        lead = " " * max(0, self._emit_end - self._emitted_size)
+        return (lead + self.emitted + self._pending)[:offset]
 
-    def _send(self, safe: str) -> None:
-        if len(safe) <= len(self._emitted) or not safe.startswith(self._emitted):
+    def _check_preview(self) -> None:
+        if _TOOL_CALL_PREVIEW_RE.match(self._after_markup):
+            self._preview_open = False
+            markup = self._markup or 0
+            line = self._pending[: max(0, markup - self._emit_end)].rsplit("\n", 1)[-1]
+            if line.count("`") % 2:
+                # Inside an inline code span: a mention, not a call.
+                return
+            before = self._emitted_size
+            self._emit_until(markup)
+            self.previewed = self.previewed or self._emitted_size > before
+        elif (
+            _TOOL_CALL_NOT_OPENER_RE.match(self._after_markup)
+            or len(self._after_markup) >= _PREVIEW_LOOKAHEAD_CHARS
+        ):
+            self._preview_open = False
+
+    def _emit_until(self, limit: int) -> None:
+        """Emit the answer text up to ``limit``, without trailing whitespace."""
+
+        count = limit - self._emit_end
+        if count <= 0:
             return
-        chunk = safe[len(self._emitted):]
-        self._emitted = safe
+        segment = self._pending[:count]
+        end = len(segment.rstrip())
+        begin = 0 if self._emitted_size else len(segment) - len(segment.lstrip())
+        if end <= begin:
+            return
+        self._emit_end += end
+        self._pending = self._pending[end:]
+        self._send(segment[begin:end])
+
+    def restart(self) -> None:
+        """Claude Code replaced the message it was streaming with a new one.
+
+        A dropped API connection makes the CLI end the partial message
+        (``message_stop`` without a stop reason) and stream the whole message
+        again; a refused message is answered again by the fallback model. If
+        nothing of it was shown yet the restart is invisible; otherwise what
+        was shown stays, followed by a separator and the new attempt.
+        Idempotent.
+        """
+
+        if self._emit_end <= len(self._head):
+            self._reset(self._head)
+            return
+        _LOG.warning(
+            "Claude Code re-streams a message after %d chars were shown; the "
+            "answer continues after a separator",
+            self._emitted_size,
+        )
+        self._reset(self._separated(self.emitted, _STREAM_RESTART_SEPARATOR))
+
+    @staticmethod
+    def _separated(shown: str, separator: str) -> str:
+        closer = _open_fence_closer(shown)
+        return shown + (f"\n{closer}" if closer else "") + separator
+
+    def finish(self, response: str) -> str:
+        """Emit what of the final answer was not streamed; return the answer.
+
+        ``response`` is this attempt's reply; the returned text is the full
+        answer (``head + response``). If that does not continue what was
+        shown, the shown text is kept and the answer follows a separator, so
+        nothing the user saw disappears and nothing of the answer (a trailing
+        ``MEDIA:`` path) is lost.
+        """
+
+        full = self.answer(response)
+        cleaned = self._cleaned(full)
+        emitted = self.emitted
+        if not cleaned.startswith(emitted):
+            _LOG.warning(
+                "Claude Code final answer does not continue the %d streamed "
+                "chars; appending it after a separator",
+                len(emitted),
+            )
+            self._head = self._separated(emitted, _STREAM_DIVERGED_SEPARATOR)
+            full = self.answer(response)
+            cleaned = self._cleaned(full)
+        if len(cleaned) > len(emitted):
+            self._send(cleaned[len(emitted):])
+        return full
+
+    def _cleaned(self, text: str) -> str:
+        return _parse_claude_reply(text).cleaned if self._had_tools else text.strip()
+
+    def _send(self, chunk: str) -> None:
+        self._emitted_parts.append(chunk)
+        self._emitted_size += len(chunk)
         try:
             self._emit(chunk)
         except Exception:
@@ -1583,8 +1795,408 @@ class _WarmProcess:
         threading.Thread(target=_reap, name="claude-code-warm-reap", daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# Turn observation: liveness, progress, CLI system events, latency telemetry
+# ---------------------------------------------------------------------------
+
+# Liveness ticks reach the stream consumer at most this often.
+_TICK_INTERVAL_SECONDS = 1.0
+_TOOL_CALL_OPENER = "<tool_call"
+# Text after the latest tool-call opener kept to find the tool's name.
+_CALL_NAME_WINDOW_CHARS = 400
+
+
+def _size_label(chars: int) -> str:
+    return f"{chars / 1000:.1f}k chars" if chars >= 1000 else f"{chars} chars"
+
+
+class _Progress:
+    """What the bridge is doing right now, for the gateway heartbeat.
+
+    ``ClaudeCodeClient.get_runtime_activity`` returns :meth:`snapshot`; the
+    Discord "Working…" heartbeat prefers it to the generic "waiting on the
+    provider, no output yet" text, which is misleading while Claude writes a
+    long tool call. Only phases, tool names, sizes and CLI notices: never
+    prompt, answer or reasoning text.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = False
+        self._phase = ""
+        self._fields: dict[str, Any] = {}
+        self._since = 0.0
+        self._updated = 0.0
+        # Sticky for the turn: an API retry or a model fallback.
+        self._notice = ""
+
+    def begin(self, phase: str) -> None:
+        with self._lock:
+            self._active = True
+            self._notice = ""
+            self._set(phase, {})
+
+    def update(self, phase: str, **fields: Any) -> None:
+        with self._lock:
+            if self._active:
+                self._set(phase, fields)
+
+    def _set(self, phase: str, fields: dict[str, Any]) -> None:
+        now = time.time()
+        if phase != self._phase:
+            self._since = now
+        self._phase = phase
+        self._fields = fields
+        self._updated = now
+
+    def notice(self, text: str) -> None:
+        with self._lock:
+            if self._active:
+                self._notice = text
+                self._updated = time.time()
+
+    def end(self) -> None:
+        with self._lock:
+            self._active = False
+            self._updated = time.time()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            if not self._active:
+                return {"active": False, "description": "", "updated_at": self._updated}
+            description = self._describe(time.time())
+            if self._notice:
+                description += f" — {self._notice}"
+            return {"active": True, "description": description, "updated_at": self._updated}
+
+    def _describe(self, now: float) -> str:
+        elapsed = max(0, int(now - self._since))
+        fields = self._fields
+        phase = self._phase
+        if phase == "starting":
+            return f"starting Claude Code ({elapsed}s)"
+        if phase == "thinking":
+            tokens = fields.get("tokens")
+            detail = f", ~{tokens} tokens" if tokens else ""
+            return f"Claude is thinking ({elapsed}s{detail})"
+        if phase == "writing":
+            return f"Claude is writing the answer ({_size_label(fields.get('chars', 0))})"
+        if phase == "tool":
+            size = _size_label(fields.get("chars", 0))
+            calls = fields.get("calls", 1)
+            name = fields.get("name") or ""
+            if calls > 1:
+                return f"Claude is writing {calls} tool calls ({size})"
+            what = f"a {name} call" if name else "a tool call"
+            return f"Claude is writing {what} ({size})"
+        if phase == "compacting":
+            return f"Claude Code is compacting its context ({elapsed}s)"
+        return f"waiting for Claude ({elapsed}s)"
+
+
+class _TurnMonitor:
+    """Observes the stdout events of one CLI turn for the session.
+
+    Forwards text/thinking deltas and liveness ticks to ``on_event``, detects
+    a message Claude Code abandoned and re-streams (``restart``), records
+    stop reasons per message, logs CLI system events (API retries,
+    compaction, model fallbacks), keeps the progress snapshot current and
+    times the turn.
+    """
+
+    def __init__(
+        self,
+        on_event: Any,
+        progress: _Progress,
+        *,
+        mode: str,
+        pid: Any,
+        started: float,
+        payload_chars: int,
+        note: str = "",
+    ) -> None:
+        self._on_event = on_event
+        self._progress = progress
+        self.mode = mode
+        self.pid = pid
+        self.started = started
+        self.payload_chars = payload_chars
+        self.note = note
+        self.marks: dict[str, float] = {}
+        # message id -> stop reason; None = ended without one (abandoned).
+        self.stop_reasons: dict[str, str | None] = {}
+        self._message_id: str | None = None
+        self._stop_reason: str | None = None
+        self._message_open = False
+        self._messages = 0
+        # Stop reason of the latest finished message (None: none, or it
+        # ended without one).
+        self._last_stop: str | None = None
+        self.api_retries = 0
+        self.compacted = False
+        self.fallback_model: str | None = None
+        self.fallback_session_wide = False
+        # Uuid of the latest chain entry the CLI reported (assistant block or
+        # the "[Request interrupted by user]" user entry).
+        self.chain_uuid: str | None = None
+        self._last_tick = 0.0
+        self._thinking_tokens = 0
+        self._text_chars = 0
+        self._tail = ""
+        self._call_start: int | None = None
+        self._call_text = ""
+        self._calls = 0
+        self._tool_name = ""
+
+    def _mark(self, key: str) -> None:
+        self.marks.setdefault(key, time.monotonic())
+
+    def _emit(self, kind: str, text: str = "") -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(kind, text)
+        except Exception:
+            pass
+
+    def _tick(self) -> None:
+        now = time.monotonic()
+        if now - self._last_tick >= _TICK_INTERVAL_SECONDS:
+            self._last_tick = now
+            self._emit("tick")
+
+    def observe(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if event_type == "stream_event":
+            self._mark("event")
+            self._stream_event(event.get("event"))
+            self._tick()
+        elif event_type == "system":
+            self._system_event(event)
+            self._tick()
+        elif event_type in ("assistant", "user"):
+            value = event.get("uuid")
+            if isinstance(value, str) and _SESSION_ID_RE.fullmatch(value):
+                self.chain_uuid = value
+
+    def _stream_event(self, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if kind == "content_block_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, dict):
+                return
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                text = delta.get("text")
+                if isinstance(text, str) and text:
+                    self._mark("text")
+                    self._track_text(text)
+                    self._emit("text", text)
+            elif delta_type == "thinking_delta":
+                text = delta.get("thinking")
+                if isinstance(text, str) and text:
+                    self._mark("thinking")
+                    self._emit("thinking", text)
+        elif kind == "message_start":
+            if self._messages and self._last_stop != "max_tokens":
+                # A second message in one turn replaces the first unless the
+                # first stopped at the output limit (then Claude Code asks
+                # the model to resume mid-reply and the texts join). It ends
+                # a message it abandons (dropped API connection) without a
+                # stop reason and streams the whole message again; a refusal
+                # is answered again by the fallback model.
+                self._emit("restart")
+            self._messages += 1
+            message = event.get("message")
+            message_id = message.get("id") if isinstance(message, dict) else None
+            self._message_id = message_id if isinstance(message_id, str) else None
+            self._stop_reason = None
+            self._last_stop = None
+            self._message_open = True
+        elif kind == "message_delta":
+            delta = event.get("delta")
+            reason = delta.get("stop_reason") if isinstance(delta, dict) else None
+            if isinstance(reason, str) and reason:
+                self._stop_reason = reason
+        elif kind == "message_stop":
+            if not self._message_open:
+                return
+            self._message_open = False
+            self._last_stop = self._stop_reason
+            if self._message_id:
+                self.stop_reasons[self._message_id] = self._stop_reason
+            if self._stop_reason is None:
+                _LOG.info(
+                    "Claude Code ended message %s without a stop reason (abandoned attempt)",
+                    self._message_id or "?",
+                )
+        elif kind == "content_block_start":
+            block = event.get("content_block")
+            block_type = block.get("type") if isinstance(block, dict) else None
+            if block_type in ("thinking", "redacted_thinking"):
+                self._mark("thinking")
+                self._progress.update("thinking", tokens=self._thinking_tokens)
+            elif block_type == "text":
+                self._report_text()
+
+    def _track_text(self, text: str) -> None:
+        self._text_chars += len(text)
+        window = self._tail + text
+        found = window.count(_TOOL_CALL_OPENER)
+        if found:
+            if self._call_start is None:
+                self._call_start = self._text_chars - (len(window) - window.find(_TOOL_CALL_OPENER))
+            self._calls += found
+            self._call_text = window[window.rfind(_TOOL_CALL_OPENER):]
+            self._tool_name = ""
+        elif self._call_start is not None and len(self._call_text) < _CALL_NAME_WINDOW_CHARS:
+            self._call_text += text
+        if self._call_start is not None and not self._tool_name:
+            self._tool_name = _tool_name_hint(self._call_text)
+        self._tail = window[-(len(_TOOL_CALL_OPENER) - 1):]
+        self._report_text()
+
+    def _report_text(self) -> None:
+        if self._call_start is None:
+            self._progress.update("writing", chars=self._text_chars)
+        else:
+            self._progress.update(
+                "tool",
+                chars=self._text_chars - self._call_start,
+                calls=self._calls,
+                name=self._tool_name,
+            )
+
+    def _system_event(self, event: dict[str, Any]) -> None:
+        subtype = event.get("subtype")
+        if subtype == "init":
+            self._mark("init")
+            self._progress.update("waiting")
+        elif subtype == "status":
+            if event.get("status") == "compacting":
+                _LOG.warning("Claude Code is compacting its context (session=%s)", event.get("session_id"))
+                self._progress.update("compacting")
+        elif subtype == "thinking_tokens":
+            tokens = event.get("estimated_tokens")
+            if isinstance(tokens, int) and not isinstance(tokens, bool):
+                self._thinking_tokens = tokens
+            self._mark("thinking")
+            self._progress.update("thinking", tokens=self._thinking_tokens)
+        elif subtype == "api_retry":
+            self.api_retries += 1
+            attempt = event.get("attempt")
+            limit = event.get("max_retries")
+            status = event.get("error_status")
+            delay = event.get("retry_delay_ms")
+            _LOG.warning(
+                "Claude Code API retry %s/%s (status=%s) in %sms: %s",
+                attempt,
+                limit,
+                status,
+                delay,
+                str(event.get("error") or "")[:200],
+            )
+            seconds = f", next in {delay / 1000:.0f}s" if isinstance(delay, (int, float)) else ""
+            self._progress.notice(
+                f"Anthropic API retry {attempt}/{limit} ({status or 'connection'}){seconds}"
+            )
+        elif subtype == "compact_boundary":
+            self.compacted = True
+            metadata = event.get("compact_metadata") or event.get("compactMetadata") or {}
+            _LOG.warning(
+                "Claude Code compacted its conversation (trigger=%s pre_tokens=%s); "
+                "the Claude-side session no longer matches Hermes's transcript",
+                metadata.get("trigger") if isinstance(metadata, dict) else None,
+                (metadata.get("pre_tokens") or metadata.get("preTokens"))
+                if isinstance(metadata, dict)
+                else None,
+            )
+        elif subtype in ("model_fallback", "model_refusal_fallback", "model_refusal_no_fallback"):
+            original = event.get("originalModel") or event.get("original_model")
+            fallback = event.get("fallbackModel") or event.get("fallback_model")
+            scope = event.get("scope")
+            _LOG.warning(
+                "Claude Code %s: %s -> %s (scope=%s, category=%s)",
+                subtype,
+                original,
+                fallback or "-",
+                scope or "session",
+                event.get("apiRefusalCategory") or event.get("api_refusal_category"),
+            )
+            if fallback and subtype != "model_refusal_no_fallback":
+                self.fallback_model = str(fallback)
+                self.fallback_session_wide = scope in (None, "session")
+                self._progress.notice(f"answered by {fallback} after a {subtype.replace('_', ' ')}")
+
+    def log(self, outcome: str, usage: dict[str, Any] | None = None) -> None:
+        """One INFO line per CLI turn: spawn vs warm, latencies, tokens."""
+
+        def since(key: str) -> str:
+            mark = self.marks.get(key)
+            return str(int((mark - self.started) * 1000)) if mark is not None else "-"
+
+        usage = usage or {}
+        _LOG.info(
+            "Claude Code turn: mode=%s pid=%s %soutcome=%s total_ms=%d init_ms=%s "
+            "first_event_ms=%s thinking_ms=%s text_ms=%s ttft_ms=%s api_ms=%s "
+            "out_tokens=%s cache_read=%s cache_write=%s payload_chars=%d api_retries=%d",
+            self.mode,
+            self.pid,
+            f"{self.note} " if self.note else "",
+            outcome,
+            int((time.monotonic() - self.started) * 1000),
+            since("init"),
+            since("event"),
+            since("thinking"),
+            since("text"),
+            usage.get("ttft_ms", "-") if usage.get("ttft_ms") is not None else "-",
+            usage.get("duration_api_ms", "-") if usage.get("duration_api_ms") is not None else "-",
+            usage.get("output_tokens", "-"),
+            usage.get("cached_tokens", "-"),
+            usage.get("cache_write_tokens", "-"),
+            self.payload_chars,
+            self.api_retries,
+        )
+
+
+class _InterruptContext(NamedTuple):
+    """The run a graceful interrupt may leave resumable (see ``_run_turn``)."""
+
+    session_id: str
+    base: tuple[tuple[str, str], ...]  # published fingerprints it continues
+    fingerprints: tuple[tuple[str, str], ...]  # the run's whole request
+    persisted: bool
+
+
+class _InterruptedTurn(NamedTuple):
+    """A resumed request the user interrupted; its turn ended cleanly.
+
+    Claude Code recorded the request, the partial reply and a "[Request
+    interrupted by user]" entry (``marker``). A next request that extends
+    ``fingerprints`` continues right after the marker, so Claude sees what
+    was interrupted and the request is not sent twice.
+    """
+
+    session_id: str
+    base: tuple[tuple[str, str], ...]
+    fingerprints: tuple[tuple[str, str], ...]
+    marker: str
+
+
 class ClaudeCodeSessionExpired(RuntimeError):
     """Claude Code positively identified a missing/invalid/expired session."""
+
+
+class ClaudeCodeInterrupted(RuntimeError):
+    """The request was cancelled (``abort``/``abort_run``): its turn was
+    interrupted gracefully, or it was stopped between attempts or while
+    queued before a CLI turn started."""
+
+
+class _CliFlagRejected(RuntimeError):
+    """The CLI rejected an optional flag before reading the request."""
 
 
 class ClaudeCodeSoftLimitNotice(RuntimeError):
@@ -1984,6 +2596,8 @@ def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, s
             "CLAUDE_API_KEY",
         }:
             env.pop(key, None)
+    for key, value in _CLI_ENV_DEFAULTS.items():
+        env.setdefault(key, os.environ.get(key, value))
     return env
 
 
@@ -2021,6 +2635,45 @@ def _reap_process_group(process: subprocess.Popen[str], *, grace_seconds: float 
         process.wait(timeout=grace_seconds)
     except Exception:
         pass
+
+
+def _kill_process_group(process: Any) -> None:
+    """SIGTERM the group now, SIGKILL it after a short grace; never blocks."""
+
+    try:
+        if process.poll() is not None:
+            return
+    except Exception:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+    def _escalate() -> None:
+        try:
+            try:
+                process.wait(timeout=0.5)
+            except Exception:
+                pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_escalate, name="claude-code-abort-escalate", daemon=True).start()
 
 
 class _Continuation(NamedTuple):
@@ -2078,6 +2731,10 @@ class ClaudeCodeSession:
       session.
     * Expired/invalid server session or unknown checkpoint -> retries once as
       a fresh conversation with the complete prompt.
+    * Interrupted (``abort``) while resuming -> the warm process is asked to
+      stop the turn (stream-json ``interrupt``) and parked again; the next
+      request that extends the interrupted one continues right after Claude
+      Code's "[Request interrupted by user]" entry.
     """
 
     def __init__(self) -> None:
@@ -2105,9 +2762,28 @@ class ClaudeCodeSession:
         self._active_process: subprocess.Popen[str] | None = None
         self._abort_requested = False
         self._request_active = False
+        # Graceful interrupt: requested, and the process whose turn may take
+        # it (set while its reply is being read, see ``_run_turn``).
+        self._interrupt_requested = False
+        self._interruptible_process: subprocess.Popen[str] | None = None
+        # One cancel event per run(), registered before it waits for the
+        # locks: abort() cancels queued runs and runs between attempts too.
+        self._run_cancels: set[threading.Event] = set()
+        self._active_run_cancel: threading.Event | None = None
+        self._interrupt_context: _InterruptContext | None = None
+        self._interrupted_turn: _InterruptedTurn | None = None
         self._last_usage: dict[str, Any] = {}
+        # Usage of attempts a request retried past (preamble continuation,
+        # tool-call repair): accounting only, never context size.
+        self._last_retry_usage: dict[str, Any] = {}
         self._last_rate_limit: dict[str, Any] = {}
         self._warm: _WarmProcess | None = None
+        self._progress = _Progress()
+        # Per-turn log context set by the retry loop ("turn=2 reason=…").
+        self._turn_note = ""
+        self._call_turns = 0
+        # Claude Code compacted its copy during this run: do not publish.
+        self._run_compacted = False
 
     @property
     def last_usage(self) -> dict[str, Any]:
@@ -2117,10 +2793,29 @@ class ClaudeCodeSession:
             return dict(self._last_usage)
 
     @property
+    def last_retry_usage(self) -> dict[str, Any]:
+        """Summed usage of the attempts the last request retried past.
+
+        ``last_usage`` is the final attempt only (it resumes the same session,
+        so its prompt tokens already cover the whole context); this is the
+        work of the discarded attempts, for token accounting only.
+        """
+
+        with self._lock:
+            return dict(self._last_retry_usage)
+
+    @property
     def last_rate_limit(self) -> dict[str, Any]:
         """Most recent ``rate_limit_info`` reported by the Claude Code CLI."""
 
         return dict(self._last_rate_limit)
+
+    def get_progress_snapshot(self) -> dict[str, Any]:
+        """What the current request is doing (``{"active", "description",
+        "updated_at"}``), for the gateway heartbeat. Never prompt or answer
+        text."""
+
+        return self._progress.snapshot()
 
     def reset(self) -> None:
         with self._lock:
@@ -2142,6 +2837,7 @@ class ClaudeCodeSession:
         self._bound_system_digest = ""
         self._checkpoints = ()
         self._session_persisted = True
+        self._interrupted_turn = None
 
     def _adopt_durable(self, durable: _DurableState) -> None:
         self._session_id = durable.session_id
@@ -2164,9 +2860,10 @@ class ClaudeCodeSession:
         )
 
     def shutdown(self) -> None:
-        """Abort any in-flight request and stop the parked warm process."""
+        """Kill any in-flight request and stop the parked warm process."""
 
-        self.abort()
+        self._cancel_runs()
+        self._abort_process()
         self._discard_warm()
 
     def _discard_warm(self) -> None:
@@ -2175,61 +2872,108 @@ class ClaudeCodeSession:
         if warm is not None:
             warm.close()
 
-    def abort(self) -> None:
-        """Terminate the in-flight Claude Code process group without waiting.
+    def _cancel_runs(self) -> None:
+        with self._process_lock:
+            for cancel in self._run_cancels:
+                cancel.set()
 
-        Sends SIGTERM immediately, closes pipes so blocked readers unwind,
-        then escalates to SIGKILL after a short grace so cancellation is not
-        weaker than the timeout path — even when the CLI ignores SIGTERM.
+    def abort(self) -> None:
+        """Cancel this session's work without blocking the caller.
+
+        Every run is cancelled: the one in flight, one between attempts
+        (backoff, continuation) and runs still queued on the session lock.
+        The turn in flight is interrupted gracefully when it can be (a warm
+        process continuing the bound conversation, see ``_run_turn``);
+        otherwise, or when the CLI does not end the turn within
+        ``_INTERRUPT_GRACE_SECONDS``, its process group is killed.
+        """
+
+        self._cancel_runs()
+        self._abort_process(graceful=True)
+
+    def abort_run(self, cancel: threading.Event) -> None:
+        """Cancel the one run started with ``cancel_event=cancel``.
+
+        For a stream consumer that went away: unlike :meth:`abort` it never
+        touches another run of this (shared) session.
+        """
+
+        cancel.set()
+        self._abort_process(graceful=True, only_for=cancel)
+
+    def _abort_process(
+        self, *, graceful: bool = False, only_for: threading.Event | None = None
+    ) -> None:
+        """Stop the in-flight CLI turn; never blocks.
+
+        The kill path signals first and never closes stdout/stderr: another
+        thread is blocked reading them, and ``BufferedReader.close()`` waits
+        for that reader's lock, which held the signal back until the CLI
+        printed again (a silent CLI was never killed, not even by the
+        timeout watchdog). The group's death gives the readers EOF; the
+        owner thread reaps.
         """
 
         with self._process_lock:
             if not self._request_active:
                 return
-            self._abort_requested = True
+            if only_for is not None and self._active_run_cancel is not only_for:
+                return
             process = self._active_process
+            gentle = (
+                graceful
+                and process is not None
+                and process is self._interruptible_process
+                and not self._abort_requested
+            )
+            if gentle:
+                if self._interrupt_requested:
+                    return
+                self._interrupt_requested = True
+            else:
+                self._abort_requested = True
         if process is None:
             return
-        # Unblock readline/communicate waiters.
-        for stream_name in ("stdin", "stdout", "stderr"):
-            stream = getattr(process, stream_name, None)
-            if stream is None:
-                continue
-            try:
-                stream.close()
-            except Exception:
-                pass
-        if process.poll() is not None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except Exception:
-            try:
-                process.terminate()
-            except Exception:
-                pass
+        if gentle:
+            self._send_interrupt(process)
+        else:
+            _kill_process_group(process)
 
-        def _escalate() -> None:
-            try:
-                try:
-                    process.wait(timeout=0.5)
-                except Exception:
-                    pass
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    return
-                except Exception:
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+    def _send_interrupt(self, process: subprocess.Popen[str]) -> None:
+        import uuid
 
-        threading.Thread(target=_escalate, name="claude-code-abort-escalate", daemon=True).start()
+        request = json.dumps(
+            {
+                "type": "control_request",
+                "request_id": f"hermes-interrupt-{uuid.uuid4().hex[:12]}",
+                "request": {"subtype": "interrupt"},
+            }
+        )
+
+        def _write() -> None:
+            try:
+                process.stdin.write(request + "\n")
+                process.stdin.flush()
+            except Exception:
+                self._escalate_interrupt(process)
+
+        threading.Thread(target=_write, name="claude-code-interrupt", daemon=True).start()
+        timer = threading.Timer(_INTERRUPT_GRACE_SECONDS, self._escalate_interrupt, args=(process,))
+        timer.daemon = True
+        timer.start()
+
+    def _escalate_interrupt(self, process: subprocess.Popen[str]) -> None:
+        """Kill ``process`` if its interrupted turn is still being read."""
+
+        with self._process_lock:
+            if self._interruptible_process is not process or self._abort_requested:
+                return
+            self._abort_requested = True
+        _LOG.info(
+            "Claude Code did not end the interrupted turn within %.1fs; killing it",
+            _INTERRUPT_GRACE_SECONDS,
+        )
+        _kill_process_group(process)
 
     def run(
         self,
@@ -2251,6 +2995,8 @@ class ClaudeCodeSession:
         keepalive: bool | None = None,
         has_tools: bool | None = None,
         now_label: str | None = None,
+        cancel_event: threading.Event | None = None,
+        on_activity: Any = None,
     ) -> tuple[str, str]:
         """Return ``(response, reasoning)`` using the durable Claude Code session.
 
@@ -2259,7 +3005,9 @@ class ClaudeCodeSession:
         blocks). ``system_prompt`` is the Hermes system contract passed through
         ``--system-prompt-file``. ``messages`` drives incremental continuation.
         ``on_text_chunk`` receives validated prose deltas (never tool-call
-        markup); ``on_reasoning_chunk`` receives live thinking deltas.
+        markup); ``on_reasoning_chunk`` receives live thinking deltas;
+        ``on_activity`` is called (at most about once a second) while the
+        CLI streams anything at all, tool-call JSON and thinking included.
 
         ``state_key`` names the durable conversation (one per Hermes agent);
         ``None`` makes the call stateless (``--no-session-persistence``, never
@@ -2273,12 +3021,76 @@ class ClaudeCodeSession:
         that carry a new user turn. It never enters the system prompt, whose
         digest is part of the session identity.
 
+        ``cancel_event`` cancels this run only (see :meth:`abort_run`);
+        :meth:`abort` cancels every run of the session.
+
         The returned ``response`` is the reply cut at the end of its first
         run of tool calls (see :func:`_parse_claude_reply`); when its calls
         still fail to parse after the in-session repairs, it is returned as is
         for the caller to surface.
         """
 
+        cancel = cancel_event if cancel_event is not None else threading.Event()
+        with self._process_lock:
+            self._run_cancels.add(cancel)
+        queued_at = time.monotonic()
+        try:
+            with self._lock, _durable_transition_lock(state_key):
+                waited_ms = int((time.monotonic() - queued_at) * 1000)
+                if cancel.is_set():
+                    # Cancelled while queued behind another run.
+                    raise ClaudeCodeInterrupted("Claude Code request aborted")
+                return self._run_locked(
+                    prompt_text,
+                    messages=messages,
+                    model=model,
+                    effort=effort,
+                    tools_digest=tools_digest,
+                    timeout_seconds=timeout_seconds,
+                    cwd=cwd,
+                    env=env,
+                    state_key=state_key,
+                    command=command,
+                    on_text_chunk=on_text_chunk,
+                    on_reasoning_chunk=on_reasoning_chunk,
+                    system_prompt=system_prompt,
+                    prompt_images=prompt_images,
+                    keepalive=keepalive,
+                    has_tools=has_tools,
+                    now_label=now_label,
+                    cancel=cancel,
+                    on_activity=on_activity,
+                    waited_ms=waited_ms,
+                )
+        finally:
+            with self._process_lock:
+                self._run_cancels.discard(cancel)
+
+    def _run_locked(
+        self,
+        prompt_text: str,
+        *,
+        messages: list[dict[str, Any]],
+        model: str,
+        effort: str | None,
+        tools_digest: str,
+        timeout_seconds: float,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        state_key: str | None,
+        command: str | None,
+        on_text_chunk: Any,
+        on_reasoning_chunk: Any,
+        system_prompt: str | None,
+        prompt_images: list[dict[str, Any]] | None,
+        keepalive: bool | None,
+        has_tools: bool | None,
+        now_label: str | None,
+        cancel: threading.Event,
+        on_activity: Any,
+        waited_ms: int,
+    ) -> tuple[str, str]:
+        started = time.monotonic()
         current = _message_fingerprint(messages)
         normalized_effort = effort.strip() if isinstance(effort, str) and effort.strip() else None
         normalized_tools = tools_digest if isinstance(tools_digest, str) else ""
@@ -2292,142 +3104,173 @@ class ClaudeCodeSession:
         # continues solely inside its own warm process.
         persist = bool(state_key)
         time_line = _time_line(now_label)
-        with self._lock, _durable_transition_lock(state_key):
-            self._last_usage = {}
-            discard_note = self._pending_discard_note
-            self._pending_discard_note = False
-            # Always reload durable state under the lease before dispatch so a
-            # long-lived owner cannot publish a divergent branch after another
-            # process advanced the same conversation.
-            if state_key:
-                durable = _load_durable_state(state_key)
-                if durable:
-                    self._adopt_durable(durable)
-                else:
-                    # Missing/corrupt durable state invalidates warm memory for
-                    # this key — never resume a stale in-memory session_id.
-                    self._clear_binding()
-                self._state_key = state_key
-            elif state_key != self._state_key:
+        self._last_usage = {}
+        self._last_retry_usage = {}
+        self._run_compacted = False
+        discard_note = self._pending_discard_note
+        self._pending_discard_note = False
+        # Always reload durable state under the lease before dispatch so a
+        # long-lived owner cannot publish a divergent branch after another
+        # process advanced the same conversation.
+        if state_key:
+            durable = _load_durable_state(state_key)
+            if durable:
+                self._adopt_durable(durable)
+            else:
+                # Missing/corrupt durable state invalidates warm memory for
+                # this key — never resume a stale in-memory session_id.
                 self._clear_binding()
-                self._state_key = state_key
-            # A parked process only knows the conversation it produced. If the
-            # durable state moved on (another process advanced it, /new, etc.)
-            # its in-memory history is stale — drop it and --resume instead.
-            if self._warm is not None and (
-                self._warm.session_id != self._session_id
-                or self._warm.fingerprints != self._previous_messages
-            ):
-                self._discard_warm()
-            plan = (
-                self._plan_continuation(
-                    messages,
-                    current,
-                    model=model,
-                    effort=normalized_effort,
-                    tools_digest=normalized_tools,
-                    system_digest=system_digest,
-                    keepalive=keepalive,
-                )
-                if self._session_id
-                else None
-            )
-            call_kwargs = dict(
-                model=model,
-                effort=normalized_effort,
-                timeout_seconds=timeout_seconds,
-                cwd=cwd,
-                env=env,
-                command=command,
-                on_text_chunk=on_text_chunk,
-                had_tools=had_tools,
-            )
-            if on_reasoning_chunk is not None:
-                call_kwargs["on_reasoning_chunk"] = on_reasoning_chunk
-            if system_prompt:
-                call_kwargs["system_prompt"] = system_prompt
-            if keepalive:
-                call_kwargs["keepalive"] = True
-            if not persist:
-                call_kwargs["persist"] = False
-            identity = dict(
+            self._state_key = state_key
+        elif state_key != self._state_key:
+            self._clear_binding()
+            self._state_key = state_key
+        # A parked process only knows the conversation it produced. If the
+        # durable state moved on (another process advanced it, /new, etc.)
+        # its in-memory history is stale — drop it and --resume instead.
+        if self._warm is not None and (
+            self._warm.session_id != self._session_id
+            or self._warm.fingerprints != self._previous_messages
+        ):
+            self._discard_warm()
+        plan = (
+            self._plan_continuation(
+                messages,
+                current,
                 model=model,
                 effort=normalized_effort,
                 tools_digest=normalized_tools,
                 system_digest=system_digest,
+                keepalive=keepalive,
             )
-            if plan is not None:
-                resume_kwargs = dict(call_kwargs)
-                if plan.resume_at:
-                    resume_kwargs["resume_at"] = plan.resume_at
-                prompt = plan.prompt
-                if discard_note and plan.mode == "advance":
-                    # Resuming right after the reply whose tail was cut.
-                    prompt = f"{_DISCARDED_TAIL_NOTE}\n\n{prompt}"
-                if time_line and plan.user_turn:
-                    prompt = f"{prompt}\n\n{time_line}"
-                try:
-                    response, reasoning, session_id = self._execute_with_soft_limit_retry(
-                        _user_message_content(prompt, plan.images, plan.image_offset),
-                        session_id=self._session_id,
-                        **resume_kwargs,
-                    )
-                except ClaudeCodeSessionExpired:
-                    # Expired/invalid server session or unknown checkpoint:
-                    # retry once as a fresh conversation with the complete
-                    # prompt.
-                    self._clear_binding()
-                    self._discard_warm()
-                    if state_key:
-                        _delete_durable_state(state_key)
-                except BaseException:
-                    # The session may now hold entries of the failed attempt;
-                    # never reuse that process. The next call resumes at the
-                    # last published checkpoint, which drops them (and still
-                    # needs the discard note).
-                    self._discard_warm()
-                    self._pending_discard_note = discard_note
-                    raise
-                else:
-                    resolved_session_id = _require_uuid_session_id(
-                        session_id or self._session_id or "",
-                        where="resume",
-                    )
-                    self._publish(
-                        state_key,
-                        resolved_session_id,
-                        current,
-                        checkpoints=self._next_checkpoints(plan.checkpoints, len(current)),
-                        persisted=persist,
-                        **identity,
-                    )
-                    return response, reasoning
+            if self._session_id
+            else None
+        )
+        call_kwargs: dict[str, Any] = dict(
+            model=model,
+            effort=normalized_effort,
+            timeout_seconds=timeout_seconds,
+            cwd=cwd,
+            env=env,
+            command=command,
+            on_text_chunk=on_text_chunk,
+            had_tools=had_tools,
+            cancel=cancel,
+        )
+        if on_reasoning_chunk is not None:
+            call_kwargs["on_reasoning_chunk"] = on_reasoning_chunk
+        if on_activity is not None:
+            call_kwargs["on_activity"] = on_activity
+        if system_prompt:
+            call_kwargs["system_prompt"] = system_prompt
+        if keepalive:
+            call_kwargs["keepalive"] = True
+        if not persist:
+            call_kwargs["persist"] = False
+        identity = dict(
+            model=model,
+            effort=normalized_effort,
+            tools_digest=normalized_tools,
+            system_digest=system_digest,
+        )
 
-            # Prompt body travels over stdin — do NOT apply argv flag-size
-            # limits to it.  Only short CLI flags are size-checked in _execute.
-            # The time goes last so equal transcripts keep a common prefix.
-            fresh_prompt = f"{prompt_text}\n\n{time_line}" if time_line else prompt_text
+        def _summary(kind: str) -> None:
+            _LOG.info(
+                "Claude Code request: plan=%s turns=%d wait_lock_ms=%d total_ms=%d messages=%d",
+                kind,
+                self._call_turns,
+                waited_ms,
+                int((time.monotonic() - started) * 1000),
+                len(current),
+            )
+
+        if plan is not None:
+            resume_kwargs = dict(call_kwargs)
+            if plan.resume_at:
+                resume_kwargs["resume_at"] = plan.resume_at
+            prompt = plan.prompt
+            if discard_note and plan.mode == "advance":
+                # Resuming right after the reply whose tail was cut.
+                prompt = f"{_DISCARDED_TAIL_NOTE}\n\n{prompt}"
+            if time_line and plan.user_turn:
+                prompt = f"{prompt}\n\n{time_line}"
+            # A graceful interrupt of this run leaves it resumable.
+            self._interrupt_context = _InterruptContext(
+                self._session_id, self._previous_messages, current, persist
+            )
             try:
                 response, reasoning, session_id = self._execute_with_soft_limit_retry(
-                    _user_message_content(fresh_prompt, prompt_images),
-                    session_id=None,
-                    **call_kwargs,
+                    _user_message_content(prompt, plan.images, plan.image_offset),
+                    session_id=self._session_id,
+                    **resume_kwargs,
                 )
-            except BaseException:
+            except ClaudeCodeSessionExpired:
+                # Expired/invalid server session or unknown checkpoint:
+                # retry once as a fresh conversation with the complete
+                # prompt.
+                self._clear_binding()
                 self._discard_warm()
+                if state_key:
+                    _delete_durable_state(state_key)
+            except ClaudeCodeInterrupted:
+                # A gracefully interrupted turn keeps its warm process (see
+                # ``_run_turn``); anything else must not be reused.
+                interrupted = self._interrupted_turn
+                if interrupted is None or interrupted.fingerprints != current:
+                    self._discard_warm()
+                self._pending_discard_note = discard_note
                 raise
-            resolved_session_id = _require_uuid_session_id(
-                session_id, where="fresh"
+            except BaseException:
+                # The session may now hold entries of the failed attempt;
+                # never reuse that process. The next call resumes at the
+                # last published checkpoint, which drops them (and still
+                # needs the discard note).
+                self._discard_warm()
+                self._pending_discard_note = discard_note
+                raise
+            else:
+                resolved_session_id = _require_uuid_session_id(
+                    session_id or self._session_id or "",
+                    where="resume",
+                )
+                self._publish_or_forget(
+                    state_key,
+                    resolved_session_id,
+                    current,
+                    checkpoints=self._next_checkpoints(plan.checkpoints, len(current)),
+                    persisted=persist,
+                    **identity,
+                )
+                _summary(plan.mode)
+                return response, reasoning
+            finally:
+                self._interrupt_context = None
+
+        # Prompt body travels over stdin — do NOT apply argv flag-size
+        # limits to it.  Only short CLI flags are size-checked in _execute.
+        # The time goes last so equal transcripts keep a common prefix.
+        fresh_prompt = f"{prompt_text}\n\n{time_line}" if time_line else prompt_text
+        try:
+            response, reasoning, session_id = self._execute_with_soft_limit_retry(
+                _user_message_content(fresh_prompt, prompt_images),
+                session_id=None,
+                **call_kwargs,
             )
-            self._publish(
-                state_key,
-                resolved_session_id,
-                current,
-                checkpoints=self._next_checkpoints((), len(current)),
-                persisted=persist,
-                **identity,
-            )
-            return response, reasoning
+        except BaseException:
+            self._discard_warm()
+            raise
+        resolved_session_id = _require_uuid_session_id(
+            session_id, where="fresh"
+        )
+        self._publish_or_forget(
+            state_key,
+            resolved_session_id,
+            current,
+            checkpoints=self._next_checkpoints((), len(current)),
+            persisted=persist,
+            **identity,
+        )
+        _summary("fresh")
+        return response, reasoning
 
     def _plan_continuation(
         self,
@@ -2481,6 +3324,9 @@ class ClaudeCodeSession:
             return None
 
         if prefix_ok:
+            resumed = self._plan_after_interrupt(messages, current, keepalive=keepalive)
+            if resumed is not None:
+                return resumed
             latest = (
                 checkpoints[-1][1]
                 if checkpoints and checkpoints[-1][0] == previous_count
@@ -2578,6 +3424,64 @@ class ClaudeCodeSession:
         skipped("prefix")
         return None
 
+    def _plan_after_interrupt(
+        self,
+        messages: list[dict[str, Any]],
+        current: tuple[tuple[str, str], ...],
+        *,
+        keepalive: bool,
+    ) -> _Continuation | None:
+        """Continue right after an interrupted request, when this extends it.
+
+        Claude Code holds the interrupted request, the partial reply and its
+        "[Request interrupted by user]" entry after the published
+        checkpoint. Resuming at that entry (the parked process, or a cold
+        ``--resume-session-at``) and sending only what follows the
+        interrupted request shows Claude what happened and never sends the
+        request twice. Anything else drops the record.
+        """
+
+        interrupted = self._interrupted_turn
+        if interrupted is None:
+            return None
+        self._interrupted_turn = None
+        count = len(interrupted.fingerprints)
+        usable = (
+            interrupted.session_id == self._session_id
+            and interrupted.base == self._previous_messages
+            and len(current) > count
+            and current[:count] == interrupted.fingerprints
+            and (
+                self._session_persisted
+                or (keepalive and self._warm_parked_at(self._session_id, interrupted.marker))
+            )
+        )
+        if not usable:
+            return None
+        offset = _prefix_image_count(messages, count)
+        prompt, images = _incremental_prompt_with_images(messages, count, image_offset=offset)
+        if not prompt:
+            return None
+        # Kept until this continuation is published: a failed attempt can
+        # resume at the same entry again.
+        self._interrupted_turn = interrupted
+        _LOG.info(
+            "Claude Code continuation: mode=interrupted messages=%d resume_at=%s "
+            "(after the interrupted request of %d messages)",
+            len(current),
+            interrupted.marker,
+            count,
+        )
+        return _Continuation(
+            "interrupted",
+            prompt,
+            images,
+            interrupted.marker,
+            self._checkpoints,
+            offset,
+            _has_user_turn(current[count:]),
+        )
+
     def _next_checkpoints(
         self, base: tuple[tuple[int, str], ...], count: int
     ) -> tuple[tuple[int, str], ...]:
@@ -2585,6 +3489,27 @@ class ClaudeCodeSession:
         if not checkpoint or count <= 0:
             return base
         return (tuple(base) + ((count, checkpoint),))[-_MAX_CHECKPOINTS:]
+
+    def _publish_or_forget(self, state_key: str | None, session_id: str, *args: Any, **kwargs: Any) -> None:
+        """Publish the request, unless Claude Code compacted its copy.
+
+        After a compaction the Claude-side conversation is a summary, no
+        longer the transcript Hermes holds; the answer is still delivered, but
+        the next request starts a fresh session from Hermes's transcript.
+        """
+
+        if not self._run_compacted:
+            self._publish(state_key, session_id, *args, **kwargs)
+            return
+        _LOG.warning(
+            "Claude Code compacted session %s; the next request starts a fresh "
+            "session from Hermes's transcript",
+            session_id,
+        )
+        self._clear_binding()
+        self._discard_warm()
+        if state_key:
+            _delete_durable_state(state_key)
 
     def _publish(
         self,
@@ -2607,6 +3532,7 @@ class ClaudeCodeSession:
         self._bound_system_digest = system_digest
         self._checkpoints = tuple(checkpoints)
         self._session_persisted = persisted
+        self._interrupted_turn = None
         if self._warm is not None and self._warm.session_id == session_id:
             self._warm.fingerprints = fingerprints
         if state_key:
@@ -2640,6 +3566,8 @@ class ClaudeCodeSession:
         keepalive: bool = False,
         resume_at: str | None = None,
         persist: bool = True,
+        cancel: threading.Event | None = None,
+        on_activity: Any = None,
     ) -> tuple[str, str, str]:
         """Run one CLI request, repairing tool calls and retrying non-answers.
 
@@ -2661,11 +3589,16 @@ class ClaudeCodeSession:
           check…") raises a clear provider error; a gerund-only one ("Checking
           the logs.") is delivered, since it may well be a real answer.
 
-        Prose streams live only once an attempt is too long to be a preamble
-        (see ``_StreamGate``); shorter answers are emitted after they validate,
-        so a preamble never becomes the live answer. When a repair continues
-        a reply whose prose was already streamed, that prose stays part of the
-        answer and the repaired calls follow it.
+        Prose streams live once an attempt is too long to be a preamble (see
+        ``_StreamGate``); shorter answers are emitted after they validate, so
+        a preamble never becomes the live answer. The prose before a tool call
+        is shown as soon as the call starts. Whatever an attempt showed stays
+        at the head of the answer when another attempt follows (a repair, a
+        continuation), so the user never sees text vanish or repeat.
+
+        ``cancel`` (the run's cancel event) ends the backoff waits and stops
+        the next attempt from starting. The usage of attempts that are
+        retried past is summed into ``last_retry_usage``.
         """
 
         last_notice = ""
@@ -2675,10 +3608,15 @@ class ClaudeCodeSession:
         attempts = max(1, int(max_attempts))
         attempt = 0
         repairs = 0
-        # Prose of a broken reply that already reached the user: it stays at
-        # the head of the answer, and the next gate continues after it.
+        turns = 0
+        reason = ""
+        # Prose earlier attempts showed: it stays at the head of the answer,
+        # and the next gate continues after it.
         carried = ""
         carried_emitted = ""
+        carried_committed = False
+        overhead: dict[str, Any] = {}
+        self._last_retry_usage = {}
 
         def _continuation(sid: str, where: str) -> tuple[str | None, str | None, bool]:
             """Where to continue right after the reply just produced."""
@@ -2693,9 +3631,52 @@ class ClaudeCodeSession:
             # original request instead.
             return session_id, resume_at, False
 
+        def _wait(seconds: float) -> None:
+            if cancel is None:
+                time.sleep(seconds)
+            elif cancel.wait(seconds):
+                raise ClaudeCodeInterrupted("Claude Code request aborted")
+
+        def _carry(gate: _StreamGate | None, attempt_text: str) -> None:
+            """Keep what ``gate`` showed at the head of the answer."""
+
+            nonlocal carried, carried_emitted, carried_committed
+            if gate is None:
+                return
+            shown = gate.emitted
+            if len(shown) <= len(carried_emitted):
+                return
+            prose = _parse_claude_reply(gate.answer(attempt_text)).cleaned if attempt_text else ""
+            carried = prose if prose.startswith(shown) else shown
+            carried_emitted = shown
+            carried_committed = gate.committed
+
+        def _account() -> None:
+            """Add the attempt just parsed to the retried-past usage."""
+
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_write_tokens",
+                "cached_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            ):
+                value = self._last_usage.get(key)
+                if isinstance(value, (int, float)):
+                    overhead[key] = overhead.get(key, 0) + value
+            cost = self._last_usage.get("total_cost_usd")
+            if isinstance(cost, (int, float)):
+                overhead["total_cost_usd"] = overhead.get("total_cost_usd", 0.0) + float(cost)
+            overhead["attempts"] = overhead.get("attempts", 0) + 1
+
         while True:
             self._last_turn_checkpoint = None
             self._last_turn_synthetic = False
+            turns += 1
+            self._call_turns = turns
+            self._turn_note = f"turn={turns}" + (f" reason={reason}" if reason else "")
             gate = None
             if on_text_chunk is not None:
                 gate = _StreamGate(
@@ -2703,17 +3684,27 @@ class ClaudeCodeSession:
                     had_tools=had_tools,
                     prefix=f"{carried}\n\n" if carried else "",
                     emitted=carried_emitted,
-                    committed=bool(carried),
+                    committed=carried_committed,
                 )
             extra: dict[str, Any] = {}
-            if gate is not None or on_reasoning_chunk is not None:
+            if gate is not None or on_reasoning_chunk is not None or on_activity is not None:
 
                 def _on_event(kind: str, text: str, _gate: _StreamGate | None = gate) -> None:
-                    if kind == "text" and _gate is not None:
-                        _gate.feed(text)
-                    elif kind == "thinking" and on_reasoning_chunk is not None:
+                    if kind == "text":
+                        if _gate is not None:
+                            _gate.feed(text)
+                    elif kind == "thinking":
+                        if on_reasoning_chunk is not None:
+                            try:
+                                on_reasoning_chunk(text)
+                            except Exception:
+                                pass
+                    elif kind == "restart":
+                        if _gate is not None:
+                            _gate.restart()
+                    elif kind == "tick" and on_activity is not None:
                         try:
-                            on_reasoning_chunk(text)
+                            on_activity()
                         except Exception:
                             pass
 
@@ -2726,6 +3717,8 @@ class ClaudeCodeSession:
                 extra["resume_at"] = next_resume_at
             if not persist:
                 extra["persist"] = False
+            if cancel is not None:
+                extra["cancel"] = cancel
             try:
                 response, reasoning, sid = self._execute(
                     next_prompt,
@@ -2739,10 +3732,16 @@ class ClaudeCodeSession:
                     **extra,
                 )
             except ClaudeCodeSoftLimitNotice as exc:
-                if gate is not None and len(gate.emitted.rstrip()) > len(carried):
+                if (
+                    gate is not None
+                    and gate.committed
+                    and len(gate.emitted) > len(carried_emitted)
+                ):
                     # Part of this answer already reached the user; a retry
                     # would duplicate it. Surface the failure instead.
                     raise RuntimeError(f"Claude Code stream interrupted: {exc}") from exc
+                # A progress sentence shown ahead of a call stays shown.
+                _carry(gate, "")
                 last_notice = str(exc)
                 attempt += 1
                 if attempt >= attempts:
@@ -2751,9 +3750,14 @@ class ClaudeCodeSession:
                         f"after {attempts} attempts (not treated as an answer). "
                         f"Detail: {last_notice[:400]}"
                     ) from exc
-                if gate is not None:
-                    carried_emitted = gate.emitted
-                time.sleep(min(2.0 * attempt, 6.0))
+                reason = "soft-limit"
+                _LOG.warning(
+                    "Claude Code soft limit/rate-limit notice; retrying (attempt %d/%d): %s",
+                    attempt,
+                    attempts,
+                    last_notice[:160],
+                )
+                _wait(min(2.0 * attempt, 6.0))
                 continue
 
             reply = _parse_claude_reply(response)
@@ -2768,14 +3772,14 @@ class ClaudeCodeSession:
                     sid,
                 )
                 response = reply.accepted
-            if carried:
-                response = f"{carried}\n\n{response}"
+            # This attempt's own reply; the answer is ``gate.answer(...)``.
+            attempt_text = response
 
             def _deliver() -> tuple[str, str, str]:
-                if gate is not None and response:
-                    gate.finish(response)
+                final = gate.finish(attempt_text) if gate is not None else attempt_text
                 self._pending_discard_note = bool(reply.discarded_tail)
-                return response, reasoning, sid
+                self._last_retry_usage = dict(overhead)
+                return final, reasoning, sid
 
             if had_tools and reply.broken:
                 self._log_tool_call_failures(reply, sid)
@@ -2788,16 +3792,13 @@ class ClaudeCodeSession:
                     )
                     return _deliver()
                 repairs += 1
-                if gate is not None and gate.committed:
-                    # The prose is already on screen: keep it, and let the
-                    # repaired calls follow it. It normally is the reply's
-                    # prose; when Claude Code continued a reply cut off at
-                    # the output limit, the final text is only the tail of a
-                    # call and the prose shown came from the earlier message.
-                    shown = gate.emitted.strip()
-                    prose = _parse_claude_reply(response).cleaned
-                    carried = prose if prose.startswith(shown) else shown
-                    carried_emitted = gate.emitted
+                _account()
+                # Prose already on screen stays; the repaired calls follow
+                # it. It normally is the reply's prose; when Claude Code
+                # continued a reply cut off at the output limit, the final
+                # text can be only the tail of a call, and the prose shown
+                # came from the earlier message.
+                _carry(gate, attempt_text)
                 next_session_id, next_resume_at, in_session = _continuation(
                     sid, "tool-call-repair"
                 )
@@ -2806,6 +3807,7 @@ class ClaudeCodeSession:
                     if in_session
                     else prompt_text
                 )
+                reason = "tool-call-repair"
                 continue
 
             if gate is not None and gate.committed:
@@ -2815,9 +3817,9 @@ class ClaudeCodeSession:
             if (
                 self._last_turn_synthetic
                 and not reply.calls
-                and _is_soft_limit_notice(response)
+                and _is_soft_limit_notice(attempt_text)
             ):
-                last_notice = response.strip()
+                last_notice = attempt_text.strip()
                 attempt += 1
                 if attempt >= attempts:
                     raise RuntimeError(
@@ -2825,7 +3827,15 @@ class ClaudeCodeSession:
                         f"after {attempts} attempts (not treated as an answer). "
                         f"Detail: {last_notice[:400]}"
                     )
-                time.sleep(min(2.0 * attempt, 6.0))
+                _account()
+                reason = "soft-limit"
+                _LOG.warning(
+                    "Claude Code returned a usage/limit banner; retrying (attempt %d/%d): %s",
+                    attempt,
+                    attempts,
+                    last_notice[:160],
+                )
+                _wait(min(2.0 * attempt, 6.0))
                 continue
 
             if _is_incomplete_preamble_response(
@@ -2833,7 +3843,7 @@ class ClaudeCodeSession:
                 had_tools=had_tools,
                 has_tool_calls=bool(reply.executable_calls),
             ):
-                last_notice = response.strip()
+                last_notice = attempt_text.strip()
                 attempt += 1
                 if attempt >= attempts:
                     if not _has_first_person_promise(reply.cleaned):
@@ -2862,6 +3872,8 @@ class ClaudeCodeSession:
                     attempts,
                     last_notice[:120],
                 )
+                _account()
+                _carry(gate, attempt_text)
                 # Continue the session that produced the preamble, right after
                 # the preamble. Replaying the complete payload would create
                 # another paid Claude turn and can duplicate work already
@@ -2870,6 +3882,7 @@ class ClaudeCodeSession:
                     sid, "progress-continuation"
                 )
                 next_prompt = _PROGRESS_CONTINUATION_PROMPT if in_session else prompt_text
+                reason = "preamble"
                 continue
 
             # Confirmed answer — flush whatever was not streamed live.
@@ -2902,14 +3915,24 @@ class ClaudeCodeSession:
         keepalive: bool = False,
         resume_at: str | None = None,
         persist: bool = True,
+        cancel: threading.Event | None = None,
     ) -> tuple[str, str, str]:
-        """Run one request with an abort latch scoped to this exact call."""
+        """Run one request with an abort latch scoped to this exact call.
+
+        ``cancel`` is checked in the same critical section that arms the
+        latch, so an abort either finds this request active (and stops its
+        process) or has already cancelled it before it starts.
+        """
 
         with self._process_lock:
+            if cancel is not None and cancel.is_set():
+                raise ClaudeCodeInterrupted("Claude Code request aborted")
             if self._request_active:
                 raise RuntimeError("Concurrent Claude Code request on one session")
             self._request_active = True
             self._abort_requested = False
+            self._interrupt_requested = False
+            self._active_run_cancel = cancel
         self._last_turn_checkpoint = None
         self._last_turn_synthetic = False
         try:
@@ -2931,14 +3954,14 @@ class ClaudeCodeSession:
             with self._process_lock:
                 if self._abort_requested:
                     raise RuntimeError("Claude Code request aborted")
-                self._active_process = None
-                self._abort_requested = False
-                self._request_active = False
             return result
         finally:
             with self._process_lock:
                 self._active_process = None
                 self._abort_requested = False
+                self._interrupt_requested = False
+                self._interruptible_process = None
+                self._active_run_cancel = None
                 self._request_active = False
 
     def _build_argv(
@@ -2995,6 +4018,10 @@ class ClaudeCodeSession:
         ]
         if effort:
             argv += ["--effort", _validate_flag_size(str(effort))]
+        display = _thinking_display()
+        if display:
+            # Sent whatever the effort: Opus 5 thinks adaptively without one.
+            argv += ["--thinking-display", display]
         if not persist:
             # Stateless calls (titles, vision, compression, review forks)
             # leave no transcript under ~/.claude/projects.
@@ -3050,7 +4077,6 @@ class ClaudeCodeSession:
         system_digest = (
             hashlib.sha256(system_prompt.encode("utf-8")).hexdigest() if system_prompt else ""
         )
-        identity = (claude_bin, str(model), effort or "", work_dir, system_digest, persist)
         keep_seconds = _keepalive_seconds() if keepalive else 0.0
         input_payload = (
             json.dumps(
@@ -3063,6 +4089,17 @@ class ClaudeCodeSession:
             + "\n"
         )
 
+        def _identity() -> tuple:
+            return (
+                claude_bin,
+                str(model),
+                effort or "",
+                work_dir,
+                system_digest,
+                persist,
+                _thinking_display() or "",
+            )
+
         # Reuse the parked process when it holds exactly this conversation,
         # ending at exactly the checkpoint being resumed. A process whose
         # last turn was rejected or retried ends past it and is replaced by
@@ -3074,7 +4111,7 @@ class ClaudeCodeSession:
                 and keep_seconds > 0
                 and warm.session_id == session_id
                 and warm.tip == resume_at
-                and warm.identity == identity
+                and warm.identity == _identity()
                 and warm.take()
             ):
                 try:
@@ -3101,13 +4138,59 @@ class ClaudeCodeSession:
                 "Claude Code stateless session is no longer warm; cannot resume it"
             )
 
+        for spawn in range(2):
+            try:
+                return self._spawn_turn(
+                    claude_bin,
+                    input_payload,
+                    identity=_identity(),
+                    session_id=session_id,
+                    model=model,
+                    effort=effort,
+                    timeout_seconds=timeout_seconds,
+                    work_dir=work_dir,
+                    env=env,
+                    on_event=on_event,
+                    system_prompt=system_prompt,
+                    keep_seconds=keep_seconds,
+                    resume_at=resume_at,
+                    persist=persist,
+                )
+            except _CliFlagRejected:
+                # Rejected before it read the request: nothing ran or was
+                # persisted. The flag is now off; spawn once more without it.
+                if spawn:
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _spawn_turn(
+        self,
+        claude_bin: str,
+        input_payload: str,
+        *,
+        identity: tuple,
+        session_id: str | None,
+        model: str,
+        effort: str | None,
+        timeout_seconds: float,
+        work_dir: str,
+        env: dict[str, str] | None,
+        on_event: Any,
+        system_prompt: str | None,
+        keep_seconds: float,
+        resume_at: str | None,
+        persist: bool,
+    ) -> tuple[str, str, str]:
         argv = self._build_argv(
             claude_bin,
             session_id=session_id,
             model=model,
             effort=effort,
             system_prompt=system_prompt,
-            stream_partials=on_event is not None,
+            # Always: a warm process spawned by a non-streaming call may serve
+            # a streaming one next, and the turn monitor (liveness, progress,
+            # restarts, stop reasons) reads these events for every call.
+            stream_partials=True,
             resume_at=resume_at,
             persist=persist,
         )
@@ -3116,6 +4199,7 @@ class ClaudeCodeSession:
         with self._process_lock:
             if self._abort_requested:
                 raise RuntimeError("Claude Code request aborted before launch")
+            spawned_at = time.monotonic()
             try:
                 process = subprocess.Popen(
                     argv,
@@ -3152,6 +4236,7 @@ class ClaudeCodeSession:
                 on_event=on_event,
                 keep_seconds=keep_seconds if can_park else 0.0,
                 reused=False,
+                started=spawned_at,
             )
 
         # Batch path (unit-test doubles exposing only communicate()).
@@ -3161,7 +4246,7 @@ class ClaudeCodeSession:
                 timeout=timeout_seconds + 30,
             )
         except subprocess.TimeoutExpired:
-            self.abort()
+            self._abort_process()
             _reap_process_group(process, grace_seconds=5.0)
             raise RuntimeError("Claude Code request timed out")
         if self._abort_requested:
@@ -3183,8 +4268,18 @@ class ClaudeCodeSession:
         on_event: Any,
         keep_seconds: float,
         reused: bool,
+        started: float | None = None,
     ) -> tuple[str, str, str]:
-        """Write one user message to ``warm`` and read events up to ``result``."""
+        """Write one user message to ``warm`` and read events up to ``result``.
+
+        While the reply is read, a graceful interrupt may arrive (see
+        :meth:`abort`): the CLI then ends the turn with a "[Request
+        interrupted by user]" entry and its ``result``. When this turn
+        continues the bound conversation, the process is parked at that entry
+        and the request is recorded as interrupted (see
+        ``_plan_after_interrupt``); ``ClaudeCodeInterrupted`` is raised either
+        way.
+        """
 
         process = warm.process
         with self._process_lock:
@@ -3195,13 +4290,31 @@ class ClaudeCodeSession:
         stdin = process.stdin
         stdout_stream = process.stdout
         timed_out = threading.Event()
+        context = self._interrupt_context
+        interruptible = bool(
+            keep_seconds > 0
+            and context is not None
+            and session_id
+            and session_id == context.session_id
+            and _graceful_interrupts()
+        )
+        monitor = _TurnMonitor(
+            on_event,
+            self._progress,
+            mode="warm" if reused else ("spawn-resume" if session_id else "spawn-fresh"),
+            pid=getattr(process, "pid", None),
+            started=started if started is not None else time.monotonic(),
+            payload_chars=len(input_payload),
+            note=self._turn_note,
+        )
+        self._progress.begin("waiting" if reused else "starting")
 
         def _timeout_watchdog() -> None:
-            # Unblock a hung readline() by aborting the process group and
-            # closing pipes — deadline checks alone cannot run while blocked.
+            # Unblock a hung readline() by killing the process group:
+            # deadline checks alone cannot run while blocked.
             timed_out.set()
             try:
-                self.abort()
+                self._abort_process()
             except Exception:
                 pass
 
@@ -3213,6 +4326,7 @@ class ClaudeCodeSession:
         watchdog.start()
         lines: list[str] = []
         saw_result = False
+        interrupted = False
         try:
             try:
                 stdin.write(input_payload)
@@ -3224,48 +4338,85 @@ class ClaudeCodeSession:
             except Exception as exc:
                 if reused:
                     raise _WarmProcessGone(str(exc)) from exc
-                self.abort()
+                # A CLI that rejects its arguments (an unknown flag, an
+                # expired session) exits before reading a large request.
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+                if process.poll() not in (0, None):
+                    stderr = warm.stderr_tail(wait=1.0)
+                    if stderr.strip():
+                        warm.close()
+                        self._raise_process_failure(process.returncode, "", stderr, session_id)
+                self._abort_process()
                 _reap_process_group(process, grace_seconds=2.0)
                 raise RuntimeError(f"Claude Code failed writing stdin: {exc}") from exc
+            if interruptible:
+                # Only now: an interrupt written while the request is still
+                # being written would interleave with it on stdin.
+                with self._process_lock:
+                    self._interruptible_process = process
 
             while True:
                 if timed_out.is_set():
                     break
                 if self._abort_requested:
                     break
-                line = stdout_stream.readline()
+                try:
+                    line = stdout_stream.readline()
+                except (ValueError, OSError):
+                    # A pipe closed under the reader: treat as EOF so the
+                    # outcome is "aborted"/"timed out", not a ValueError.
+                    line = ""
                 if line == "":
                     break
-                lines.append(line)
                 stripped = line.strip()
                 if not stripped.startswith("{"):
+                    lines.append(line)
                     continue
                 try:
                     event = json.loads(stripped)
                 except json.JSONDecodeError:
+                    lines.append(line)
                     continue
                 if not isinstance(event, dict):
+                    lines.append(line)
                     continue
                 event_type = event.get("type")
                 if event_type == "stream_event":
-                    if on_event is not None:
-                        self._dispatch_stream_event(event.get("event"), on_event)
-                elif event_type == "rate_limit_event":
+                    # Consumed here; the turn parser never needs the deltas.
+                    monitor.observe(event)
+                    continue
+                lines.append(line)
+                if event_type == "rate_limit_event":
                     self._record_rate_limit(event.get("rate_limit_info"))
                 elif event_type == "result":
                     saw_result = True
                     break
+                else:
+                    monitor.observe(event)
         finally:
             watchdog.cancel()
+            with self._process_lock:
+                self._interruptible_process = None
+                interrupted = self._interrupt_requested
+            self._progress.end()
 
         if timed_out.is_set():
             warm.close()
             _reap_process_group(process, grace_seconds=5.0)
+            monitor.log("timeout")
             raise RuntimeError("Claude Code request timed out")
         if self._abort_requested:
             warm.close()
             _reap_process_group(process, grace_seconds=2.0)
+            monitor.log("aborted")
             raise RuntimeError("Claude Code request aborted")
+        if interrupted:
+            self._finish_interrupted_turn(
+                warm, monitor, saw_result=saw_result, keep_seconds=keep_seconds
+            )
 
         stdout = "".join(lines)
         if not saw_result:
@@ -3274,7 +4425,7 @@ class ClaudeCodeSession:
             try:
                 process.wait(timeout=5)
             except Exception:
-                self.abort()
+                self._abort_process()
                 _reap_process_group(process, grace_seconds=2.0)
             warm.close()
             if reused and not stdout.strip():
@@ -3282,24 +4433,37 @@ class ClaudeCodeSession:
             # The exit reason (expired session, unknown checkpoint) is often
             # only on stderr; let the drain thread finish reading it.
             stderr = warm.stderr_tail(wait=2.0)
+            monitor.log(f"exit={process.returncode}")
             if process.returncode not in (0, None):
                 self._raise_process_failure(process.returncode, stdout, stderr, session_id)
             # Clean exit without a result: let the strict parser explain it.
-            return self._parse_turn(stdout, session_id, cost_offset=warm.cost_total)
+            return self._parse_turn(
+                stdout, session_id, cost_offset=warm.cost_total, stop_reasons=monitor.stop_reasons
+            )
 
         try:
             response, reasoning, sid = self._parse_turn(
-                stdout, session_id, cost_offset=warm.cost_total
+                stdout, session_id, cost_offset=warm.cost_total, stop_reasons=monitor.stop_reasons
             )
         except BaseException:
             warm.close()
+            monitor.log("rejected")
             raise
+        monitor.log("ok", self._last_usage)
+        if monitor.compacted:
+            self._run_compacted = True
+        if monitor.fallback_model:
+            self._last_usage["served_model"] = monitor.fallback_model
         warm.turns += 1
         warm.session_id = sid
         warm.tip = self._last_turn_checkpoint
         total_cost = self._last_usage.get("_cumulative_cost_usd")
         if isinstance(total_cost, (int, float)):
             warm.cost_total = float(total_cost)
+        if monitor.fallback_session_wide:
+            # Claude Code swapped the whole session to the fallback model; a
+            # new process resumes it on the requested model again.
+            keep_seconds = 0.0
         if keep_seconds > 0 and warm.alive():
             self._warm = warm
             warm.park(keep_seconds)
@@ -3307,24 +4471,46 @@ class ClaudeCodeSession:
             warm.close()
         return response, reasoning, sid
 
-    def _dispatch_stream_event(self, event: Any, on_event: Any) -> None:
-        if not isinstance(event, dict) or event.get("type") != "content_block_delta":
-            return
-        delta = event.get("delta")
-        if not isinstance(delta, dict):
-            return
-        delta_type = delta.get("type")
-        try:
-            if delta_type == "text_delta":
-                text = delta.get("text")
-                if isinstance(text, str) and text:
-                    on_event("text", text)
-            elif delta_type == "thinking_delta":
-                text = delta.get("thinking")
-                if isinstance(text, str) and text:
-                    on_event("thinking", text)
-        except Exception:
-            pass
+    def _finish_interrupted_turn(
+        self,
+        warm: _WarmProcess,
+        monitor: _TurnMonitor,
+        *,
+        saw_result: bool,
+        keep_seconds: float,
+    ) -> None:
+        """Park a gracefully interrupted process and record the request.
+
+        Always raises ``ClaudeCodeInterrupted``.
+        """
+
+        context = self._interrupt_context
+        marker = monitor.chain_uuid
+        parked = recorded = False
+        if saw_result and marker and context is not None:
+            if keep_seconds > 0 and warm.alive():
+                warm.turns += 1
+                warm.session_id = context.session_id
+                warm.tip = marker
+                warm.fingerprints = context.base
+                self._warm = warm
+                warm.park(keep_seconds)
+                parked = True
+            if parked or context.persisted:
+                self._interrupted_turn = _InterruptedTurn(
+                    context.session_id, context.base, context.fingerprints, marker
+                )
+                recorded = True
+        if not parked:
+            warm.close()
+        monitor.log("interrupted")
+        _LOG.info(
+            "Claude Code request interrupted (session=%s, resumable_at=%s, process %s)",
+            context.session_id if context is not None else "-",
+            marker if recorded else "-",
+            "kept warm" if parked else "closed",
+        )
+        raise ClaudeCodeInterrupted("Claude Code request aborted")
 
     def _record_rate_limit(self, info: Any) -> None:
         if not isinstance(info, dict):
@@ -3366,6 +4552,16 @@ class ClaudeCodeSession:
         if stdout.strip():
             detail_parts.append(stdout.strip()[-1000:])
         detail = "\n".join(detail_parts) if detail_parts else f"exit {returncode}"
+        if "--thinking-display" in detail and (
+            "unknown option" in detail.lower() or "allowed choices" in detail.lower()
+        ):
+            global _thinking_display_supported
+            _thinking_display_supported = False
+            _LOG.warning(
+                "Claude Code CLI rejected --thinking-display; Claude's reasoning "
+                "stays hidden from now on"
+            )
+            raise _CliFlagRejected(f"Claude Code failed: {detail}")
         if session_id and "--resume-session-at" in detail and "unknown option" in detail.lower():
             global _resume_at_supported
             _resume_at_supported = False
@@ -3391,9 +4587,12 @@ class ClaudeCodeSession:
         session_id: str | None,
         *,
         cost_offset: float,
+        stop_reasons: dict[str, str | None] | None = None,
     ) -> tuple[str, str, str]:
         try:
-            response, reasoning, result_session_id = _parse_stream_json_output(stdout)
+            response, reasoning, result_session_id = _parse_stream_json_output(
+                stdout, stop_reasons=stop_reasons
+            )
         except ClaudeCodeSessionExpired:
             raise
         except RuntimeError as exc:
@@ -3415,15 +4614,49 @@ class ClaudeCodeSession:
 
 
 
-def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
+def _turn_text(
+    messages: list[tuple[str, str, str | None]],
+    stop_reasons: dict[str, str | None],
+) -> str:
+    """The reply of a turn made of several assistant messages.
+
+    Claude Code answers some failures inside the turn with a new API message:
+    after a reply cut at the output limit (``max_tokens``) it asks the model
+    to resume mid-reply, so the texts join; after a dropped connection (no
+    stop reason), a refusal or a cut-off stream the new message replaces the
+    old one. The turn's ``result`` field only holds the last message.
+    """
+
+    segments: list[str] = []
+    joins = False
+    for message_id, text, reason in messages:
+        if message_id and message_id in stop_reasons:
+            reason = stop_reasons[message_id]
+        if text:
+            if joins and segments:
+                segments[-1] += text
+            else:
+                segments.append(text)
+        joins = reason == "max_tokens"
+    return segments[-1] if segments else ""
+
+
+def _parse_stream_json_output(
+    stdout: str, *, stop_reasons: dict[str, str | None] | None = None
+) -> tuple[str, str, str]:
     """Parse a Claude Code ``stream-json`` stdout into (text, reasoning, session_id).
 
     Requires exactly one terminal successful ``result`` event and a UUID-valid
     session_id.  Partial streams (system/assistant only) are rejected.
+    ``stop_reasons`` (message id -> stop reason, from the turn's stream
+    events) says how the messages of a multi-message turn combine.
     """
 
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    # (message id, text, stop reason) per assistant message, in order; the
+    # CLI emits one ``assistant`` event per content block.
+    turn_messages: list[list[Any]] = []
     init_session_id = ""
     result_session_id = ""
     result_text = ""
@@ -3461,6 +4694,13 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
         if event_type == "assistant":
             message = event.get("message") or {}
             if isinstance(message, dict):
+                message_id = message.get("id") if isinstance(message.get("id"), str) else ""
+                if not turn_messages or turn_messages[-1][0] != message_id:
+                    turn_messages.append([message_id, "", None])
+                entry = turn_messages[-1]
+                reason = message.get("stop_reason")
+                if isinstance(reason, str) and reason:
+                    entry[2] = reason
                 for block in message.get("content") or []:
                     if not isinstance(block, dict):
                         continue
@@ -3469,6 +4709,7 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
                         chunk = str(block.get("text") or "")
                         if chunk:
                             text_parts.append(chunk)
+                            entry[1] += chunk
                     elif block_type in ("thinking", "reasoning"):
                         chunk = str(block.get("thinking") or block.get("text") or "")
                         if chunk:
@@ -3549,6 +4790,20 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
     # If both are present and disagree, prefer the terminal result (complete).
     streamed = "".join(text_parts)
     response = result_text if result_text.strip() else streamed
+    if sum(1 for _id, text, _reason in turn_messages if text) > 1:
+        # The CLI recovered inside the turn and ``result`` holds only the
+        # last message: a reply continued after the output limit would lose
+        # its beginning (often the start of a tool call).
+        joined = _turn_text([tuple(item) for item in turn_messages], stop_reasons or {})
+        if joined.strip() and joined != response:
+            _LOG.warning(
+                "Claude Code turn spans %d assistant messages; using the turn's "
+                "combined reply (%d chars) instead of the result field (%d chars)",
+                len(turn_messages),
+                len(joined),
+                len(result_text),
+            )
+            response = joined
     reasoning = "".join(reasoning_parts)
     return response, reasoning, result_session_id
 
@@ -3659,4 +4914,10 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
         "service_tier": service_tier if isinstance(service_tier, str) else None,
         "duration_ms": result.get("duration_ms"),
         "duration_api_ms": result.get("duration_api_ms"),
+        "ttft_ms": result.get("ttft_ms"),
+        # "max_tokens" / "refusal" map to finish reasons in the client.
+        "stop_reason": result.get("stop_reason") if isinstance(result.get("stop_reason"), str) else None,
+        "terminal_reason": (
+            result.get("terminal_reason") if isinstance(result.get("terminal_reason"), str) else None
+        ),
     }

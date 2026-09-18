@@ -18,7 +18,11 @@ Key differences from the Copilot ACP bridge
   model calls of a tool loop, or via ``--resume`` at the last published
   checkpoint in a new process.
 * **Live streaming** — ``--include-partial-messages`` thinking deltas stream
-  as reasoning; prose streams once it cannot be a retried banner/preamble.
+  as reasoning (``--thinking-display summarized``); prose streams once it
+  cannot be a retried banner/preamble, and the progress sentence before a
+  tool call as soon as the call starts. Empty keep-alive chunks flow while
+  Claude writes tool-call JSON or thinks, and ``get_runtime_activity`` tells
+  the gateway heartbeat what Claude is doing.
 * **Distinct identity** — provider ``claude-code``, base marker
   ``acp://claude-code``.  Does not reuse, relabel, or replace ``copilot-acp``
   or the Antigravity command.
@@ -42,6 +46,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,6 +55,7 @@ from typing import Any
 from agent.claude_code_session import (
     _HERMES_BACKEND_SYSTEM_PROMPT,
     _HERMES_TOOL_PROTOCOL,
+    _STREAM_DIVERGED_SEPARATOR,
     ClaudeCodeSession,
     _mask_code,
     _parse_claude_reply,
@@ -61,6 +67,9 @@ from agent.portal_tags import get_bridge_state_key
 
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+# At most one empty keep-alive stream chunk this often while Claude produces
+# output that is not content (tool-call JSON, unsummarized thinking).
+_KEEPALIVE_CHUNK_SECONDS = 5.0
 # v6: flat <tool_call> objects with JSON-object arguments, <tool_result>
 # envelopes, one backend contract. Part of ``_tools_digest``, so a bump starts
 # every durable conversation fresh (Claude Code would otherwise replay the old
@@ -330,11 +339,18 @@ def _assign_tool_call_ids(
     return assigned
 
 
+# Claude's stop reasons that Hermes handles through its own finish reasons
+# (length: continuation / truncated-call retry; content_filter: refusal
+# message and fallback).
+_STOP_REASON_FINISH = {"max_tokens": "length", "refusal": "content_filter"}
+
+
 def _completion_parts(
     response_text: str,
     messages: list[dict[str, Any]] | None,
     *,
     tools_offered: bool,
+    stop_reason: str | None = None,
 ) -> tuple[list[Any], str, str]:
     """``(tool_calls, content, finish_reason)`` for one Claude reply.
 
@@ -346,15 +362,24 @@ def _completion_parts(
 
     Without tools there is no protocol: the whole reply is the answer (a
     title or summary may quote tool-call markup).
+
+    ``stop_reason`` is the Claude Code result's: a reply without calls that
+    stopped at the output limit or was refused reports "length" or
+    "content_filter" instead of "stop".
     """
 
+    def _finish(default: str) -> str:
+        if default == "stop":
+            return _STOP_REASON_FINISH.get(stop_reason or "", default)
+        return default
+
     if not tools_offered:
-        return [], (response_text or "").strip(), "stop"
+        return [], (response_text or "").strip(), _finish("stop")
     reply = _parse_claude_reply(response_text or "")
     if reply.broken:
         return [], reply.cleaned, "length" if reply.unterminated else "tool_calls"
     tool_calls = _assign_tool_call_ids(reply.executable_calls, messages)
-    return tool_calls, reply.cleaned, "tool_calls" if tool_calls else "stop"
+    return tool_calls, reply.cleaned, "tool_calls" if tool_calls else _finish("stop")
 
 
 def _current_time_label() -> str | None:
@@ -432,6 +457,17 @@ class ClaudeCodeClient:
         # when two spawned workspaces begin with identical prompts.
         self._claude_session = ClaudeCodeSession()
         self._owns_claude_session = True
+
+    def get_runtime_activity(self) -> dict[str, Any] | None:
+        """What Claude is doing right now, for the gateway heartbeat.
+
+        ``{"active", "description", "updated_at"}`` ("Claude is writing a
+        write_file call (12.4k chars)", "Claude is thinking (35s)", API retry
+        and model-fallback notices). Read by ``AIAgent.get_activity_summary``;
+        request clients share this session, so the primary client sees it.
+        """
+
+        return self._claude_session.get_progress_snapshot()
 
     def close(self) -> None:
         if self._owns_claude_session:
@@ -526,11 +562,15 @@ class ClaudeCodeClient:
 
         response_text, reasoning_text = self._claude_session.run(prompt_text, **run_kwargs)
 
+        last_usage = self._claude_session.last_usage
         tool_calls, cleaned_text, finish_reason = _completion_parts(
-            response_text, messages, tools_offered=bool(tools)
+            response_text,
+            messages,
+            tools_offered=bool(tools),
+            stop_reason=last_usage.get("stop_reason"),
         )
 
-        usage = _completion_usage(self._claude_session.last_usage)
+        usage = _completion_usage(last_usage, retry=self._claude_session.last_retry_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -559,6 +599,12 @@ class ClaudeCodeClient:
         the session's gate has validated the attempt (never raw ``<tool_call>``
         markup). Contract: concatenated ``delta.content`` over the whole stream
         equals the non-streaming ``cleaned_text``.
+
+        While Claude produces output that is not streamed as content (tool-call
+        JSON, thinking without a summary), an empty chunk is yielded at most
+        every ``_KEEPALIVE_CHUNK_SECONDS`` so the consumer's stale-stream
+        detector sees a live stream. Abandoning the generator cancels this
+        request only (never another request on the shared session).
         """
 
         import queue
@@ -566,6 +612,7 @@ class ClaudeCodeClient:
         q: queue.Queue[Any] = queue.Queue()
         done = object()
         error_box: dict[str, BaseException] = {}
+        cancel = threading.Event()
 
         def on_text(text: str) -> None:
             if text:
@@ -575,12 +622,17 @@ class ClaudeCodeClient:
             if text:
                 q.put(("reasoning", text))
 
+        def on_activity() -> None:
+            q.put(("tick",))
+
         def worker() -> None:
             try:
                 response_text, reasoning_text = self._claude_session.run(
                     prompt_text,
                     on_text_chunk=on_text,
                     on_reasoning_chunk=on_reasoning,
+                    on_activity=on_activity,
+                    cancel_event=cancel,
                     **run_kwargs,
                 )
                 q.put(("final", response_text, reasoning_text))
@@ -615,34 +667,58 @@ class ClaudeCodeClient:
         streamed_reasoning = False
         final_text = ""
         final_reasoning = ""
+        finished = False
+        last_yield = time.monotonic()
         try:
             while True:
                 item = q.get()
                 if item is done:
+                    finished = True
                     break
                 if not (isinstance(item, tuple) and item):
                     continue
                 if item[0] == "text":
                     emitted_text.append(item[1])
+                    last_yield = time.monotonic()
                     yield _chunk(content=item[1])
                 elif item[0] == "reasoning":
                     streamed_reasoning = True
+                    last_yield = time.monotonic()
                     yield _chunk(reasoning=item[1])
+                elif item[0] == "tick":
+                    now = time.monotonic()
+                    if now - last_yield >= _KEEPALIVE_CHUNK_SECONDS:
+                        last_yield = now
+                        # All-empty delta: keeps the consumer's stream
+                        # liveness fresh, carries nothing.
+                        yield _chunk(role=None)
                 elif item[0] == "final":
                     final_text = item[1] or ""
                     final_reasoning = item[2] or ""
             if error_box.get("exc"):
                 raise error_box["exc"]
 
+            last_usage = self._claude_session.last_usage
             tool_calls, cleaned, finish = _completion_parts(
                 final_text,
                 run_kwargs.get("messages"),
                 tools_offered=bool(run_kwargs.get("has_tools")),
+                stop_reason=last_usage.get("stop_reason"),
             )
             already = "".join(emitted_text)
             # Safety net: emit any cleaned remainder the session did not stream.
-            if cleaned and cleaned != already and cleaned.startswith(already):
-                yield _chunk(content=cleaned[len(already):])
+            if cleaned and cleaned != already:
+                if cleaned.startswith(already):
+                    yield _chunk(content=cleaned[len(already):])
+                elif not already.endswith(cleaned):
+                    # The answer does not continue what was shown: keep both
+                    # rather than lose its end (a trailing MEDIA: path).
+                    _LOG.warning(
+                        "Claude Code answer diverged from the %d streamed chars; "
+                        "appending it after a separator",
+                        len(already),
+                    )
+                    yield _chunk(content=_STREAM_DIVERGED_SEPARATOR + cleaned)
             # Reasoning reaches the consumer exactly once: live, or here.
             late_reasoning = None if streamed_reasoning else (final_reasoning or None)
 
@@ -669,9 +745,16 @@ class ClaudeCodeClient:
             yield SimpleNamespace(
                 choices=[],
                 model=model,
-                usage=_completion_usage(self._claude_session.last_usage),
+                usage=_completion_usage(
+                    last_usage, retry=self._claude_session.last_retry_usage
+                ),
             )
         finally:
+            if not finished and thread.is_alive():
+                # The consumer abandoned the stream (interrupt, stale-stream
+                # kill, error): stop this request instead of letting it run
+                # on unseen, holding the session lock for the next turn.
+                self._claude_session.abort_run(cancel)
             thread.join(timeout=5)
 
 
@@ -734,8 +817,14 @@ def _tools_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _completion_usage(raw: dict[str, Any] | None) -> Any:
-    """Expose Claude Code result usage through the OpenAI-compatible facade."""
+def _completion_usage(raw: dict[str, Any] | None, *, retry: dict[str, Any] | None = None) -> Any:
+    """Expose Claude Code result usage through the OpenAI-compatible facade.
+
+    ``retry`` is the session's ``last_retry_usage`` (attempts the bridge
+    retried past, see ``ClaudeCodeSession.last_retry_usage``). It rides along
+    as ``hermes_retry_usage`` for token accounting and is never part of the
+    prompt-size fields.
+    """
 
     usage = raw or {}
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
@@ -758,6 +847,7 @@ def _completion_usage(raw: dict[str, Any] | None) -> Any:
         output_tokens=int(usage.get("output_tokens") or completion_tokens),
         total_cost_usd=usage.get("total_cost_usd"),
         service_tier=usage.get("service_tier"),
+        hermes_retry_usage=_completion_usage(retry) if retry else None,
     )
 
 
