@@ -32,7 +32,7 @@ version can change at runtime (editable installs, hot-reload tooling), and
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 # ── Ambient conversation context ─────────────────────────────────────────────
 #
@@ -80,6 +80,61 @@ def reset_conversation_context(token) -> None:
 def get_conversation_context() -> Optional[str]:
     """Return the ambient conversation id, or ``None`` when unset."""
     return _conversation_id.get()
+
+
+# ── CLI-bridge state scope ───────────────────────────────────────────────────
+#
+# The conversation id above deliberately merges a whole delegation tree (and
+# background-review forks) into one tag. Durable CLI-bridge state — the Claude
+# Code session mapping and its per-key file lock — must NOT be merged that
+# way: siblings sharing one key overwrite each other's session and serialize
+# on the lock. So the agent loop publishes a separate, per-agent key here, next
+# to ``set_conversation_context``:
+#
+# * ``None`` for agents that must stay stateless (background-review forks,
+#   which pin the parent's session id and must never publish over it);
+# * otherwise a zero-argument resolver returning ``"<root>|<session_id>"``,
+#   evaluated at request time so an in-turn compression rotation re-keys the
+#   next request to the new segment immediately.
+#
+# When nothing was published (callers outside ``AIAgent.run_conversation``),
+# the conversation id is used, as before this scope existed.
+_UNSET = object()
+_bridge_state_key: ContextVar[Any] = ContextVar(
+    "hermes_bridge_state_key", default=_UNSET
+)
+
+
+def set_bridge_state_key(key: "Optional[str] | Callable[[], Optional[str]]"):
+    """Publish the per-agent CLI-bridge state key (or a resolver for it).
+
+    Returns the ContextVar token for :func:`reset_bridge_state_key`.
+    """
+    return _bridge_state_key.set(key)
+
+
+def reset_bridge_state_key(token) -> None:
+    """Restore the previous bridge state key (pair with ``set_...``)."""
+    try:
+        _bridge_state_key.reset(token)
+    except Exception:
+        _bridge_state_key.set(_UNSET)
+
+
+def get_bridge_state_key() -> Optional[str]:
+    """Return the durable CLI-bridge state key for the current agent.
+
+    ``None`` means the caller must not load or publish durable state.
+    """
+    value = _bridge_state_key.get()
+    if value is _UNSET:
+        return get_conversation_context()
+    if callable(value):
+        try:
+            value = value()
+        except Exception:
+            return None
+    return value if isinstance(value, str) and value else None
 
 
 def _hermes_version() -> str:

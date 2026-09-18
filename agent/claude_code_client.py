@@ -12,10 +12,11 @@ Key differences from the Copilot ACP bridge
   schemas travel via ``--system-prompt-file``; the transcript (with native
   base64 image blocks) travels as a stream-json user message on stdin, never
   as an ``execve`` argument.  There is no ``MAX_ARG_STRLEN`` ceiling.
-* **Durable session continuation** — one Claude Code ``session_id`` per cached
-  Hermes model client; later turns send only the incremental new messages,
-  to a warm process kept alive between the model calls of a tool loop, or via
-  ``--resume`` in a new process.
+* **Durable session continuation** — one Claude Code ``session_id`` per Hermes
+  agent (``agent.portal_tags.get_bridge_state_key``); later turns send only
+  the incremental new messages, to a warm process kept alive between the
+  model calls of a tool loop, or via ``--resume`` at the last published
+  checkpoint in a new process.
 * **Live streaming** — ``--include-partial-messages`` thinking deltas stream
   as reasoning; prose streams once it cannot be a retried banner/preamble.
 * **Distinct identity** — provider ``claude-code``, base marker
@@ -46,8 +47,10 @@ from agent.claude_code_session import (
     _HERMES_BACKEND_SYSTEM_PROMPT,
     ClaudeCodeSession,
     _render_content_collecting_images,
+    _tool_names_by_call_id,
+    _tool_result_name,
 )
-from agent.portal_tags import get_conversation_context
+from agent.portal_tags import get_bridge_state_key
 
 CLAUDE_CODE_MARKER_BASE_URL = "acp://claude-code"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -163,13 +166,16 @@ def _build_claude_code_request(
         )
 
     transcript: list[str] = []
+    # Tool results reloaded from the session DB carry no ``name``; recover it
+    # from the assistant call so replays label results like live turns.
+    tool_names = _tool_names_by_call_id(messages)
     for message in messages[index:]:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").strip().lower()
         if role == "tool":
             tool_call_id = message.get("tool_call_id") or message.get("id") or ""
-            tool_name = message.get("name") or ""
+            tool_name = _tool_result_name(message, tool_names)
             rendered = _render_transcript_content(message.get("content"), images)
             meta = []
             if isinstance(tool_name, str) and tool_name.strip():
@@ -350,10 +356,11 @@ class ClaudeCodeClient:
         effort = _resolve_effort_from_kwargs(kwargs) or _resolve_effort()
         tools_digest = _tools_digest(tools, tool_choice=tool_choice)
 
-        # Only the main tool-enabled agent owns durable Claude Code continuity.
-        # Auxiliary title/compression calls have no tool schema and must not
-        # overwrite the main session's conversation mapping.
-        state_key = get_conversation_context() if tools else None
+        # Durable Claude Code continuity is scoped per Hermes agent (main
+        # agent, each delegate child); background-review forks publish None.
+        # Auxiliary title/compression/vision calls have no tool schema: they
+        # stay stateless and never touch an agent's conversation mapping.
+        state_key = get_bridge_state_key() if tools else None
 
         run_kwargs: dict[str, Any] = dict(
             messages=messages or [],
@@ -366,6 +373,9 @@ class ClaudeCodeClient:
             state_key=state_key,
             command=self._claude_command,
             system_prompt=system_prompt,
+            # A tool loop follows only when tools were offered; keep the
+            # process warm for it whether or not the state is durable.
+            keepalive=bool(tools),
         )
         if prompt_images:
             run_kwargs["prompt_images"] = prompt_images

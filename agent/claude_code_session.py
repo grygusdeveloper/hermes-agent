@@ -33,6 +33,24 @@ Design invariants
   process-group latch; aborts and timeouts kill the whole group and reap it.
 * **Expired-session recovery** — a missing/expired server session is detected
   and retried once as a fresh conversation with the complete prompt.
+* **Rewindable continuity** — every published turn records a *checkpoint*:
+  the uuid of Claude's last ``assistant`` chain entry for that request. Cold
+  resumes always pass ``--resume <sid> --resume-session-at <checkpoint>``, so
+  entries left by failed or retried attempts (which Claude Code persists as
+  soon as it reads them) never reach the model, and a rewound history
+  (``/retry``, ``/undo``) resumes at the older checkpoint instead of
+  replaying the whole transcript. An identical re-send is repaired inside the
+  session. A parked warm process is reused only when its in-memory tip is the
+  checkpoint being resumed.
+* **Durable identity** — model, effort, the tool surface digest and the
+  digest of the complete system prompt. Claude Code snapshots the system
+  prompt on a conversation's first request and replays that record on every
+  resume (``--system-prompt-snapshot`` defaults on), so a changed system
+  prompt must start a fresh session rather than silently keep the old one.
+* **Per-agent state** — callers pass one ``state_key`` per Hermes agent (see
+  ``agent.portal_tags.get_bridge_state_key``); ``state_key=None`` calls are
+  stateless: they run with ``--no-session-persistence``, never publish, and
+  continue only inside their own warm process.
 """
 
 from __future__ import annotations
@@ -49,7 +67,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # Claude Code's stream-json output requires ``--verbose``; we always pass it.
 # Linux limits each execve argument to MAX_ARG_STRLEN (normally 128 KiB).
@@ -63,9 +81,39 @@ _SESSION_ID_RE = re.compile(
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
 _MESSAGE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_STATE_VERSION = 2
+# v3: fingerprints no longer hash message ``name``; states carry the system
+# prompt digest and resume checkpoints.
+_STATE_VERSION = 3
 _STATE_LOCK = threading.Lock()
 _LOG = logging.getLogger(__name__)
+# Resume checkpoints kept per conversation (newest last). Older ones only
+# matter for rewinds deeper than this many model calls.
+_MAX_CHECKPOINTS = 64
+# Durable state files idle longer than this are pruned (matches Claude Code's
+# own ``cleanupPeriodDays`` default, after which the transcript is gone too).
+_STATE_RETENTION_DEFAULT_DAYS = 30.0
+_STATE_PRUNE_INTERVAL_SECONDS = 6 * 3600
+_last_state_prune = 0.0
+# ``--resume-session-at`` is a hidden Claude Code flag (verified on 2.1.276).
+# If an installed CLI rejects it, stop passing it for the rest of the process
+# and resume plainly, as before checkpoints existed.
+_resume_at_supported = True
+
+# Sent into the session when Hermes re-sends exactly the request it already
+# published (a Hermes-side rejection of the reply, e.g. unusable tool-call
+# arguments). The session layer does not know why, so the wording is generic.
+_RESEND_REPAIR_PROMPT = """\
+Hermes did not use your previous reply, and nothing from it was executed.
+Respond to the latest request again from the conversation above. If you call
+tools, emit valid <tool_call> blocks exactly as specified.
+""".strip()
+
+# Sent when the only new messages since the last published request are
+# assistant messages (a continuation of Claude's own last reply).
+_ASSISTANT_ONLY_CONTINUATION_PROMPT = """\
+Continue from the end of your previous message without repeating it. If a tool
+is needed, emit the <tool_call> block(s) now; otherwise finish the answer.
+""".strip()
 
 # Replace Claude Code's native coding-agent persona. Hermes supplies the real
 # conversation and owns every tool, so leaving the stock Claude Code prompt in
@@ -122,6 +170,8 @@ _EXPIRED_SESSION_MARKERS = (
     "no conversation found with session id",
     "no conversation found",
     "conversation not found",
+    # --resume-session-at with a checkpoint the loaded chain does not hold.
+    "no message found with message.uuid",
 )
 
 
@@ -203,10 +253,15 @@ def _message_fingerprint(messages: list[dict[str, Any]]) -> tuple[tuple[str, str
             and durable_content.endswith(trusted_oob)
         ):
             durable_content = durable_content[: -len(trusted_oob)]
+        # ``name`` is deliberately not part of the identity. Live tool results
+        # carry it, but history reloaded from the session DB does not (only
+        # ``tool_name``, which the chat-completions transport strips), so
+        # hashing it broke the prefix on every turn after tool use.
+        # ``tool_call_id`` already binds a result to the call (and its
+        # function name) hashed in the preceding assistant ``tool_calls``.
         identity = {
             "role": role,
             "content": durable_content,
-            "name": message.get("name"),
             "tool_call_id": message.get("tool_call_id"),
             "tool_calls": _normalize_for_digest(message.get("tool_calls")),
         }
@@ -220,6 +275,70 @@ def _message_fingerprint(messages: list[dict[str, Any]]) -> tuple[tuple[str, str
             (role, hashlib.sha256(canonical.encode("utf-8")).hexdigest())
         )
     return tuple(fingerprints)
+
+
+def _first_divergence(
+    current: tuple[tuple[str, str], ...],
+    previous: tuple[tuple[str, str], ...],
+) -> str:
+    """Describe where ``current`` stops extending ``previous`` (for logs)."""
+
+    for index, (now, before) in enumerate(zip(current, previous)):
+        if now != before:
+            return f"index={index} role={now[0]} previous_role={before[0]}"
+    if len(current) < len(previous):
+        return f"index={len(current)} history shorter than published"
+    return "none"
+
+
+def _tool_call_id_and_name(call: Any) -> tuple[Any, Any]:
+    model_dump = getattr(call, "model_dump", None)
+    if callable(model_dump):
+        try:
+            call = model_dump()
+        except Exception:
+            pass
+    if isinstance(call, dict):
+        function = call.get("function") or {}
+        name = function.get("name") if isinstance(function, dict) else getattr(function, "name", None)
+        return call.get("id"), name
+    return getattr(call, "id", None), getattr(getattr(call, "function", None), "name", None)
+
+
+def _tool_names_by_call_id(messages: list[dict[str, Any]]) -> dict[str, str]:
+    """Map assistant ``tool_calls`` ids to their function names.
+
+    Tool results reloaded from the session DB carry no ``name``; renderings
+    recover it from the call that produced the result, so live and replayed
+    transcripts label results the same way.
+    """
+
+    names: dict[str, str] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            call_id, name = _tool_call_id_and_name(call)
+            if isinstance(call_id, str) and call_id and isinstance(name, str) and name.strip():
+                names[call_id] = name.strip()
+    return names
+
+
+def _tool_result_name(message: dict[str, Any], names: dict[str, str]) -> str:
+    """Best available tool name for a tool-result message."""
+
+    call_id = message.get("tool_call_id")
+    for candidate in (
+        message.get("name"),
+        message.get("tool_name"),
+        names.get(call_id) if isinstance(call_id, str) else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
 
 
 def _state_dir() -> Path:
@@ -262,9 +381,20 @@ def _durable_transition_lock(state_key: str | None):
         os.close(fd)
 
 
-def _load_durable_state(
-    state_key: str,
-) -> tuple[str, tuple[tuple[str, str], ...], str, str | None, str] | None:
+class _DurableState(NamedTuple):
+    session_id: str
+    fingerprints: tuple[tuple[str, str], ...]
+    model: str
+    effort: str | None
+    tools_digest: str
+    system_digest: str
+    # ``(request_message_count, assistant_uuid)`` per published model call,
+    # oldest first: resuming at ``assistant_uuid`` restores Claude's view of
+    # the first ``request_message_count`` messages plus its own reply.
+    checkpoints: tuple[tuple[int, str], ...]
+
+
+def _load_durable_state(state_key: str) -> _DurableState | None:
     path = _state_path(state_key)
     try:
         with _STATE_LOCK:
@@ -281,6 +411,8 @@ def _load_durable_state(
     model = payload.get("model")
     effort = payload.get("effort")
     tools_digest = payload.get("tools_digest")
+    system_digest = payload.get("system_digest", "")
+    raw_checkpoints = payload.get("checkpoints", [])
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         return None
     if not isinstance(model, str) or not model.strip():
@@ -289,7 +421,11 @@ def _load_durable_state(
         return None
     if not isinstance(tools_digest, str):
         return None
-    if not isinstance(raw_fingerprints, list):
+    if not isinstance(system_digest, str) or (
+        system_digest and not _MESSAGE_DIGEST_RE.fullmatch(system_digest)
+    ):
+        return None
+    if not isinstance(raw_fingerprints, list) or not isinstance(raw_checkpoints, list):
         return None
     fingerprints: list[tuple[str, str]] = []
     for item in raw_fingerprints:
@@ -301,12 +437,29 @@ def _load_durable_state(
         if not _MESSAGE_DIGEST_RE.fullmatch(digest):
             return None
         fingerprints.append((role, digest))
-    return (
-        session_id,
-        tuple(fingerprints),
-        model.strip(),
-        effort.strip() if isinstance(effort, str) and effort.strip() else None,
-        tools_digest,
+    checkpoints: list[tuple[int, str]] = []
+    for item in raw_checkpoints:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        count, uuid_text = item
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 0 < count <= len(fingerprints)
+            or (checkpoints and count < checkpoints[-1][0])
+            or not isinstance(uuid_text, str)
+            or not _SESSION_ID_RE.fullmatch(uuid_text)
+        ):
+            return None
+        checkpoints.append((count, uuid_text))
+    return _DurableState(
+        session_id=session_id,
+        fingerprints=tuple(fingerprints),
+        model=model.strip(),
+        effort=effort.strip() if isinstance(effort, str) and effort.strip() else None,
+        tools_digest=tools_digest,
+        system_digest=system_digest,
+        checkpoints=tuple(checkpoints),
     )
 
 
@@ -318,6 +471,8 @@ def _save_durable_state(
     model: str,
     effort: str | None,
     tools_digest: str,
+    system_digest: str = "",
+    checkpoints: tuple[tuple[int, str], ...] = (),
 ) -> None:
     directory = _state_dir()
     path = _state_path(state_key)
@@ -329,6 +484,8 @@ def _save_durable_state(
         "model": model,
         "effort": effort,
         "tools_digest": tools_digest,
+        "system_digest": system_digest,
+        "checkpoints": [list(item) for item in checkpoints[-_MAX_CHECKPOINTS:]],
     }
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     with _STATE_LOCK:
@@ -350,6 +507,93 @@ def _save_durable_state(
                 temp.unlink()
             except FileNotFoundError:
                 pass
+    _maybe_prune_durable_states()
+
+
+def _state_retention_seconds() -> float:
+    raw = os.getenv("HERMES_CLAUDE_CODE_STATE_RETENTION_DAYS", "").strip()
+    try:
+        days = float(raw) if raw else _STATE_RETENTION_DEFAULT_DAYS
+    except ValueError:
+        days = _STATE_RETENTION_DEFAULT_DAYS
+    return max(0.0, days) * 86400.0
+
+
+def _prune_durable_states(now: float | None = None) -> int:
+    """Delete state and lock files of conversations idle past the retention.
+
+    A state file's mtime is its last publication. A key is only pruned when
+    its transition lock can be taken without blocking, so a conversation
+    that is being served right now is never touched. Returns the number of
+    state files removed.
+    """
+
+    retention = _state_retention_seconds()
+    if retention <= 0:
+        return 0
+    directory = _state_dir()
+    if not directory.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - retention
+
+    def _stale(path: Path) -> bool:
+        try:
+            return path.stat().st_mtime < cutoff
+        except OSError:
+            return False
+
+    removed = 0
+    candidates = [p for p in directory.glob("*.json") if _stale(p)]
+    candidates += [
+        p for p in directory.glob("*.lock")
+        if not p.with_suffix(".json").exists() and _stale(p)
+    ]
+    for path in candidates:
+        lock_path = path.with_suffix(".lock")
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            state_path = path.with_suffix(".json")
+            # Re-check under the lock: a publisher may just have refreshed it.
+            if state_path.exists() and not _stale(state_path):
+                continue
+            for victim in (state_path, lock_path):
+                try:
+                    victim.unlink()
+                except FileNotFoundError:
+                    pass
+            if path.suffix == ".json":
+                removed += 1
+        except OSError:
+            continue
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+    return removed
+
+
+def _maybe_prune_durable_states() -> None:
+    global _last_state_prune
+    now = time.time()
+    if now - _last_state_prune < _STATE_PRUNE_INTERVAL_SECONDS:
+        return
+    _last_state_prune = now
+    try:
+        removed = _prune_durable_states(now)
+    except Exception:
+        _LOG.debug("Claude Code durable state pruning failed", exc_info=True)
+        return
+    if removed:
+        _LOG.info("Pruned %d idle Claude Code durable session state file(s)", removed)
 
 
 def _delete_durable_state(state_key: str) -> None:
@@ -494,6 +738,9 @@ def _incremental_prompt_with_images(
 
     parts: list[str] = []
     images: list[dict[str, Any]] = []
+    # Built over the whole history: a result's call usually precedes the
+    # incremental window.
+    tool_names = _tool_names_by_call_id(messages)
     for message in messages[previous_count:]:
         if not isinstance(message, dict):
             continue
@@ -507,7 +754,7 @@ def _incremental_prompt_with_images(
             continue
         if role == "tool":
             tool_call_id = message.get("tool_call_id") or message.get("id") or ""
-            tool_name = message.get("name") or ""
+            tool_name = _tool_result_name(message, tool_names)
             header = "Tool Result"
             meta_bits = []
             if isinstance(tool_name, str) and tool_name.strip():
@@ -705,17 +952,23 @@ class _WarmProcess:
         self.session_id = session_id
         self.identity = identity
         self.fingerprints: tuple[tuple[str, str], ...] = ()
+        # Uuid of the last assistant entry this process produced: the point
+        # its in-memory conversation ends at. It may only serve a resume at
+        # exactly this checkpoint.
+        self.tip: str | None = None
         self.cost_total = 0.0
         self.turns = 0
         self._stderr: list[str] = []
         self._stderr_lock = threading.Lock()
         self._idle_timer: threading.Timer | None = None
         self._closed = False
+        self._stderr_thread: threading.Thread | None = None
         err = getattr(process, "stderr", None)
         if err is not None and callable(getattr(err, "__iter__", None)):
-            threading.Thread(
+            self._stderr_thread = threading.Thread(
                 target=self._drain_stderr, args=(err,), name="claude-code-stderr", daemon=True
-            ).start()
+            )
+            self._stderr_thread.start()
 
     def _drain_stderr(self, stream: Any) -> None:
         try:
@@ -727,7 +980,12 @@ class _WarmProcess:
         except Exception:
             pass
 
-    def stderr_tail(self) -> str:
+    def stderr_tail(self, wait: float = 0.0) -> str:
+        """Last stderr output; ``wait`` lets the drain reach EOF after an exit."""
+
+        thread = self._stderr_thread
+        if wait > 0 and thread is not None:
+            thread.join(timeout=wait)
         with self._stderr_lock:
             return "".join(self._stderr)[-2000:]
 
@@ -1130,6 +1388,18 @@ def _reap_process_group(process: subprocess.Popen[str], *, grace_seconds: float 
         pass
 
 
+class _Continuation(NamedTuple):
+    """How a request continues the bound Claude Code session."""
+
+    mode: str  # "advance" | "assistant-only" | "resend" | "rewind"
+    prompt: str
+    images: list[dict[str, Any]]
+    resume_at: str | None
+    # Checkpoints still valid for the resumed chain; the new call's
+    # checkpoint is appended to these when it is published.
+    checkpoints: tuple[tuple[int, str], ...]
+
+
 class ClaudeCodeSession:
     """One collision-free Claude Code conversation bound to one Hermes client.
 
@@ -1137,14 +1407,20 @@ class ClaudeCodeSession:
     ---------
     * First turn: no ``session_id`` -> launches ``claude`` with a fresh
       ``--session-id`` UUID, sends the complete formatted prompt over stdin,
-      and records the returned ``session_id`` + message fingerprints.
+      and records the returned ``session_id``, message fingerprints and the
+      reply's checkpoint uuid.
     * Later turns: ``session_id`` known and prefix matches -> sends only the
-      incremental new messages, to the still-running warm process when one is
-      parked for this conversation, otherwise via ``--resume <session_id>``.
-    * Prefix mismatch (``/new``, compression, transcript repair) -> starts a
-      fresh session.
-    * Expired/invalid server session -> retries once as a fresh conversation
-      with the complete prompt.
+      incremental new messages, to the still-running warm process when it is
+      parked at the latest checkpoint, otherwise via ``--resume <session_id>
+      --resume-session-at <checkpoint>``.
+    * Identical re-send -> a short repair turn in the same session; only new
+      assistant messages -> a short continuation turn.
+    * Rewound history (``/retry``, ``/undo``) -> resumes at the newest older
+      checkpoint whose prefix still matches and sends only the new tail.
+    * Otherwise (``/new``, compression, transcript repair) -> starts a fresh
+      session.
+    * Expired/invalid server session or unknown checkpoint -> retries once as
+      a fresh conversation with the complete prompt.
     """
 
     def __init__(self) -> None:
@@ -1154,6 +1430,13 @@ class ClaudeCodeSession:
         self._bound_model: str | None = None
         self._bound_effort: str | None = None
         self._bound_tools_digest: str = ""
+        self._bound_system_digest: str = ""
+        self._checkpoints: tuple[tuple[int, str], ...] = ()
+        # False for stateless (``--no-session-persistence``) sessions: they
+        # exist only inside their warm process and cannot be cold-resumed.
+        self._session_persisted = True
+        # Checkpoint uuid of the most recent successful CLI turn.
+        self._last_turn_checkpoint: str | None = None
         self._lock = threading.RLock()
         self._process_lock = threading.Lock()
         self._active_process: subprocess.Popen[str] | None = None
@@ -1180,14 +1463,42 @@ class ClaudeCodeSession:
         with self._lock:
             if self._state_key:
                 _delete_durable_state(self._state_key)
-            self._session_id = None
-            self._previous_messages = ()
+            self._clear_binding()
             self._state_key = None
-            self._bound_model = None
-            self._bound_effort = None
-            self._bound_tools_digest = ""
             self._last_usage = {}
             self._discard_warm()
+
+    def _clear_binding(self) -> None:
+        """Forget the bound Claude Code conversation (next call starts fresh)."""
+
+        self._session_id = None
+        self._previous_messages = ()
+        self._bound_model = None
+        self._bound_effort = None
+        self._bound_tools_digest = ""
+        self._bound_system_digest = ""
+        self._checkpoints = ()
+        self._session_persisted = True
+
+    def _adopt_durable(self, durable: _DurableState) -> None:
+        self._session_id = durable.session_id
+        self._previous_messages = durable.fingerprints
+        self._bound_model = durable.model
+        self._bound_effort = durable.effort
+        self._bound_tools_digest = durable.tools_digest
+        self._bound_system_digest = durable.system_digest
+        self._checkpoints = durable.checkpoints
+        self._session_persisted = True
+
+    def _warm_parked_at(self, session_id: str | None, tip: str | None) -> bool:
+        warm = self._warm
+        return bool(
+            session_id
+            and warm is not None
+            and warm.alive()
+            and warm.session_id == session_id
+            and warm.tip == tip
+        )
 
     def shutdown(self) -> None:
         """Abort any in-flight request and stop the parked warm process."""
@@ -1274,6 +1585,7 @@ class ClaudeCodeSession:
         on_reasoning_chunk: Any = None,
         system_prompt: str | None = None,
         prompt_images: list[dict[str, Any]] | None = None,
+        keepalive: bool | None = None,
     ) -> tuple[str, str]:
         """Return ``(response, reasoning)`` using the durable Claude Code session.
 
@@ -1283,14 +1595,25 @@ class ClaudeCodeSession:
         ``--system-prompt-file``. ``messages`` drives incremental continuation.
         ``on_text_chunk`` receives validated prose deltas (never tool-call
         markup); ``on_reasoning_chunk`` receives live thinking deltas.
+
+        ``state_key`` names the durable conversation (one per Hermes agent);
+        ``None`` makes the call stateless (``--no-session-persistence``, never
+        published). ``keepalive`` parks the process between the model calls
+        of a tool loop; it defaults to ``bool(state_key)``, and callers that
+        know whether a tool loop follows pass it explicitly.
         """
 
         current = _message_fingerprint(messages)
         normalized_effort = effort.strip() if isinstance(effort, str) and effort.strip() else None
         normalized_tools = tools_digest if isinstance(tools_digest, str) else ""
-        # Only the main conversation keeps a warm process between model calls;
-        # one-off auxiliary calls (titles, compression) exit immediately.
-        keepalive = bool(state_key)
+        system_digest = (
+            hashlib.sha256(system_prompt.encode("utf-8")).hexdigest() if system_prompt else ""
+        )
+        if keepalive is None:
+            keepalive = bool(state_key)
+        # Only keyed conversations are written to disk; a stateless call
+        # continues solely inside its own warm process.
+        persist = bool(state_key)
         with self._lock, _durable_transition_lock(state_key):
             self._last_usage = {}
             # Always reload durable state under the lease before dispatch so a
@@ -1299,28 +1622,14 @@ class ClaudeCodeSession:
             if state_key:
                 durable = _load_durable_state(state_key)
                 if durable:
-                    (
-                        self._session_id,
-                        self._previous_messages,
-                        self._bound_model,
-                        self._bound_effort,
-                        self._bound_tools_digest,
-                    ) = durable
+                    self._adopt_durable(durable)
                 else:
                     # Missing/corrupt durable state invalidates warm memory for
                     # this key — never resume a stale in-memory session_id.
-                    self._session_id = None
-                    self._previous_messages = ()
-                    self._bound_model = None
-                    self._bound_effort = None
-                    self._bound_tools_digest = ""
+                    self._clear_binding()
                 self._state_key = state_key
             elif state_key != self._state_key:
-                self._session_id = None
-                self._previous_messages = ()
-                self._bound_model = None
-                self._bound_effort = None
-                self._bound_tools_digest = ""
+                self._clear_binding()
                 self._state_key = state_key
             # A parked process only knows the conversation it produced. If the
             # durable state moved on (another process advanced it, /new, etc.)
@@ -1330,28 +1639,19 @@ class ClaudeCodeSession:
                 or self._warm.fingerprints != self._previous_messages
             ):
                 self._discard_warm()
-            previous_count = len(self._previous_messages)
-            identity_matches = (
-                self._bound_model == model
-                and self._bound_effort == normalized_effort
-                and self._bound_tools_digest == normalized_tools
-            )
-            can_resume = bool(
-                self._session_id
-                and identity_matches
-                and len(current) > previous_count
-                and current[:previous_count] == self._previous_messages
-            )
-            if self._session_id and not can_resume:
-                _LOG.info(
-                    "Claude Code resume skipped: identity_match=%s prefix_match=%s "
-                    "history_advanced=%s previous_messages=%d current_messages=%d",
-                    identity_matches,
-                    current[:previous_count] == self._previous_messages,
-                    len(current) > previous_count,
-                    previous_count,
-                    len(current),
+            plan = (
+                self._plan_continuation(
+                    messages,
+                    current,
+                    model=model,
+                    effort=normalized_effort,
+                    tools_digest=normalized_tools,
+                    system_digest=system_digest,
+                    keepalive=keepalive,
                 )
+                if self._session_id
+                else None
+            )
             call_kwargs = dict(
                 model=model,
                 effort=normalized_effort,
@@ -1368,50 +1668,64 @@ class ClaudeCodeSession:
                 call_kwargs["system_prompt"] = system_prompt
             if keepalive:
                 call_kwargs["keepalive"] = True
-            if can_resume:
-                incremental, incremental_images = _incremental_prompt_with_images(
-                    messages, previous_count
-                )
-                if incremental:
-                    try:
-                        response, reasoning, session_id = self._execute_with_soft_limit_retry(
-                            _user_message_content(incremental, incremental_images),
-                            session_id=self._session_id,
-                            **call_kwargs,
-                        )
-                    except ClaudeCodeSessionExpired:
-                        # Expired/invalid server session: retry once as a fresh
-                        # conversation with the complete prompt.
-                        self._session_id = None
-                        self._previous_messages = ()
-                        self._bound_model = None
-                        self._bound_effort = None
-                        self._bound_tools_digest = ""
-                        self._discard_warm()
-                        if state_key:
-                            _delete_durable_state(state_key)
-                    else:
-                        resolved_session_id = _require_uuid_session_id(
-                            session_id or self._session_id or "",
-                            where="resume",
-                        )
-                        self._publish(
-                            state_key,
-                            resolved_session_id,
-                            current,
-                            model=model,
-                            effort=normalized_effort,
-                            tools_digest=normalized_tools,
-                        )
-                        return response, reasoning
+            if not persist:
+                call_kwargs["persist"] = False
+            identity = dict(
+                model=model,
+                effort=normalized_effort,
+                tools_digest=normalized_tools,
+                system_digest=system_digest,
+            )
+            if plan is not None:
+                resume_kwargs = dict(call_kwargs)
+                if plan.resume_at:
+                    resume_kwargs["resume_at"] = plan.resume_at
+                try:
+                    response, reasoning, session_id = self._execute_with_soft_limit_retry(
+                        _user_message_content(plan.prompt, plan.images),
+                        session_id=self._session_id,
+                        **resume_kwargs,
+                    )
+                except ClaudeCodeSessionExpired:
+                    # Expired/invalid server session or unknown checkpoint:
+                    # retry once as a fresh conversation with the complete
+                    # prompt.
+                    self._clear_binding()
+                    self._discard_warm()
+                    if state_key:
+                        _delete_durable_state(state_key)
+                except BaseException:
+                    # The session may now hold entries of the failed attempt;
+                    # never reuse that process. The next call resumes at the
+                    # last published checkpoint, which drops them.
+                    self._discard_warm()
+                    raise
+                else:
+                    resolved_session_id = _require_uuid_session_id(
+                        session_id or self._session_id or "",
+                        where="resume",
+                    )
+                    self._publish(
+                        state_key,
+                        resolved_session_id,
+                        current,
+                        checkpoints=self._next_checkpoints(plan.checkpoints, len(current)),
+                        persisted=persist,
+                        **identity,
+                    )
+                    return response, reasoning
 
             # Prompt body travels over stdin — do NOT apply argv flag-size
             # limits to it.  Only short CLI flags are size-checked in _execute.
-            response, reasoning, session_id = self._execute_with_soft_limit_retry(
-                _user_message_content(prompt_text, prompt_images),
-                session_id=None,
-                **call_kwargs,
-            )
+            try:
+                response, reasoning, session_id = self._execute_with_soft_limit_retry(
+                    _user_message_content(prompt_text, prompt_images),
+                    session_id=None,
+                    **call_kwargs,
+                )
+            except BaseException:
+                self._discard_warm()
+                raise
             resolved_session_id = _require_uuid_session_id(
                 session_id, where="fresh"
             )
@@ -1419,11 +1733,146 @@ class ClaudeCodeSession:
                 state_key,
                 resolved_session_id,
                 current,
-                model=model,
-                effort=normalized_effort,
-                tools_digest=normalized_tools,
+                checkpoints=self._next_checkpoints((), len(current)),
+                persisted=persist,
+                **identity,
             )
             return response, reasoning
+
+    def _plan_continuation(
+        self,
+        messages: list[dict[str, Any]],
+        current: tuple[tuple[str, str], ...],
+        *,
+        model: str,
+        effort: str | None,
+        tools_digest: str,
+        system_digest: str,
+        keepalive: bool,
+    ) -> _Continuation | None:
+        """Decide how ``messages`` continue the bound session (None = fresh)."""
+
+        previous = self._previous_messages
+        previous_count = len(previous)
+        checkpoints = self._checkpoints
+        changed = [
+            name
+            for name, bound, wanted in (
+                ("model", self._bound_model, model),
+                ("effort", self._bound_effort, effort),
+                ("tools", self._bound_tools_digest, tools_digest),
+                ("system_prompt", self._bound_system_digest, system_digest),
+            )
+            if bound != wanted
+        ]
+        prefix_ok = len(current) >= previous_count and current[:previous_count] == previous
+
+        def skipped(cause: str) -> None:
+            # A durable conversation falling back to a full replay is costly
+            # and worth seeing; identity changes are deliberate, and stateless
+            # (auxiliary) sessions are expected to start over.
+            durable = self._session_persisted and self._state_key
+            log = _LOG.warning if durable and cause != "identity" else _LOG.info
+            log(
+                "Claude Code resume skipped (%s): changed=%s prefix_match=%s "
+                "history_advanced=%s previous_messages=%d current_messages=%d "
+                "first_divergence=%s",
+                cause,
+                ",".join(changed) or "-",
+                prefix_ok,
+                len(current) > previous_count,
+                previous_count,
+                len(current),
+                _first_divergence(current, previous),
+            )
+
+        if changed:
+            skipped("identity")
+            return None
+
+        if prefix_ok:
+            latest = (
+                checkpoints[-1][1]
+                if checkpoints and checkpoints[-1][0] == previous_count
+                else None
+            )
+            if not self._session_persisted and not (
+                keepalive and self._warm_parked_at(self._session_id, latest)
+            ):
+                # A stateless session exists only inside its warm process.
+                skipped("not-persisted")
+                return None
+            if len(current) == previous_count:
+                plan = _Continuation(
+                    "resend",
+                    _RESEND_REPAIR_PROMPT,
+                    [],
+                    latest,
+                    tuple(cp for cp in checkpoints if cp[0] < previous_count),
+                )
+            else:
+                prompt, images = _incremental_prompt_with_images(messages, previous_count)
+                if prompt:
+                    plan = _Continuation("advance", prompt, images, latest, checkpoints)
+                else:
+                    plan = _Continuation(
+                        "assistant-only",
+                        _ASSISTANT_ONLY_CONTINUATION_PROMPT,
+                        [],
+                        latest,
+                        checkpoints,
+                    )
+            if plan.mode != "advance":
+                _LOG.info(
+                    "Claude Code continuation: mode=%s messages=%d resume_at=%s",
+                    plan.mode,
+                    len(current),
+                    plan.resume_at or "-",
+                )
+            return plan
+
+        # Rewound or edited history: resume at the newest older checkpoint
+        # whose prefix, including Claude's reply to it, is still intact, and
+        # send only what follows. The tail must hold no assistant message:
+        # Claude would otherwise miss replies from the abandoned branch.
+        if self._session_persisted:
+            for index in range(len(checkpoints) - 1, -1, -1):
+                count, checkpoint = checkpoints[index]
+                if count >= previous_count:
+                    continue
+                reply = count  # index of Claude's reply to that request
+                if len(current) <= reply + 1:
+                    continue
+                if any(role == "assistant" for role, _ in current[reply + 1 :]):
+                    break
+                if previous[reply][0] != "assistant" or (
+                    current[: reply + 1] != previous[: reply + 1]
+                ):
+                    continue
+                prompt, images = _incremental_prompt_with_images(messages, reply + 1)
+                if not prompt:
+                    continue
+                _LOG.info(
+                    "Claude Code continuation: mode=rewind previous_messages=%d "
+                    "current_messages=%d resume_at=%s (checkpoint for %d messages)",
+                    previous_count,
+                    len(current),
+                    checkpoint,
+                    count,
+                )
+                return _Continuation(
+                    "rewind", prompt, images, checkpoint, checkpoints[: index + 1]
+                )
+        skipped("prefix")
+        return None
+
+    def _next_checkpoints(
+        self, base: tuple[tuple[int, str], ...], count: int
+    ) -> tuple[tuple[int, str], ...]:
+        checkpoint = self._last_turn_checkpoint
+        if not checkpoint or count <= 0:
+            return base
+        return (tuple(base) + ((count, checkpoint),))[-_MAX_CHECKPOINTS:]
 
     def _publish(
         self,
@@ -1434,12 +1883,18 @@ class ClaudeCodeSession:
         model: str,
         effort: str | None,
         tools_digest: str,
+        system_digest: str = "",
+        checkpoints: tuple[tuple[int, str], ...] = (),
+        persisted: bool = True,
     ) -> None:
         self._session_id = session_id
         self._previous_messages = fingerprints
         self._bound_model = model
         self._bound_effort = effort
         self._bound_tools_digest = tools_digest
+        self._bound_system_digest = system_digest
+        self._checkpoints = tuple(checkpoints)
+        self._session_persisted = persisted
         if self._warm is not None and self._warm.session_id == session_id:
             self._warm.fingerprints = fingerprints
         if state_key:
@@ -1450,6 +1905,8 @@ class ClaudeCodeSession:
                 model=model,
                 effort=effort,
                 tools_digest=tools_digest,
+                system_digest=system_digest,
+                checkpoints=self._checkpoints,
             )
 
     def _execute_with_soft_limit_retry(
@@ -1469,13 +1926,17 @@ class ClaudeCodeSession:
         had_tools: bool = False,
         system_prompt: str | None = None,
         keepalive: bool = False,
+        resume_at: str | None = None,
+        persist: bool = True,
     ) -> tuple[str, str, str]:
         """Run one CLI request, retrying soft notices and incomplete preambles.
 
         Soft notices and short planning-only preambles are *not* answers.
-        Retry the same payload (same resume session when provided) with short
-        backoff. Only after retries exhaust raise a clear provider error for
-        Hermes to surface.
+        A soft notice is retried with the same payload, resumed at the same
+        checkpoint (``resume_at``) so the rejected attempt is dropped from the
+        chain; a preamble is continued in the session that produced it. Only
+        after retries exhaust raise a clear provider error for Hermes to
+        surface.
 
         Prose streams live only once an attempt is too long to be a banner or
         preamble (see ``_StreamGate``); shorter answers are emitted after they
@@ -1485,8 +1946,10 @@ class ClaudeCodeSession:
         last_notice = ""
         next_prompt = prompt_text
         next_session_id = session_id
+        next_resume_at = resume_at
         attempts = max(1, int(max_attempts))
         for attempt in range(1, attempts + 1):
+            self._last_turn_checkpoint = None
             gate = (
                 _StreamGate(on_text_chunk, had_tools=had_tools)
                 if on_text_chunk is not None
@@ -1509,6 +1972,10 @@ class ClaudeCodeSession:
                 extra["system_prompt"] = system_prompt
             if keepalive:
                 extra["keepalive"] = True
+            if next_session_id and next_resume_at:
+                extra["resume_at"] = next_resume_at
+            if not persist:
+                extra["persist"] = False
             try:
                 response, reasoning, sid = self._execute(
                     next_prompt,
@@ -1567,13 +2034,26 @@ class ClaudeCodeSession:
                         f"text after {attempts} attempts (not treated as an "
                         f"answer). Detail: {last_notice[:400]}"
                     )
-                # Continue the session that produced the preamble. Replaying
-                # the complete payload would create another paid Claude turn
-                # and can duplicate work already performed by the model.
-                next_session_id = _require_uuid_session_id(
+                # Continue the session that produced the preamble, right after
+                # the preamble. Replaying the complete payload would create
+                # another paid Claude turn and can duplicate work already
+                # performed by the model.
+                continuation_sid = _require_uuid_session_id(
                     sid, where="progress-continuation"
                 )
-                next_prompt = _PROGRESS_CONTINUATION_PROMPT
+                continuation_at = self._last_turn_checkpoint
+                if persist or (
+                    keepalive and self._warm_parked_at(continuation_sid, continuation_at)
+                ):
+                    next_session_id = continuation_sid
+                    next_resume_at = continuation_at
+                    next_prompt = _PROGRESS_CONTINUATION_PROMPT
+                else:
+                    # A stateless one-shot left nothing to resume: re-roll
+                    # the original request instead.
+                    next_session_id = session_id
+                    next_resume_at = resume_at
+                    next_prompt = prompt_text
                 continue
 
             # Confirmed answer — flush whatever was not streamed live.
@@ -1600,6 +2080,8 @@ class ClaudeCodeSession:
         on_event: Any = None,
         system_prompt: str | None = None,
         keepalive: bool = False,
+        resume_at: str | None = None,
+        persist: bool = True,
     ) -> tuple[str, str, str]:
         """Run one request with an abort latch scoped to this exact call."""
 
@@ -1608,6 +2090,7 @@ class ClaudeCodeSession:
                 raise RuntimeError("Concurrent Claude Code request on one session")
             self._request_active = True
             self._abort_requested = False
+        self._last_turn_checkpoint = None
         try:
             result = self._execute_active(
                 prompt_text,
@@ -1621,6 +2104,8 @@ class ClaudeCodeSession:
                 on_event=on_event,
                 system_prompt=system_prompt,
                 keepalive=keepalive,
+                resume_at=resume_at,
+                persist=persist,
             )
             with self._process_lock:
                 if self._abort_requested:
@@ -1644,6 +2129,8 @@ class ClaudeCodeSession:
         effort: str | None,
         system_prompt: str | None,
         stream_partials: bool,
+        resume_at: str | None = None,
+        persist: bool = True,
     ) -> list[str]:
         argv = [
             claude_bin,
@@ -1687,6 +2174,10 @@ class ClaudeCodeSession:
         ]
         if effort:
             argv += ["--effort", _validate_flag_size(str(effort))]
+        if not persist:
+            # Stateless calls (titles, vision, compression, review forks)
+            # leave no transcript under ~/.claude/projects.
+            argv.append("--no-session-persistence")
         if session_id:
             argv += [
                 "--resume",
@@ -1694,6 +2185,14 @@ class ClaudeCodeSession:
                     _require_uuid_session_id(session_id, where="resume-arg")
                 ),
             ]
+            if resume_at and _resume_at_supported:
+                # Load the chain only up to this turn's checkpoint, dropping
+                # anything a failed or superseded attempt appended after it.
+                if not _SESSION_ID_RE.fullmatch(resume_at):
+                    raise RuntimeError(
+                        f"Claude Code checkpoint is not a message uuid: {resume_at!r}"
+                    )
+                argv += ["--resume-session-at", resume_at]
         else:
             import uuid
 
@@ -1714,11 +2213,15 @@ class ClaudeCodeSession:
         on_event: Any = None,
         system_prompt: str | None = None,
         keepalive: bool = False,
+        resume_at: str | None = None,
+        persist: bool = True,
     ) -> tuple[str, str, str]:
         """Send one user turn to ``claude`` and parse its stream-json events.
 
         ``prompt_text`` is the stream-json user ``content``: a string, or a
-        list of text/image blocks. Returns ``(response, reasoning, session_id)``.
+        list of text/image blocks. ``resume_at`` is the checkpoint a resumed
+        ``session_id`` continues from. Returns ``(response, reasoning,
+        session_id)``.
         """
 
         claude_bin = (command or "").strip() or _resolve_claude_command()
@@ -1726,7 +2229,7 @@ class ClaudeCodeSession:
         system_digest = (
             hashlib.sha256(system_prompt.encode("utf-8")).hexdigest() if system_prompt else ""
         )
-        identity = (claude_bin, str(model), effort or "", work_dir, system_digest)
+        identity = (claude_bin, str(model), effort or "", work_dir, system_digest, persist)
         keep_seconds = _keepalive_seconds() if keepalive else 0.0
         input_payload = (
             json.dumps(
@@ -1739,13 +2242,17 @@ class ClaudeCodeSession:
             + "\n"
         )
 
-        # Reuse the parked process when it holds exactly this conversation.
+        # Reuse the parked process when it holds exactly this conversation,
+        # ending at exactly the checkpoint being resumed. A process whose
+        # last turn was rejected or retried ends past it and is replaced by
+        # a cold resume at the checkpoint.
         warm = self._warm
         if warm is not None:
             if (
                 session_id
                 and keep_seconds > 0
                 and warm.session_id == session_id
+                and warm.tip == resume_at
                 and warm.identity == identity
                 and warm.take()
             ):
@@ -1772,6 +2279,8 @@ class ClaudeCodeSession:
             effort=effort,
             system_prompt=system_prompt,
             stream_partials=on_event is not None,
+            resume_at=resume_at,
+            persist=persist,
         )
         process_env = _build_subprocess_env(env)
 
@@ -1941,7 +2450,9 @@ class ClaudeCodeSession:
             warm.close()
             if reused and not stdout.strip():
                 raise _WarmProcessGone("warm Claude Code process exited")
-            stderr = warm.stderr_tail()
+            # The exit reason (expired session, unknown checkpoint) is often
+            # only on stderr; let the drain thread finish reading it.
+            stderr = warm.stderr_tail(wait=2.0)
             if process.returncode not in (0, None):
                 self._raise_process_failure(process.returncode, stdout, stderr, session_id)
             # Clean exit without a result: let the strict parser explain it.
@@ -1956,6 +2467,7 @@ class ClaudeCodeSession:
             raise
         warm.turns += 1
         warm.session_id = sid
+        warm.tip = self._last_turn_checkpoint
         total_cost = self._last_usage.get("_cumulative_cost_usd")
         if isinstance(total_cost, (int, float)):
             warm.cost_total = float(total_cost)
@@ -2025,6 +2537,15 @@ class ClaudeCodeSession:
         if stdout.strip():
             detail_parts.append(stdout.strip()[-1000:])
         detail = "\n".join(detail_parts) if detail_parts else f"exit {returncode}"
+        if session_id and "--resume-session-at" in detail and "unknown option" in detail.lower():
+            global _resume_at_supported
+            _resume_at_supported = False
+            _LOG.warning(
+                "Claude Code CLI rejected --resume-session-at; resuming without "
+                "checkpoints from now on"
+            )
+            # Route to the fresh-session fallback for this request.
+            raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
         if session_id and _is_expired_session_error(detail):
             raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
         # Rate-limit / spend-limit notices arrive as exit 1 with
@@ -2050,6 +2571,7 @@ class ClaudeCodeSession:
             if session_id and _is_expired_session_error(str(exc)):
                 raise ClaudeCodeSessionExpired(str(exc)) from exc
             raise
+        self._last_turn_checkpoint = _last_assistant_uuid(stdout)
         usage = _parse_stream_json_usage(stdout)
         # ``total_cost_usd`` is cumulative for the lifetime of one CLI
         # process; report this turn's share.
@@ -2198,6 +2720,33 @@ def _parse_stream_json_output(stdout: str) -> tuple[str, str, str]:
     response = result_text if result_text.strip() else streamed
     reasoning = "".join(reasoning_parts)
     return response, reasoning, result_session_id
+
+
+def _last_assistant_uuid(stdout: str) -> str | None:
+    """Uuid of the turn's last ``assistant`` chain entry (its checkpoint).
+
+    Claude Code emits one ``assistant`` event per content block (thinking,
+    text), each carrying the ``uuid`` of its transcript chain entry. The last
+    one ends the turn; ``--resume-session-at`` accepts it.
+    """
+
+    checkpoint: str | None = None
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "assistant":
+            value = event.get("uuid")
+            # An unusable last uuid leaves the checkpoint unknown; an earlier
+            # block's uuid would cut the reply off.
+            checkpoint = (
+                value if isinstance(value, str) and _SESSION_ID_RE.fullmatch(value) else None
+            )
+    return checkpoint
 
 
 def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:

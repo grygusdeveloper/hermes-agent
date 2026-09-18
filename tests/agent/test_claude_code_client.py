@@ -228,7 +228,10 @@ class TestIncrementalAndFingerprints:
 
 
 class TestClaudeCodeSession:
-    def test_second_turn_uses_resume_and_only_new_input(self, monkeypatch):
+    def test_second_turn_uses_resume_and_only_new_input(self, monkeypatch, tmp_path):
+        # Cold resume needs a durable (persisted) session: state_key=None calls
+        # run with --no-session-persistence and continue only while warm.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         session = ClaudeCodeSession()
         calls: list[dict] = []
 
@@ -238,13 +241,15 @@ class TestClaudeCodeSession:
 
         monkeypatch.setattr(session, "_execute", fake_execute)
         first = _messages(("system", "rules"), ("user", "first question"))
-        session.run("FULL FIRST PROMPT WITH TOOLS", messages=first, model="sonnet")
+        session.run(
+            "FULL FIRST PROMPT WITH TOOLS", messages=first, model="sonnet", state_key="conv"
+        )
 
         second = first + _messages(
             ("assistant", "answer"),
             ("user", "second question"),
         )
-        session.run("FULL SECOND PROMPT", messages=second, model="sonnet")
+        session.run("FULL SECOND PROMPT", messages=second, model="sonnet", state_key="conv")
 
         assert calls[0]["session_id"] is None
         assert calls[0]["prompt"] == "FULL FIRST PROMPT WITH TOOLS"
@@ -253,7 +258,8 @@ class TestClaudeCodeSession:
         assert "first question" not in calls[1]["prompt"]
         assert "answer" not in calls[1]["prompt"]
 
-    def test_expired_session_retries_with_full_prompt(self, monkeypatch):
+    def test_expired_session_retries_with_full_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         session = ClaudeCodeSession()
         calls: list[dict] = []
 
@@ -267,9 +273,9 @@ class TestClaudeCodeSession:
 
         monkeypatch.setattr(session, "_execute", fake_execute)
         first = _messages(("user", "one"))
-        session.run("FULL1", messages=first, model="sonnet")
+        session.run("FULL1", messages=first, model="sonnet", state_key="conv")
         second = first + _messages(("assistant", "first"), ("user", "two"))
-        response, _ = session.run("FULL2", messages=second, model="sonnet")
+        response, _ = session.run("FULL2", messages=second, model="sonnet", state_key="conv")
         assert response == "recovered"
         assert calls[1]["session_id"] == "12345678-1234-1234-1234-123456789abc"
         assert calls[2]["session_id"] is None
@@ -964,12 +970,22 @@ class TestReviewBlockerRegressions:
         assert "three" in calls_a[0]["prompt"]
         assert "one" not in calls_a[0]["prompt"]
 
-    def test_production_request_factory_shares_session_and_aborts(self):
+    def test_production_request_factory_shares_session_and_aborts(self, monkeypatch, tmp_path):
         """Two-turn continuation through real _create_request_openai_client."""
         from run_agent import AIAgent
         from agent.claude_code_client import ClaudeCodeClient
+        from agent.portal_tags import reset_bridge_state_key, set_bridge_state_key
         from unittest.mock import patch as mock_patch
 
+        # The agent loop publishes a per-agent durable key for tool turns.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        bridge_token = set_bridge_state_key("root|factory-session")
+        try:
+            self._run_production_request_factory_flow(AIAgent, ClaudeCodeClient, mock_patch)
+        finally:
+            reset_bridge_state_key(bridge_token)
+
+    def _run_production_request_factory_flow(self, AIAgent, ClaudeCodeClient, mock_patch):
         agent = AIAgent.__new__(AIAgent)
         agent.provider = "claude-code"
         agent.base_url = "acp://claude-code"

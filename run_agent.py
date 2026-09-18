@@ -370,6 +370,32 @@ def _safe_session_filename_component(session_id: str) -> str:
     return f"{sanitized}_{digest}"
 
 
+def _bridge_state_key_resolver(agent: Any, conversation_root: Optional[str]):
+    """Per-agent durable CLI-bridge state key for ``set_bridge_state_key``.
+
+    Returns ``None`` (stateless) for agents that must never publish bridge
+    state: background-review forks set ``_persist_disabled`` and pin the
+    parent's ``session_id``, so any key derived from it would collide with
+    the parent's. Otherwise returns a resolver for
+    ``"<conversation root>|<current session_id>"``: delegate children and
+    ``/branch`` sessions have their own session ids and therefore their own
+    keys, and resolving at request time follows a compression rotation that
+    happens mid-turn. Works on stand-in agents (``getattr`` only).
+    """
+    if getattr(agent, "_persist_disabled", False):
+        return None
+
+    def _resolve() -> Optional[str]:
+        if getattr(agent, "_persist_disabled", False):
+            return None
+        session_id = getattr(agent, "session_id", None)
+        if not session_id:
+            return None
+        return f"{conversation_root or session_id}|{session_id}"
+
+    return _resolve
+
+
 class _StreamErrorEvent(Exception):
     """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
 
@@ -8023,7 +8049,9 @@ class AIAgent:
         from agent import relay_runtime
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
+            reset_bridge_state_key,
             reset_conversation_context,
+            set_bridge_state_key,
             set_conversation_context,
         )
         from hermes_cli.observability.relay_shared_metrics import (
@@ -8050,6 +8078,7 @@ class AIAgent:
         relay_lease = None
         relay_turn = None
         token = None
+        bridge_token = None
         acct_token = None
         task_started = False
         task_finished = False
@@ -8080,7 +8109,15 @@ class AIAgent:
             # web_extract, session_search, MoA slots, background-review forks
             # (which copy this Context into their thread) — inherits the
             # ``conversation=<root>`` tag with zero per-call-site plumbing.
-            token = set_conversation_context(self._conversation_root_id())
+            conversation_root = self._conversation_root_id()
+            token = set_conversation_context(conversation_root)
+            # The conversation tag above deliberately merges a delegation tree;
+            # durable CLI-bridge state (Claude Code session mapping + file
+            # lock) is per agent instead, so children, /branch siblings and
+            # review forks never overwrite or serialize on the parent's.
+            bridge_token = set_bridge_state_key(
+                _bridge_state_key_resolver(self, conversation_root)
+            )
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
@@ -8164,6 +8201,8 @@ class AIAgent:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    if bridge_token is not None:
+                        reset_bridge_state_key(bridge_token)
                     if token is not None:
                         reset_conversation_context(token)
 

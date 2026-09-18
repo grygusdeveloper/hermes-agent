@@ -1,7 +1,10 @@
 """Integration tests for Claude Code CLI provider against the real binary.
 
 These tests require the installed authenticated Claude Code CLI (2.1.183+).
-They are skipped automatically when ``claude`` is not on PATH.
+They are skipped automatically when ``claude`` is not on PATH. Tests that
+make real model calls (they spend the user's Claude subscription and write
+sessions under ~/.claude/projects) additionally require
+``HERMES_CLAUDE_CODE_LIVE_TESTS=1``.
 """
 
 from __future__ import annotations
@@ -23,6 +26,10 @@ from hermes_cli.runtime_provider import resolve_runtime_provider
 CLAUDE = shutil.which("claude")
 pytestmark = pytest.mark.skipif(
     not CLAUDE, reason="Claude Code CLI not installed on PATH"
+)
+live = pytest.mark.skipif(
+    os.environ.get("HERMES_CLAUDE_CODE_LIVE_TESTS") != "1",
+    reason="real model call; set HERMES_CLAUDE_CODE_LIVE_TESTS=1 to run",
 )
 
 
@@ -54,6 +61,7 @@ def test_runtime_and_auth_resolve_without_exposing_credentials():
         assert "oauth" not in blob.lower() or "source" in blob.lower()
 
 
+@live
 def test_stream_json_stdin_end_to_end_exact_reply(tmp_path):
     session = ClaudeCodeSession()
     marker = f"CC_INT_{uuid.uuid4().hex[:8]}"
@@ -76,7 +84,12 @@ def test_stream_json_stdin_end_to_end_exact_reply(tmp_path):
     print(f"E2E_REASONING_LEN={len(reasoning or '')}")
 
 
-def test_session_resume_preserves_server_memory(tmp_path):
+@live
+def test_session_resume_preserves_server_memory(tmp_path, monkeypatch):
+    # Cold resume needs a persisted session, i.e. a durable state key;
+    # state_key=None calls run with --no-session-persistence.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    state_key = f"integration|{uuid.uuid4().hex}"
     session = ClaudeCodeSession()
     secret = f"SECRET_{uuid.uuid4().hex[:6].upper()}"
     first_prompt = (
@@ -94,6 +107,8 @@ def test_session_resume_preserves_server_memory(tmp_path):
         effort="low",
         timeout_seconds=120,
         cwd=str(tmp_path),
+        state_key=state_key,
+        keepalive=False,
     )
     assert "GOT_IT" in r1
     assert session._session_id
@@ -114,6 +129,8 @@ def test_session_resume_preserves_server_memory(tmp_path):
         effort="low",
         timeout_seconds=120,
         cwd=str(tmp_path),
+        state_key=state_key,
+        keepalive=False,
     )
     assert secret in r2
     assert session._session_id == first_sid
@@ -121,6 +138,7 @@ def test_session_resume_preserves_server_memory(tmp_path):
     print(f"RESUME_REPLY={r2!r}")
 
 
+@live
 def test_native_tools_disabled_emits_hermes_tool_call_blocks(tmp_path):
     client = ClaudeCodeClient(cwd=str(tmp_path))
     response = client.chat.completions.create(
@@ -155,8 +173,10 @@ def test_native_tools_disabled_emits_hermes_tool_call_blocks(tmp_path):
     args = json.loads(tc.function.arguments)
     assert "tokyo" in str(args.get("city", "")).lower()
     print(f"TOOL_CALL={tc.function.name} args={args}")
+    client.close()  # tool turns keep a warm process parked
 
 
+@live
 def test_client_create_and_close_cleanup(tmp_path):
     client = ClaudeCodeClient(cwd=str(tmp_path))
     resp = client.chat.completions.create(
@@ -248,6 +268,7 @@ def test_command_line_never_contains_prompt_body(tmp_path, monkeypatch):
     assert "--tools" in captured["command"]
     assert captured["command"][captured["command"].index("--tools") + 1] == ""
 
+@live
 def test_tools_flag_disables_all_native_tools_live():
     """Prove --tools "" yields empty tools[] on Claude Code 2.1.x system/init."""
     import json
