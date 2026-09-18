@@ -519,8 +519,10 @@ class ClaudeCodeClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        # Prefer per-request effort kwargs, then configured agent effort.
-        effort = _resolve_effort_from_kwargs(kwargs) or _resolve_effort()
+        # The agent sends its resolved reasoning config (per-model override,
+        # /reasoning, presets); calls without one (titles, compression) use
+        # the configured default for the model.
+        effort, thinking = _resolve_reasoning(kwargs, model)
         tools_digest = _tools_digest(tools, tool_choice=tool_choice)
 
         # Durable Claude Code continuity is scoped per Hermes agent (main
@@ -547,6 +549,8 @@ class ClaudeCodeClient:
             # tool presence travels explicitly.
             has_tools=bool(tools),
         )
+        if thinking:
+            run_kwargs["thinking"] = thinking
         if prompt_images:
             run_kwargs["prompt_images"] = prompt_images
         now_label = _current_time_label()
@@ -848,50 +852,113 @@ def _completion_usage(raw: dict[str, Any] | None, *, retry: dict[str, Any] | Non
         total_cost_usd=usage.get("total_cost_usd"),
         service_tier=usage.get("service_tier"),
         hermes_retry_usage=_completion_usage(retry) if retry else None,
+        # Model calls summed into a retry usage (None on a request's own).
+        attempts=_positive_int(usage.get("attempts")),
+        # The model's context window as Claude Code runs it (``modelUsage``);
+        # the conversation loop syncs Hermes's compressor to it.
+        context_window=_positive_int(usage.get("context_window")),
     )
+
+
+def _positive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+# ``--effort`` choices of Claude Code 2.1.x. Hermes levels outside them map
+# to the nearest one: "ultracode" is xhigh plus Claude Code's own workflow
+# orchestration (its native tools are off here), "ultra" the top level.
+_CLI_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_EFFORT_ALIASES = {"minimal": "low", "ultra": "max", "ultracode": "xhigh"}
+_REASONING_OFF = frozenset({"none", "off", "false", "disabled", "no"})
+
+
+def _normalize_effort(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().lower()
+    normalized = _EFFORT_ALIASES.get(normalized, normalized)
+    return normalized if normalized in _CLI_EFFORTS else None
+
+
+def _reasoning_flags(config: Any) -> tuple[str | None, str | None]:
+    """``(effort, thinking)`` for a Hermes reasoning config dict.
+
+    ``{"enabled": False}`` (``/reasoning none``, ``reasoning_effort: false``)
+    turns thinking off and uses the lowest effort; otherwise the effort maps
+    to a CLI level and thinking stays Claude Code's default (adaptive).
+    """
+
+    if not isinstance(config, dict):
+        return None, None
+    if config.get("enabled") is False:
+        return "low", "disabled"
+    return _normalize_effort(config.get("effort")), None
+
+
+def _explicit_reasoning(kwargs: dict[str, Any]) -> tuple[str | None, str | None] | None:
+    """The reasoning a request carries itself, or None when it names none."""
+
+    for key in ("effort", "reasoning_effort"):
+        value = kwargs.get(key)
+        if isinstance(value, str) and value.strip():
+            if value.strip().lower() in _REASONING_OFF:
+                return "low", "disabled"
+            effort = _normalize_effort(value)
+            if effort:
+                return effort, None
+    reasoning = kwargs.get("reasoning")
+    if not isinstance(reasoning, dict):
+        extra_body = kwargs.get("extra_body")
+        reasoning = extra_body.get("reasoning") if isinstance(extra_body, dict) else None
+    if isinstance(reasoning, dict):
+        return _reasoning_flags(reasoning)
+    return None
+
+
+def _resolve_reasoning(kwargs: dict[str, Any], model: str | None = None) -> tuple[str | None, str | None]:
+    """``(effort, thinking)`` for one request.
+
+    The agent passes its resolved ``reasoning`` config (per-model
+    ``reasoning_overrides``, a ``/reasoning`` session override, a preset);
+    that is authoritative, even when it names no effort. Only calls that carry
+    no reasoning at all (auxiliary titles, compression, vision) fall back to
+    the configured default for ``model``.
+    """
+
+    explicit = _explicit_reasoning(kwargs)
+    if explicit is not None:
+        return explicit
+    return _reasoning_flags(_configured_reasoning(model))
 
 
 def _resolve_effort_from_kwargs(kwargs: dict[str, Any]) -> str | None:
     """Pull effort from OpenAI-style / Hermes kwargs when present."""
 
-    for key in ("effort", "reasoning_effort"):
-        value = kwargs.get(key)
-        if isinstance(value, str) and value.strip():
-            normalized = value.strip().lower()
-            if normalized in {"low", "medium", "high", "xhigh", "max", "ultracode"}:
-                return normalized
-    reasoning = kwargs.get("reasoning")
-    if isinstance(reasoning, dict):
-        value = reasoning.get("effort")
-        if isinstance(value, str) and value.strip():
-            normalized = value.strip().lower()
-            if normalized in {"low", "medium", "high", "xhigh", "max", "ultracode"}:
-                return normalized
-    return None
+    explicit = _explicit_reasoning(kwargs)
+    return explicit[0] if explicit is not None else None
 
 
-def _resolve_effort() -> str | None:
-    """Resolve the configured reasoning effort for the active agent, if any.
-
-    Reads the agent's configured ``reasoning_effort`` without importing the
-    full agent runtime (keeps this module import-light).
-    """
+def _configured_reasoning(model: str | None = None) -> dict[str, Any] | None:
+    """The configured reasoning for ``model`` (per-model override first)."""
 
     try:
         from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
 
-        config = load_config() or {}
-        agent_cfg = config.get("agent") or {}
-        if isinstance(agent_cfg, dict):
-            effort = agent_cfg.get("reasoning_effort")
-            if isinstance(effort, str) and effort.strip():
-                normalized = effort.strip().lower()
-                # Claude Code also exposes Ultracode as its workflow-aware top tier.
-                if normalized in {"low", "medium", "high", "xhigh", "max", "ultracode"}:
-                    return normalized
+        return resolve_reasoning_config(load_config() or {}, model or "")
     except Exception:
-        pass
-    return None
+        return None
+
+
+def _resolve_effort(model: str | None = None) -> str | None:
+    """Resolve the configured reasoning effort for ``model``, if any.
+
+    Reads ``agent.reasoning_overrides`` then ``agent.reasoning_effort``
+    without importing the full agent runtime (keeps this module
+    import-light).
+    """
+
+    return _reasoning_flags(_configured_reasoning(model))[0]
 
 
 def _build_subprocess_env() -> dict[str, str]:

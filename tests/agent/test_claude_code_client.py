@@ -64,8 +64,10 @@ def _messages(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     return [{"role": role, "content": content} for role, content in pairs]
 
 
-def test_claude_code_accepts_ultracode_effort_from_reasoning_kwargs():
-    assert _resolve_effort_from_kwargs({"reasoning": {"effort": "ultracode"}}) == "ultracode"
+def test_claude_code_maps_ultracode_effort_to_a_cli_level():
+    # ``--effort`` accepts only low|medium|high|xhigh|max (2.1.276);
+    # ultracode is xhigh plus Claude Code's own workflow orchestration.
+    assert _resolve_effort_from_kwargs({"reasoning": {"effort": "ultracode"}}) == "xhigh"
 
 
 class TestClaudeCodePromptUX:

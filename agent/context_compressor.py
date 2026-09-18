@@ -2438,6 +2438,29 @@ class ContextCompressor(ContextEngine):
             return None
         return ivalue if ivalue > 0 else None
 
+    @staticmethod
+    def _coerce_provider_threshold_tokens(value: Any) -> dict[str, int]:
+        """Normalize ``{provider: cap}``; non-positive or bad caps are dropped."""
+        if not isinstance(value, dict):
+            return {}
+        caps: dict[str, int] = {}
+        for provider, cap in value.items():
+            if isinstance(cap, bool):
+                continue
+            coerced = ContextCompressor._coerce_threshold_tokens_cap(cap)
+            if coerced is not None:
+                caps[str(provider).strip().lower()] = coerced
+        return caps
+
+    def _effective_threshold_tokens_cap(self) -> int | None:
+        """The lower of the global cap and the active provider's cap."""
+        caps = [self.threshold_tokens_cap] if self.threshold_tokens_cap else []
+        provider_caps = getattr(self, "provider_threshold_tokens", None) or {}
+        provider_cap = provider_caps.get((getattr(self, "provider", "") or "").strip().lower())
+        if provider_cap:
+            caps.append(provider_cap)
+        return min(caps) if caps else None
+
     def _apply_threshold_tokens_cap(self) -> None:
         """Apply the absolute token cap if configured.
 
@@ -2446,9 +2469,12 @@ class ContextCompressor(ContextEngine):
         than the user's preferred absolute token count. The cap itself
         is clamped to the current context length so a cap larger than
         the model's window is a no-op (the ratio-based threshold wins).
+        The cap is the global ``threshold_tokens`` and/or the active
+        provider's ``provider_threshold_tokens`` entry, whichever is lower.
         """
-        if self.threshold_tokens_cap is not None and self.threshold_tokens_cap > 0:
-            _effective_cap = min(self.threshold_tokens_cap, self.context_length)
+        _cap = self._effective_threshold_tokens_cap()
+        if _cap is not None and _cap > 0:
+            _effective_cap = min(_cap, self.context_length)
             if _effective_cap < self.threshold_tokens:
                 self.threshold_tokens = _effective_cap
 
@@ -2528,6 +2554,7 @@ class ContextCompressor(ContextEngine):
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
         threshold_tokens_cap: Any = None,
+        provider_threshold_tokens: dict[str, Any] | None = None,
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
@@ -2558,6 +2585,13 @@ class ContextCompressor(ContextEngine):
         # re-applied in update_model() so it survives model switches/fallbacks.
         self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(
             threshold_tokens_cap,
+        )
+        # Provider-scoped absolute caps (compression.provider_threshold_tokens,
+        # e.g. {"claude-code": 250000}): apply only while that provider is
+        # active, so a fallback or /model switch to another provider keeps its
+        # own threshold. Combined with the global cap (lower wins).
+        self.provider_threshold_tokens = self._coerce_provider_threshold_tokens(
+            provider_threshold_tokens,
         )
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n

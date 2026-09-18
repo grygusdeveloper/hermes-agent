@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -54,6 +55,7 @@ class FailoverReason(enum.Enum):
 
     # Model / provider policy
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
+    provider_unavailable = "provider_unavailable"  # Local provider runtime cannot start (CLI missing / not executable) — fail fast, fallback
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
 
@@ -747,6 +749,10 @@ def classify_api_error(
             retryable=False,
             should_fallback=False,
         )
+    if provider_lower == "claude-code":
+        classified = _classify_claude_code(error_msg, error_code, body, _result)
+        if classified is not None:
+            return classified
 
     # Anthropic thinking block recovery (400).  Two distinct failure modes,
     # same recovery (strip all reasoning_details and retry without thinking
@@ -1016,6 +1022,67 @@ def classify_api_error(
     # ── 9. Fallback: unknown ────────────────────────────────────────
 
     return _result(FailoverReason.unknown, retryable=True)
+
+
+# ── Claude Code bridge ──────────────────────────────────────────────────
+
+# Subscription-limit wording of the Claude Code CLI and the bridge's own
+# errors once its in-session retries are spent ("You've hit your session
+# limit · resets 3pm", "soft usage/limit notice after 3 attempts").
+_CLAUDE_CODE_LIMIT_PATTERNS = [
+    "soft usage/limit notice",
+    "claude code rate-limit result",
+    "limit · resets",
+    "usage limit reached",
+]
+_CLAUDE_CODE_LIMIT_BANNER_RE = re.compile(r"\bhit your (?:[\w-]+ ){0,3}limit\b")
+
+
+def _classify_claude_code(
+    error_msg: str, error_code: str, body: dict, result_fn,
+) -> Optional[ClassifiedError]:
+    """Claude Code bridge failures the generic pipeline would mislabel.
+
+    Both are deterministic for this request: the bridge already retried what
+    retrying can fix, so Hermes must not burn its own retries (each one a CLI
+    start) before falling back.
+    """
+
+    # The CLI is missing or not executable (a stale versioned path after an
+    # auto-update): every retry fails identically. The error text is kept
+    # for the final response if the fallback fails too.
+    if (
+        "claude code cli not launchable" in error_msg
+        or "claude code cli not found" in error_msg
+    ):
+        return result_fn(
+            FailoverReason.provider_unavailable,
+            retryable=False,
+            should_fallback=True,
+        )
+    # Subscription limit. ``usage_limit_reached`` holds until the reset the
+    # body names; the text patterns cover status-less errors. There is no
+    # credential pool for the CLI's OAuth login, so never rotate.
+    if (error_code or "").lower() == "usage_limit_reached" or (
+        any(p in error_msg for p in _CLAUDE_CODE_LIMIT_PATTERNS)
+        or _CLAUDE_CODE_LIMIT_BANNER_RE.search(error_msg)
+    ):
+        context: Dict[str, Any] = {"usage_limit": True}
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            for key in ("rate_limit_type", "resets_at", "resets_in_seconds"):
+                if err.get(key) is not None:
+                    context[key] = err[key]
+            if (error_code or "").lower() == "usage_limit_reached":
+                context["hard"] = True
+        return result_fn(
+            FailoverReason.rate_limit,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=True,
+            error_context=context,
+        )
+    return None
 
 
 # ── Status code classification ──────────────────────────────────────────

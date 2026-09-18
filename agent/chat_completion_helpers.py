@@ -228,6 +228,27 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _is_keepalive_chunk(chunk: Any) -> bool:
+    """True for a chunk that carries nothing: no content, reasoning, tool
+    calls, role, finish reason or usage (a liveness tick)."""
+
+    if getattr(chunk, "usage", None) is not None:
+        return False
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return False
+    for choice in choices:
+        if getattr(choice, "finish_reason", None) is not None:
+            return False
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        for field in ("role", "content", "tool_calls", "reasoning_content", "reasoning"):
+            if getattr(delta, field, None):
+                return False
+    return True
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters.
 
@@ -1568,7 +1589,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    _kwargs = _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -1604,6 +1625,32 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
     )
+    _add_claude_code_reasoning(agent, _kwargs)
+    return _kwargs
+
+
+def _is_claude_code_agent(agent) -> bool:
+    return (getattr(agent, "provider", "") or "").strip().lower() == "claude-code" or str(
+        getattr(agent, "base_url", "") or ""
+    ).strip().lower().startswith("acp://claude-code")
+
+
+def _add_claude_code_reasoning(agent, kwargs: dict) -> None:
+    """Hand the agent's resolved reasoning config to the Claude Code bridge.
+
+    The chat-completions transport only emits reasoning for providers that
+    take it in ``extra_body``; ``claude-code`` is not one, so without this the
+    bridge fell back to the global ``agent.reasoning_effort`` and ignored
+    per-model ``reasoning_overrides``, ``/reasoning`` and presets. The bridge
+    maps it to ``--effort`` (and ``--thinking disabled`` when reasoning is
+    off); only ``ClaudeCodeClient`` ever sees this key.
+    """
+
+    if not _is_claude_code_agent(agent):
+        return
+    config = getattr(agent, "reasoning_config", None)
+    if isinstance(config, dict):
+        kwargs["reasoning"] = dict(config)
 
 
 
@@ -2477,6 +2524,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
             if _lm_reasoning_effort is not None:
                 summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+            _add_claude_code_reasoning(agent, summary_kwargs)
 
             # Merge the profile's canonical body even when routing is unset:
             # profiles may always emit required metadata such as Portal tags.
@@ -3404,7 +3452,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # interrupted by diagnostic accounting.
             try:
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
-                if _diag.get("first_chunk_at") is None:
+                # Keep-alive chunks (the Claude Code bridge yields all-empty
+                # deltas while Claude writes tool-call JSON or thinks) keep
+                # the stream alive but are not a first token.
+                if _diag.get("first_chunk_at") is None and not _is_keepalive_chunk(chunk):
                     _diag["first_chunk_at"] = last_chunk_time["t"]
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full

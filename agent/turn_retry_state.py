@@ -73,6 +73,11 @@ class TurnRetryState:
     # credential-refresh attempt above failed) to the fallback chain, so we
     # don't loop on the same auth failover within one attempt.
     auth_failover_attempted: bool = False
+    # Why the primary provider failed, kept when Hermes switches to a
+    # fallback for it (Claude Code: a subscription limit with its reset time,
+    # a CLI that cannot start). A fallback that fails too reports it first
+    # instead of hiding it behind its own error.
+    primary_failure_notice: str = ""
 
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False

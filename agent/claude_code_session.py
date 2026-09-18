@@ -24,8 +24,8 @@ Design invariants
   (``--tools ""``).  All tool execution stays under Hermes logging,
   permissions, MCP, and approvals.  Hermes injects its tool schemas into the
   prompt and parses ``<tool_call>`` blocks back out of the response.
-* **Exact model + effort** — ``--model`` and ``--effort`` are forwarded on
-  every turn.
+* **Exact model + effort** — ``--model`` and ``--effort`` (plus ``--thinking
+  disabled`` when Hermes turned reasoning off) are forwarded on every turn.
 * **No credential exposure** — authentication is delegated entirely to the
   already-authenticated Claude Code CLI; this module never reads, passes, or
   logs credentials.
@@ -52,11 +52,19 @@ Design invariants
   replaying the whole transcript. An identical re-send is repaired inside the
   session. A parked warm process is reused only when its in-memory tip is the
   checkpoint being resumed.
-* **Durable identity** — model, effort, the tool surface digest and the
-  digest of the complete system prompt. Claude Code snapshots the system
-  prompt on a conversation's first request and replays that record on every
-  resume (``--system-prompt-snapshot`` defaults on), so a changed system
-  prompt must start a fresh session rather than silently keep the old one.
+* **Durable identity** — model, the tool surface digest and the digest of
+  the complete system prompt. Claude Code snapshots the system prompt on a
+  conversation's first request and replays that record on every resume
+  (``--system-prompt-snapshot`` defaults on), so a changed system prompt
+  must start a fresh session rather than silently keep the old one. Effort
+  and thinking mode are per-invocation flags, not transcript state: a
+  ``/reasoning`` change resumes the same session in a new process (they are
+  part of the warm-process identity only).
+* **Errors Hermes can classify** — API failures the CLI reports carry their
+  HTTP status (``ClaudeCodeAPIError``); a subscription limit that holds until
+  a reset is never retried (``ClaudeCodeUsageLimitError``, and later calls
+  for the model fail fast until the reset); a CLI that cannot be launched
+  raises ``ClaudeCodeLaunchError``.
 * **Per-agent state** — callers pass one ``state_key`` per Hermes agent (see
   ``agent.portal_tags.get_bridge_state_key``); ``state_key=None`` calls are
   stateless: they run with ``--no-session-persistence``, never publish, and
@@ -82,7 +90,9 @@ import signal
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 # Claude Code's stream-json output requires ``--verbose``; we always pass it.
@@ -122,6 +132,12 @@ _resume_at_supported = True
 # (``off`` sends no flag). Turned off for the process if a CLI rejects it.
 _THINKING_DISPLAY_CHOICES = frozenset({"summarized", "omitted"})
 _thinking_display_supported = True
+# ``--thinking <mode>`` is hidden too (2.1.276 choices: enabled, adaptive,
+# disabled). Hermes sends ``disabled`` when reasoning is turned off
+# (``/reasoning none``, ``reasoning_effort: false``); turned off for the
+# process if a CLI rejects it.
+_THINKING_MODES = frozenset({"enabled", "adaptive", "disabled"})
+_thinking_mode_supported = True
 # A graceful interrupt (stream-json ``control_request`` "interrupt") ends the
 # turn and keeps the warm process; the CLI answers within ~100 ms. If the turn
 # has not ended after this grace, the process group is killed.
@@ -2204,12 +2220,93 @@ class _CliFlagRejected(RuntimeError):
     """The CLI rejected an optional flag before reading the request."""
 
 
-class ClaudeCodeSoftLimitNotice(RuntimeError):
+class ClaudeCodeLaunchError(RuntimeError):
+    """The Claude Code CLI cannot be started (missing, not executable, or an
+    unusable working directory).
+
+    Deterministic until the installation or configuration is fixed, so Hermes
+    never retries it. Deliberately not an ``OSError``: the error classifier
+    treats those as transient transport failures.
+    """
+
+
+# Anthropic error types by HTTP status, for results that name no type.
+_API_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    500: "api_error",
+    529: "overloaded_error",
+}
+
+
+def _api_error_body(status: int | None, code: str | None, message: str) -> dict[str, Any]:
+    kind = code or _API_ERROR_TYPES.get(status or 0) or "api_error"
+    return {"error": {"type": kind, "message": message}}
+
+
+class ClaudeCodeAPIError(RuntimeError):
+    """A Claude Code turn failed with an API error the CLI reported.
+
+    Carries the result's ``api_error_status`` as ``status_code`` and an
+    Anthropic-style error ``body`` (also via ``response.json()``), so Hermes's
+    error classifier routes it like a direct API error: 401 auth, 429 rate
+    limit, 500 server error, 529 overload. ``detail`` is the CLI's own text.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        body: dict[str, Any] | None = None,
+        detail: str = "",
+    ) -> None:
+        super().__init__(message)
+        valid = isinstance(status_code, int) and not isinstance(status_code, bool)
+        self.status_code = status_code if valid else None
+        self.body = body if isinstance(body, dict) else {}
+        self.detail = detail or ""
+        payload = self.body
+        self.response = SimpleNamespace(
+            status_code=self.status_code, headers={}, json=lambda: payload
+        )
+
+
+class ClaudeCodeSoftLimitNotice(ClaudeCodeAPIError):
     """Claude Code returned a soft billing/limit notice as successful content.
 
     This is a *warning*, not a hard transport failure. Callers should retry the
-    same turn rather than treating the notice text as the model answer.
+    same turn rather than treating the notice text as the model answer —
+    unless the subscription window is exhausted until a reset (see
+    ``ClaudeCodeUsageLimitError``).
     """
+
+
+class ClaudeCodeUsageLimitError(ClaudeCodeAPIError):
+    """The Claude subscription limit is reached and holds until a reset.
+
+    HTTP 429 with an error body of type ``usage_limit_reached`` that names the
+    window (``rate_limit_type``) and its reset (``resets_at``,
+    ``resets_in_seconds``). Never retried by the bridge; the message reads
+    "Claude 5-hour session limit reached — resets 15:00 CEST (in ~2h 10m)".
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        body: dict[str, Any],
+        detail: str = "",
+        resets_at: float | None = None,
+        rate_limit_type: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=429, body=body, detail=detail)
+        self.resets_at = resets_at
+        self.rate_limit_type = rate_limit_type
 
 
 # Soft notices Claude Code may emit as a normal successful ``result`` string.
@@ -2227,7 +2324,163 @@ _SOFT_LIMIT_MARKERS = (
     "hit your usage limit",
     "rate limit reached",
     "too many requests",
+    "limit · resets",
 )
+# Claude Code's own subscription-limit wording (2.1.x): "You've hit your
+# limit", "You've hit your session limit · resets 3pm (UTC)", "You've hit
+# your weekly limit · resets Mon 9am", "usage limit reached · continues
+# automatically when it resets".
+_LIMIT_BANNER_RE = re.compile(r"\bhit your ((?:[\w-]+ ){0,3})limit\b", re.IGNORECASE)
+# ...and the part that says the window only lifts at its reset: retrying the
+# request before then cannot succeed.
+_HARD_LIMIT_TEXT_RE = re.compile(
+    r"(?:\bhit your (?:[\w-]+ ){0,3}limit|\blimit reached)\s*[·•-]\s*"
+    r"(?:resets\b|continues automatically)",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_LABELS = {
+    "five_hour": "5-hour session limit",
+    "seven_day": "weekly limit",
+    "seven_day_opus": "weekly Opus limit",
+    "seven_day_sonnet": "weekly Sonnet limit",
+    "seven_day_overage_included": "weekly limit",
+    "overage": "extra-usage limit",
+}
+# After a hard limit, calls for the same model fail fast without starting the
+# CLI until the reset, but a real call re-checks at least this often (extra
+# usage bought meanwhile, a window lifted early).
+_USAGE_LIMIT_RECHECK_SECONDS = 600.0
+_USAGE_LIMIT_LOCK = threading.Lock()
+# model -> (blocked until, rate_limit_info, CLI text)
+_USAGE_LIMIT_BLOCKS: dict[str, tuple[float, dict[str, Any], str]] = {}
+
+
+def _epoch_seconds(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return float(value) / 1000.0 if value > 1e12 else float(value)
+
+
+def _overage_usable(info: dict[str, Any]) -> bool:
+    """Extra usage still serves requests once the plan window is exhausted."""
+
+    return info.get("isUsingOverage") is True or str(info.get("overageStatus") or "") in {
+        "allowed",
+        "allowed_warning",
+    }
+
+
+def _reset_label(resets_at: float | None, now: float | None = None) -> str:
+    """``15:00 CEST (in ~2h 10m)`` in Hermes's timezone; "" when unknown."""
+
+    if resets_at is None:
+        return ""
+    now = time.time() if now is None else now
+    remaining = max(0, int(resets_at - now))
+    days, rest = divmod(remaining, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        span = f"{days}d {hours}h"
+    elif hours:
+        span = f"{hours}h {minutes:02d}m"
+    else:
+        span = f"{max(1, minutes)}m"
+    try:
+        try:
+            from hermes_time import now as _hermes_now
+
+            zone = _hermes_now().tzinfo
+        except Exception:
+            zone = None
+        moment = (
+            datetime.fromtimestamp(resets_at, zone)
+            if zone is not None
+            else datetime.fromtimestamp(resets_at).astimezone()
+        )
+        today = datetime.fromtimestamp(now, moment.tzinfo).date()
+        clock = moment.strftime("%H:%M" if moment.date() == today else "%a %H:%M")
+        if moment.tzname():
+            clock += f" {moment.tzname()}"
+    except Exception:
+        return f"in ~{span}"
+    return f"{clock} (in ~{span})"
+
+
+def _limit_window(info: dict[str, Any]) -> tuple[str | None, float | None]:
+    """``(rateLimitType, reset epoch seconds)`` of a ``rate_limit_info``."""
+
+    kind = info.get("rateLimitType") if isinstance(info.get("rateLimitType"), str) else None
+    resets_at = _epoch_seconds(info.get("resetsAt"))
+    windows = info.get("unifiedWindows")
+    if resets_at is None and kind and isinstance(windows, dict) and isinstance(windows.get(kind), dict):
+        resets_at = _epoch_seconds(windows[kind].get("resetsAt"))
+    return kind, resets_at
+
+
+def _usage_limit_error(info: dict[str, Any], cli_text: str) -> ClaudeCodeUsageLimitError:
+    """Build the error for a subscription limit that holds until its reset.
+
+    ``info`` is the CLI's ``rate_limit_info`` for the rejection ({} when only
+    the CLI's text says so); the window's name and reset come from it, else
+    from the text.
+    """
+
+    kind, resets_at = _limit_window(info)
+    label = _RATE_LIMIT_LABELS.get(kind or "", "")
+    if not label:
+        named = _LIMIT_BANNER_RE.search(cli_text or "")
+        label = f"{named.group(1)}limit" if named and named.group(1).strip() else "usage limit"
+    detail = " ".join((cli_text or "").split())[:300]
+    when = _reset_label(resets_at)
+    message = f"Claude {label} reached" + (f" — resets {when}" if when else "")
+    if detail and not when:
+        message += f" ({detail})"
+    now = time.time()
+    body = {
+        "error": {
+            "type": "usage_limit_reached",
+            "message": message,
+            "rate_limit_type": kind,
+            "resets_at": resets_at,
+            "resets_in_seconds": max(0, int(resets_at - now)) if resets_at else None,
+        }
+    }
+    return ClaudeCodeUsageLimitError(
+        message, body=body, detail=detail, resets_at=resets_at, rate_limit_type=kind
+    )
+
+
+def _block_usage_limit(model: str, info: dict[str, Any], cli_text: str) -> None:
+    now = time.time()
+    until = now + _USAGE_LIMIT_RECHECK_SECONDS
+    _kind, resets_at = _limit_window(info)
+    if resets_at is not None:
+        until = min(until, resets_at)
+    if until <= now:
+        return
+    with _USAGE_LIMIT_LOCK:
+        _USAGE_LIMIT_BLOCKS[str(model)] = (until, dict(info), cli_text)
+
+
+def _usage_limit_block(model: str) -> ClaudeCodeUsageLimitError | None:
+    """The error to fail with right away while ``model`` is limited."""
+
+    with _USAGE_LIMIT_LOCK:
+        entry = _USAGE_LIMIT_BLOCKS.get(str(model))
+        if entry is None:
+            return None
+        if entry[0] <= time.time():
+            _USAGE_LIMIT_BLOCKS.pop(str(model), None)
+            return None
+    return _usage_limit_error(entry[1], entry[2])
+
+
+def clear_usage_limit_blocks() -> None:
+    """Forget every recorded subscription limit (the next call re-checks)."""
+
+    with _USAGE_LIMIT_LOCK:
+        _USAGE_LIMIT_BLOCKS.clear()
 
 
 def _is_soft_limit_detail(detail: str) -> bool:
@@ -2249,7 +2502,29 @@ def _is_soft_limit_detail(detail: str) -> bool:
     if 'api_error_status":429' in lower or 'api_error_status": 429' in lower:
         return True
     # Known soft-limit banner text embedded in the result.
-    return any(marker in lower for marker in _SOFT_LIMIT_MARKERS)
+    return any(marker in lower for marker in _SOFT_LIMIT_MARKERS) or bool(
+        _LIMIT_BANNER_RE.search(lower)
+    )
+
+
+def _soft_limit_exhausted(
+    attempts: int, notice: str, cause: ClaudeCodeAPIError | None
+) -> ClaudeCodeAPIError:
+    """The error once soft limit notices used up the retry budget (HTTP 429
+    unless the CLI reported another status)."""
+
+    message = (
+        "Claude Code CLI returned a soft usage/limit notice "
+        f"after {attempts} attempts (not treated as an answer). "
+        f"Detail: {notice[:400]}"
+    )
+    status = (cause.status_code if cause is not None else None) or 429
+    body = (cause.body if cause is not None else None) or _api_error_body(
+        status, None, (cause.detail if cause is not None else "") or notice[:400]
+    )
+    return ClaudeCodeAPIError(
+        message, status_code=status, body=body, detail=cause.detail if cause else notice
+    )
 
 
 def _is_expired_session_error(detail: str) -> bool:
@@ -2273,7 +2548,9 @@ def _is_soft_limit_notice(text: str) -> bool:
     if len(body) > 600:
         return False
     normalized = body.lower()
-    if not any(marker in normalized for marker in _SOFT_LIMIT_MARKERS):
+    if not any(marker in normalized for marker in _SOFT_LIMIT_MARKERS) and not (
+        _LIMIT_BANNER_RE.search(normalized)
+    ):
         return False
     # Prefer high-confidence patterns: short banner-like lines.
     line_count = body.count("\n") + 1
@@ -3022,6 +3299,7 @@ class ClaudeCodeSession:
         now_label: str | None = None,
         cancel_event: threading.Event | None = None,
         on_activity: Any = None,
+        thinking: str | None = None,
     ) -> tuple[str, str]:
         """Return ``(response, reasoning)`` using the durable Claude Code session.
 
@@ -3048,6 +3326,15 @@ class ClaudeCodeSession:
 
         ``cancel_event`` cancels this run only (see :meth:`abort_run`);
         :meth:`abort` cancels every run of the session.
+
+        ``effort`` and ``thinking`` (``"disabled"`` turns thinking off) are
+        per-invocation CLI flags: changing them resumes the same session in
+        a new process rather than starting over.
+
+        Raises ``ClaudeCodeUsageLimitError`` without starting the CLI while
+        ``model`` is known to be at a subscription limit (see
+        ``_usage_limit_block``); ``ClaudeCodeAPIError`` for API failures the
+        CLI reported, ``ClaudeCodeLaunchError`` when the CLI cannot start.
 
         The returned ``response`` is the reply cut at the end of its first
         run of tool calls (see :func:`_parse_claude_reply`); when its calls
@@ -3086,6 +3373,7 @@ class ClaudeCodeSession:
                     cancel=cancel,
                     on_activity=on_activity,
                     waited_ms=waited_ms,
+                    thinking=thinking,
                 )
         finally:
             with self._process_lock:
@@ -3114,8 +3402,15 @@ class ClaudeCodeSession:
         cancel: threading.Event,
         on_activity: Any,
         waited_ms: int,
+        thinking: str | None = None,
     ) -> tuple[str, str]:
         started = time.monotonic()
+        limited = _usage_limit_block(model)
+        if limited is not None:
+            # The account is at a subscription limit for this model: the CLI
+            # would only print the same notice again.
+            _LOG.info("Claude Code not started: %s", limited)
+            raise limited
         current = _message_fingerprint(messages)
         normalized_effort = effort.strip() if isinstance(effort, str) and effort.strip() else None
         normalized_tools = tools_digest if isinstance(tools_digest, str) else ""
@@ -3181,6 +3476,8 @@ class ClaudeCodeSession:
             had_tools=had_tools,
             cancel=cancel,
         )
+        if thinking in _THINKING_MODES:
+            call_kwargs["thinking"] = thinking
         if on_reasoning_chunk is not None:
             call_kwargs["on_reasoning_chunk"] = on_reasoning_chunk
         if on_activity is not None:
@@ -3313,11 +3610,14 @@ class ClaudeCodeSession:
         previous = self._previous_messages
         previous_count = len(previous)
         checkpoints = self._checkpoints
+        # Effort is not part of the durable identity: it is a per-invocation
+        # flag, not transcript state, so a /reasoning change resumes the same
+        # session in a new process (the warm-process identity holds it)
+        # instead of replaying the whole transcript uncached.
         changed = [
             name
             for name, bound, wanted in (
                 ("model", self._bound_model, model),
-                ("effort", self._bound_effort, effort),
                 ("tools", self._bound_tools_digest, tools_digest),
                 ("system_prompt", self._bound_system_digest, system_digest),
             )
@@ -3596,6 +3896,7 @@ class ClaudeCodeSession:
         persist: bool = True,
         cancel: threading.Event | None = None,
         on_activity: Any = None,
+        thinking: str | None = None,
     ) -> tuple[str, str, str]:
         """Run one CLI request, repairing tool calls and retrying non-answers.
 
@@ -3611,7 +3912,11 @@ class ClaudeCodeSession:
           ``tool_calls``, or ``length`` for a cut-off call).
         * A soft notice (a CLI-written ``<synthetic>`` banner) is retried with
           the same payload, resumed at the same checkpoint (``resume_at``) so
-          the rejected attempt is dropped from the chain.
+          the rejected attempt is dropped from the chain. A subscription
+          limit that only lifts at its reset (``rate_limit_info`` status
+          ``rejected`` without usable extra usage, or the CLI's "· resets"
+          wording) is never retried: ``ClaudeCodeUsageLimitError``, and
+          calls for the model fail fast until the reset.
         * A short planning-only preamble is continued in the session that
           produced it. When retries run out, a first-person promise ("I'll
           check…") raises a clear provider error; a gerund-only one ("Checking
@@ -3747,6 +4052,8 @@ class ClaudeCodeSession:
                 extra["persist"] = False
             if cancel is not None:
                 extra["cancel"] = cancel
+            if thinking:
+                extra["thinking"] = thinking
             try:
                 response, reasoning, sid = self._execute(
                     next_prompt,
@@ -3760,6 +4067,7 @@ class ClaudeCodeSession:
                     **extra,
                 )
             except ClaudeCodeSoftLimitNotice as exc:
+                self._raise_if_usage_limited(exc.detail or str(exc), model, cause=exc)
                 if (
                     gate is not None
                     and gate.committed
@@ -3773,11 +4081,7 @@ class ClaudeCodeSession:
                 last_notice = str(exc)
                 attempt += 1
                 if attempt >= attempts:
-                    raise RuntimeError(
-                        "Claude Code CLI returned a soft usage/limit notice "
-                        f"after {attempts} attempts (not treated as an answer). "
-                        f"Detail: {last_notice[:400]}"
-                    ) from exc
+                    raise _soft_limit_exhausted(attempts, last_notice, exc) from exc
                 reason = "soft-limit"
                 _LOG.warning(
                     "Claude Code soft limit/rate-limit notice; retrying (attempt %d/%d): %s",
@@ -3848,13 +4152,10 @@ class ClaudeCodeSession:
                 and _is_soft_limit_notice(attempt_text)
             ):
                 last_notice = attempt_text.strip()
+                self._raise_if_usage_limited(last_notice, model)
                 attempt += 1
                 if attempt >= attempts:
-                    raise RuntimeError(
-                        "Claude Code CLI returned a soft usage/limit notice "
-                        f"after {attempts} attempts (not treated as an answer). "
-                        f"Detail: {last_notice[:400]}"
-                    )
+                    raise _soft_limit_exhausted(attempts, last_notice, None)
                 _account()
                 reason = "soft-limit"
                 _LOG.warning(
@@ -3916,6 +4217,43 @@ class ClaudeCodeSession:
             # Confirmed answer — flush whatever was not streamed live.
             return _deliver()
 
+    def _raise_if_usage_limited(
+        self, text: str, model: str, *, cause: BaseException | None = None
+    ) -> None:
+        """Raise ``ClaudeCodeUsageLimitError`` when a limit notice cannot be
+        retried: the window is exhausted until its reset.
+
+        The turn's ``rate_limit_info`` decides (status ``rejected`` and no
+        usable extra usage); without it, Claude Code's own "· resets" wording
+        does. A spend-limit banner alone stays a soft notice.
+        """
+
+        info = dict(self._last_rate_limit)
+        _kind, resets_at = _limit_window(info)
+        rejected = (
+            info.get("status") == "rejected"
+            and not _overage_usable(info)
+            # A rejection whose window already reset is an earlier turn's.
+            and (resets_at is None or resets_at > time.time())
+        )
+        if not rejected and not _HARD_LIMIT_TEXT_RE.search(text or ""):
+            return
+        # Stale info from an earlier turn must not name the wrong window.
+        source = info if rejected else {}
+        error = _usage_limit_error(source, text)
+        _block_usage_limit(model, source, text)
+        _LOG.warning(
+            "Claude Code subscription limit reached for %s (type=%s, resets_at=%s); "
+            "not retrying, and calls fail fast until the reset: %s",
+            model,
+            error.rate_limit_type or "?",
+            error.resets_at or "?",
+            (text or "")[:160],
+        )
+        if cause is not None:
+            raise error from cause
+        raise error
+
     def _log_tool_call_failures(self, reply: _ClaudeReply, sid: str) -> None:
         for failure in reply.failures or [_ToolCallFailure(0, "", "cut off", "")]:
             _LOG.warning(
@@ -3944,6 +4282,7 @@ class ClaudeCodeSession:
         resume_at: str | None = None,
         persist: bool = True,
         cancel: threading.Event | None = None,
+        thinking: str | None = None,
     ) -> tuple[str, str, str]:
         """Run one request with an abort latch scoped to this exact call.
 
@@ -3963,6 +4302,7 @@ class ClaudeCodeSession:
             self._active_run_cancel = cancel
         self._last_turn_checkpoint = None
         self._last_turn_synthetic = False
+        extra: dict[str, Any] = {"thinking": thinking} if thinking else {}
         try:
             result = self._execute_active(
                 prompt_text,
@@ -3978,6 +4318,7 @@ class ClaudeCodeSession:
                 keepalive=keepalive,
                 resume_at=resume_at,
                 persist=persist,
+                **extra,
             )
             with self._process_lock:
                 if self._abort_requested:
@@ -4004,6 +4345,7 @@ class ClaudeCodeSession:
         stream_partials: bool,
         resume_at: str | None = None,
         persist: bool = True,
+        thinking: str | None = None,
     ) -> list[str]:
         argv = [
             claude_bin,
@@ -4047,6 +4389,9 @@ class ClaudeCodeSession:
         ]
         if effort:
             argv += ["--effort", _validate_flag_size(str(effort))]
+        if thinking in _THINKING_MODES and _thinking_mode_supported:
+            # "disabled": Hermes turned reasoning off for this conversation.
+            argv += ["--thinking", thinking]
         display = _thinking_display()
         if display:
             # Sent whatever the effort: Opus 5 thinks adaptively without one.
@@ -4092,6 +4437,7 @@ class ClaudeCodeSession:
         keepalive: bool = False,
         resume_at: str | None = None,
         persist: bool = True,
+        thinking: str | None = None,
     ) -> tuple[str, str, str]:
         """Send one user turn to ``claude`` and parse its stream-json events.
 
@@ -4119,10 +4465,12 @@ class ClaudeCodeSession:
         )
 
         def _identity() -> tuple:
+            # Everything fixed when the process is spawned.
             return (
                 claude_bin,
                 str(model),
                 effort or "",
+                (thinking or "") if _thinking_mode_supported else "",
                 work_dir,
                 system_digest,
                 persist,
@@ -4184,6 +4532,7 @@ class ClaudeCodeSession:
                     keep_seconds=keep_seconds,
                     resume_at=resume_at,
                     persist=persist,
+                    thinking=thinking,
                 )
             except _CliFlagRejected:
                 # Rejected before it read the request: nothing ran or was
@@ -4209,6 +4558,7 @@ class ClaudeCodeSession:
         keep_seconds: float,
         resume_at: str | None,
         persist: bool,
+        thinking: str | None = None,
     ) -> tuple[str, str, str]:
         argv = self._build_argv(
             claude_bin,
@@ -4222,6 +4572,7 @@ class ClaudeCodeSession:
             stream_partials=True,
             resume_at=resume_at,
             persist=persist,
+            thinking=thinking,
         )
         process_env = _build_subprocess_env(env)
 
@@ -4241,9 +4592,15 @@ class ClaudeCodeSession:
                     env=process_env,
                     start_new_session=True,
                 )
-            except FileNotFoundError as exc:
-                raise RuntimeError(
-                    f"Claude Code CLI not found at '{claude_bin}'. "
+            except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
+                reason = exc.strerror or type(exc).__name__
+                if getattr(exc, "filename", None) == work_dir:
+                    raise ClaudeCodeLaunchError(
+                        f"Claude Code CLI not launchable: working directory "
+                        f"'{work_dir}' is unusable ({reason})."
+                    ) from exc
+                raise ClaudeCodeLaunchError(
+                    f"Claude Code CLI not launchable at '{claude_bin}' ({reason}). "
                     "Install Claude Code or set HERMES_CLAUDE_CODE_COMMAND."
                 ) from exc
             self._active_process = process
@@ -4283,6 +4640,8 @@ class ClaudeCodeSession:
             raise RuntimeError("Claude Code request aborted")
         stdout = stdout or ""
         stderr = stderr or ""
+        for event in _stream_events(stdout, "rate_limit_event"):
+            self._record_rate_limit(event.get("rate_limit_info"))
         if process.returncode not in (0, None):
             self._raise_process_failure(process.returncode, stdout, stderr, session_id)
         return self._parse_turn(stdout, session_id, cost_offset=0.0)
@@ -4497,6 +4856,9 @@ class ClaudeCodeSession:
             self._run_compacted = True
         if monitor.fallback_model:
             self._last_usage["served_model"] = monitor.fallback_model
+            # The fallback model's window is not the conversation's.
+            self._last_usage.pop("context_window", None)
+            self._last_usage.pop("max_output_tokens", None)
         warm.turns += 1
         warm.session_id = sid
         warm.tip = self._last_turn_checkpoint
@@ -4613,6 +4975,18 @@ class ClaudeCodeSession:
                 "stays hidden from now on"
             )
             raise _CliFlagRejected(f"Claude Code failed: {detail}")
+        # Commander quotes the flag: "unknown option '--thinking'", "option
+        # '--thinking <mode>' argument 'x' is invalid. Allowed choices are …".
+        if re.search(r"'--thinking(?: <mode>)?'", argv_error) and (
+            "unknown option" in argv_error or "allowed choices" in argv_error
+        ):
+            global _thinking_mode_supported
+            _thinking_mode_supported = False
+            _LOG.warning(
+                "Claude Code CLI rejected --thinking; Claude keeps thinking even "
+                "when Hermes turned reasoning off"
+            )
+            raise _CliFlagRejected(f"Claude Code failed: {detail}")
         if session_id and "--resume-session-at" in argv_error and "unknown option" in argv_error:
             global _resume_at_supported
             _resume_at_supported = False
@@ -4624,12 +4998,25 @@ class ClaudeCodeSession:
             raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
         if session_id and _is_expired_session_error(detail):
             raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
+        # The turn's result event, when the CLI got that far, says what the
+        # API answered.
+        status, code, text = _result_error(_last_stream_event(stdout, "result"))
+        body = _api_error_body(status, code, text or detail[-300:]) if status or code else None
         # Rate-limit / spend-limit notices arrive as exit 1 with
         # is_error:true and a 429 / rate_limit signal.  These are
         # transient — convert to a retryable exception so the soft-limit
         # retry handler can re-attempt instead of killing the turn.
         if _is_soft_limit_detail(detail):
-            raise ClaudeCodeSoftLimitNotice(detail)
+            raise ClaudeCodeSoftLimitNotice(
+                detail, status_code=status, body=body, detail=text or detail[-300:]
+            )
+        if status is not None:
+            raise ClaudeCodeAPIError(
+                f"Claude Code failed (exit {returncode}): {detail}",
+                status_code=status,
+                body=body,
+                detail=text,
+            )
         raise RuntimeError(f"Claude Code failed (exit {returncode}): {detail}")
 
     def _parse_turn(
@@ -4791,17 +5178,27 @@ def _parse_stream_json_output(
                     raise ClaudeCodeSessionExpired(
                         f"Claude Code result error: {detail}"
                     )
+                # The API's status and error type travel with the error, so
+                # Hermes classifies it like a direct API failure.
+                status, code, _text = _result_error(event)
+                body = _api_error_body(status, code, detail) if status or code else None
                 # Rate-limit / spend-limit arrives as is_error:true — make it
                 # retryable instead of a hard failure.
                 if _is_soft_limit_detail(detail) or _is_soft_limit_detail(
                     json.dumps(event)
                 ):
                     raise ClaudeCodeSoftLimitNotice(
-                        f"Claude Code rate-limit result: {detail}"
+                        f"Claude Code rate-limit result: {detail}",
+                        status_code=status,
+                        body=body,
+                        detail=detail,
                     )
-                raise RuntimeError(
+                raise ClaudeCodeAPIError(
                     f"Claude Code result rejected (is_error={is_error!r}, "
-                    f"subtype={subtype!r}): {detail}"
+                    f"subtype={subtype!r}): {detail}",
+                    status_code=status,
+                    body=body,
+                    detail=detail,
                 )
             if subtype and subtype not in {"success", "result_success", ""}:
                 if subtype in {"error", "failure", "failed"}:
@@ -4857,6 +5254,42 @@ def _parse_stream_json_output(
             response = joined
     reasoning = "".join(reasoning_parts)
     return response, reasoning, result_session_id
+
+
+def _stream_events(stdout: str, kind: str) -> list[dict[str, Any]]:
+    """The stream-json events of type ``kind`` in ``stdout``, in order."""
+
+    found: list[dict[str, Any]] = []
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == kind:
+            found.append(event)
+    return found
+
+
+def _last_stream_event(stdout: str, kind: str) -> dict[str, Any] | None:
+    found = _stream_events(stdout, kind)
+    return found[-1] if found else None
+
+
+def _result_error(event: dict[str, Any] | None) -> tuple[int | None, str | None, str]:
+    """``(api_error_status, api_error_code, text)`` of a failed result event."""
+
+    if not isinstance(event, dict) or event.get("is_error") is False:
+        return None, None, ""
+    status = event.get("api_error_status")
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status < 600:
+        status = None
+    code = event.get("api_error_code")
+    code = code.strip() if isinstance(code, str) and code.strip() else None
+    text = event.get("result")
+    return status, code, str(text)[:300] if isinstance(text, str) else ""
 
 
 def _last_assistant_event(stdout: str) -> dict[str, Any] | None:
@@ -4953,6 +5386,7 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
     prompt_tokens = input_tokens + cache_write_tokens + cached_tokens
     service_tier = raw.get("service_tier")
     total_cost = result.get("total_cost_usd")
+    context_window, max_output_tokens = _model_usage_limits(result.get("modelUsage"))
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -4971,4 +5405,35 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
         "terminal_reason": (
             result.get("terminal_reason") if isinstance(result.get("terminal_reason"), str) else None
         ),
+        # The window the CLI actually runs the model with (Hermes syncs its
+        # context meter and compression threshold to it).
+        "context_window": context_window,
+        "max_output_tokens": max_output_tokens,
     }
+
+
+def _model_usage_limits(model_usage: Any) -> tuple[int | None, int | None]:
+    """``(contextWindow, maxOutputTokens)`` of the model that served the turn.
+
+    ``modelUsage`` is keyed by full model id (``claude-haiku-4-5-20251001``);
+    the entry that read the most input is the conversation's model (any
+    side request the CLI makes is small).
+    """
+
+    if not isinstance(model_usage, dict):
+        return None, None
+
+    def positive(value: Any) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+    best: tuple[int, int | None, int | None] | None = None
+    for entry in model_usage.values():
+        if not isinstance(entry, dict) or positive(entry.get("contextWindow")) is None:
+            continue
+        read = sum(
+            positive(entry.get(key)) or 0
+            for key in ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+        )
+        if best is None or read > best[0]:
+            best = (read, positive(entry.get("contextWindow")), positive(entry.get("maxOutputTokens")))
+    return (best[1], best[2]) if best is not None else (None, None)

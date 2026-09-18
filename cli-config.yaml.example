@@ -464,6 +464,14 @@ compression:
   # Survives model switches and fallback activations.
   # threshold_tokens: 200000
 
+  # Absolute caps that apply only while a given provider is active (the lower
+  # of this and threshold_tokens wins). Default: {claude-code: 250000} — Claude
+  # Code re-reads its whole cached conversation on every call and slows down
+  # past ~350k tokens, while its 1M-window models would compress at 500k.
+  # Setting this map replaces the default; 0 disables a provider's cap.
+  # provider_threshold_tokens:
+  #   claude-code: 250000
+
   # Existing Codex gpt-5.5 behavior: raise Hermes' compaction trigger to 85%
   # for the ChatGPT Codex OAuth route. Set false to opt back down to threshold.
   codex_gpt55_autoraise: true

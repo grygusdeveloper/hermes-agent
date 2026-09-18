@@ -105,6 +105,166 @@ def _nonretryable_error_allows_fallback(classified) -> bool:
     return bool(getattr(classified, "should_fallback", False))
 
 
+def _error_label(status_code, classified) -> str:
+    """``HTTP 401`` when the error has a status, else the classified reason
+    (Claude Code and other local runtimes raise errors without one)."""
+
+    if status_code is not None:
+        return f"HTTP {status_code}"
+    reason = getattr(classified, "reason", None)
+    return getattr(reason, "value", None) or "no HTTP status"
+
+
+def _is_claude_code_agent(agent) -> bool:
+    return (getattr(agent, "provider", "") or "").strip().lower() == "claude-code"
+
+
+def _claude_code_limit_notice(agent, classified) -> str:
+    """User-facing text for a Claude subscription limit, or "".
+
+    The bridge has already retried what can be retried, and a limit that holds
+    until its reset never lifts within Hermes's retry window.
+    """
+
+    context = getattr(classified, "error_context", None) or {}
+    if not context.get("usage_limit") or not _is_claude_code_agent(agent):
+        return ""
+    message = str(getattr(classified, "message", "") or "").strip()
+    if context.get("hard"):
+        # "Claude 5-hour session limit reached — resets 15:00 CEST (in ~2h)"
+        return message or "Claude usage limit reached"
+    return f"Claude usage limit: {message}" if message else "Claude usage limit reached"
+
+
+def _remember_primary_failure(agent, retry_state, text: str) -> None:
+    """Keep why Claude Code failed before Hermes switches to a fallback, so a
+    fallback that fails too cannot hide it behind its own error."""
+
+    if _is_claude_code_agent(agent) and text and not retry_state.primary_failure_notice:
+        retry_state.primary_failure_notice = text
+
+
+def _with_primary_failure(agent, retry_state, text: str) -> str:
+    notice = getattr(retry_state, "primary_failure_notice", "") or ""
+    if not notice or _is_claude_code_agent(agent):
+        return text
+    return f"{notice}\n\nFallback {agent.provider}/{agent.model} failed too: {text}"
+
+
+def _sync_provider_context_window(agent, usage) -> None:
+    """Adopt the context window the provider reports for the served model.
+
+    The Claude Code bridge reports the window the CLI runs the model with
+    (result ``modelUsage``). Without it Hermes guesses from its catalog (a
+    failed probe, then 1M for claude-opus-5); a smaller real window would let
+    the CLI reject prompts before Hermes compresses. ``update_model``
+    recomputes the compression threshold (the provider cap included). An
+    explicit ``model.context_length`` always wins. Must run before
+    ``update_from_response`` (``update_model`` resets calibration).
+    """
+
+    window = getattr(usage, "context_window", None)
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        return
+    configured = getattr(agent, "_config_context_length", None)
+    if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+        return
+    compressor = getattr(agent, "context_compressor", None)
+    current = getattr(compressor, "context_length", None)
+    if compressor is None or current == window:
+        return
+    try:
+        compressor.update_model(
+            model=agent.model,
+            context_length=window,
+            base_url=agent.base_url,
+            api_key=getattr(agent, "api_key", ""),
+            provider=agent.provider,
+            api_mode=agent.api_mode,
+        )
+    except Exception as exc:
+        logger.debug("Context window sync failed: %s", exc)
+        return
+    logger.info(
+        "Context window for %s synced from %s: %s -> %s tokens (compress at %s)",
+        agent.model,
+        agent.provider or "provider",
+        f"{current:,}" if isinstance(current, int) else current,
+        f"{window:,}",
+        f"{getattr(compressor, 'threshold_tokens', 0):,}",
+    )
+    try:
+        # Persisted so the next agent starts with the real window instead
+        # of probing and guessing.
+        save_context_length(agent.model, agent.base_url, window)
+    except Exception:
+        pass
+
+
+def _account_retry_usage(agent, usage) -> None:
+    """Count a provider's retried-past attempts in the session's token totals.
+
+    The Claude Code bridge reports the attempts it retried inside one request
+    (tool-call repair, preamble continuation, soft-limit retry) as
+    ``usage.hermes_retry_usage``. Accounting only: never the prompt size that
+    drives compression.
+    """
+
+    extra = getattr(usage, "hermes_retry_usage", None)
+    if extra is None or not isinstance(getattr(extra, "prompt_tokens", None), int):
+        return
+    canonical = normalize_usage(extra, provider=agent.provider, api_mode=agent.api_mode)
+    attempts = getattr(extra, "attempts", None)
+    attempts = attempts if isinstance(attempts, int) and attempts > 0 else 1
+    agent.session_prompt_tokens += canonical.prompt_tokens
+    agent.session_completion_tokens += canonical.output_tokens
+    agent.session_total_tokens += canonical.total_tokens
+    agent.session_api_calls += attempts
+    agent.session_input_tokens += canonical.input_tokens
+    agent.session_output_tokens += canonical.output_tokens
+    agent.session_cache_read_tokens += canonical.cache_read_tokens
+    agent.session_cache_write_tokens += canonical.cache_write_tokens
+    agent.session_reasoning_tokens += canonical.reasoning_tokens
+    cost = estimate_usage_cost(
+        agent.model,
+        canonical,
+        provider=agent.provider,
+        base_url=agent.base_url,
+        api_key=getattr(agent, "api_key", ""),
+    )
+    if cost.amount_usd is not None:
+        agent.session_estimated_cost_usd += float(cost.amount_usd)
+    if agent._session_db and agent.session_id:
+        try:
+            agent._session_db.queue_token_counts(
+                agent.session_id,
+                input_tokens=canonical.input_tokens,
+                output_tokens=canonical.output_tokens,
+                cache_read_tokens=canonical.cache_read_tokens,
+                cache_write_tokens=canonical.cache_write_tokens,
+                reasoning_tokens=canonical.reasoning_tokens,
+                estimated_cost_usd=(
+                    float(cost.amount_usd) if cost.amount_usd is not None else None
+                ),
+                cost_status=cost.status,
+                cost_source=cost.source,
+                billing_provider=agent.provider,
+                billing_base_url=agent.base_url,
+                billing_mode="subscription_included" if cost.status == "included" else None,
+                model=agent.model,
+                api_call_count=attempts,
+            )
+        except Exception as exc:
+            logger.debug("Retry usage persistence failed: %s", exc)
+    logger.info(
+        "Provider retried %d attempt(s) inside the call: in=%d out=%d cache_read=%d",
+        attempts,
+        canonical.prompt_tokens,
+        canonical.output_tokens,
+        canonical.cache_read_tokens,
+    )
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -3624,6 +3784,7 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    _sync_provider_context_window(agent, response.usage)
                     agent.context_compressor.update_from_response(usage_dict)
 
                     # Stash this response's canonical usage so the post-turn
@@ -3772,7 +3933,8 @@ def run_conversation(
                                 "Token persistence failed (session=%s, tokens=%d): %s",
                                 agent.session_id, total_tokens, e,
                             )
-                    
+                    _account_retry_usage(agent, response.usage)
+
                     if agent.verbose_logging:
                         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                     
@@ -4790,6 +4952,16 @@ def run_conversation(
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
 
+                # Claude subscription limit: say so right away (not buffered),
+                # with the reset time. The eager fallback below switches to a
+                # fallback provider when one is configured; otherwise the turn
+                # ends here instead of retrying a limit that holds until its
+                # reset.
+                _claude_limit = _claude_code_limit_notice(agent, classified)
+                if _claude_limit and not _retry.primary_failure_notice:
+                    agent._emit_status(f"⏳ {_claude_limit}")
+                    _remember_primary_failure(agent, _retry, _claude_limit)
+
                 # Eager fallback for rate-limit errors (429 or quota exhaustion)
                 # and transport errors (connection failure / timeout / provider
                 # overloaded).  Rate limits and billing: switch immediately —
@@ -4863,6 +5035,25 @@ def run_conversation(
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
+
+                if _claude_limit:
+                    # No fallback took over: retries cannot help before the
+                    # reset (the bridge already retried the soft cases).
+                    agent._flush_status_buffer()
+                    logger.warning(
+                        "%sClaude Code limit, not retrying: %s",
+                        agent.log_prefix, _claude_limit,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _claude_limit,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _claude_limit,
+                        "failure_reason": classified.reason.value,
+                    }
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
@@ -5498,10 +5689,16 @@ def run_conversation(
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
-                            agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                            agent._buffer_status(
+                                f"⚠️ Non-retryable error ({_error_label(status_code, classified)}) "
+                                "— trying fallback..."
+                            )
+                        _remember_primary_failure(
+                            agent, _retry, f"Claude Code failed: {agent._summarize_api_error(api_error)}"
+                        )
                     if (
                         _nonretryable_error_allows_fallback(classified)
-                        and agent._try_activate_fallback()
+                        and agent._try_activate_fallback(reason=classified.reason)
                     ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -5535,10 +5732,10 @@ def run_conversation(
                         )
                     else:
                         agent._emit_status(
-                            f"❌ Non-retryable error (HTTP {status_code}): "
+                            f"❌ Non-retryable error ({_error_label(status_code, classified)}): "
                             f"{_nonretryable_summary}"
                         )
-                    agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
+                    agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error ({_error_label(status_code, classified)}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
@@ -5684,6 +5881,7 @@ def run_conversation(
                         _ce_final = f"Billing or credits exhausted: {_nonretryable_summary}"
                         if _ce_guidance:
                             _ce_final += f"\n\n{_ce_guidance}"
+                        _ce_final = _with_primary_failure(agent, _retry, _ce_final)
                         _ce_block = _billing_block_dict(_provider, _base, _model, _ce_guidance)
                         return {
                             "final_response": _ce_final,
@@ -5696,7 +5894,9 @@ def run_conversation(
                             "billing_block": _ce_block,
                         }
                     return {
-                        "final_response": _nonretryable_summary,
+                        "final_response": _with_primary_failure(
+                            agent, _retry, _nonretryable_summary
+                        ),
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
@@ -5725,7 +5925,10 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                        _remember_primary_failure(
+                            agent, _retry, f"Claude Code failed: {agent._summarize_api_error(api_error)}"
+                        )
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5865,6 +6068,7 @@ def run_conversation(
                         _billing_block = _billing_block_dict(_provider, _base, _model, _billing_guidance)
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                    _final_response = _with_primary_failure(agent, _retry, _final_response)
                     if _is_thinking_timeout:
                         # Thinking-timeout guidance overrides the generic
                         # stream-drop guidance — the latter is wrong for

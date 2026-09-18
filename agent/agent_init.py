@@ -60,6 +60,13 @@ from utils import base_url_host_matches, is_truthy_value
 # from inside that module.)
 logger = logging.getLogger("run_agent")
 
+# compression.provider_threshold_tokens when config sets none. Claude Code
+# replays its cached conversation on every call; per-call latency roughly
+# doubles past ~350k tokens, while its 1M-window models would only compress
+# at 500k. Other providers (codex has codex_responses_compact_threshold) are
+# unaffected.
+_DEFAULT_PROVIDER_THRESHOLD_TOKENS = {"claude-code": 250_000}
+
 
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
@@ -2138,6 +2145,24 @@ def init_agent(
                 compression_threshold_tokens = None
         except (TypeError, ValueError):
             compression_threshold_tokens = None
+    # Provider-scoped absolute caps, applied only while that provider is
+    # active (fallbacks and other providers keep their own threshold).
+    # Claude Code resumes the whole cached conversation on every call and
+    # gets markedly slower past ~350k tokens, while its models advertise a
+    # 1M window (50% = 500k): compact it at 250k by default. A configured
+    # map replaces the default; a non-positive entry disables a cap.
+    compression_provider_threshold_tokens = dict(_DEFAULT_PROVIDER_THRESHOLD_TOKENS)
+    _raw_provider_caps = _compression_cfg.get("provider_threshold_tokens")
+    if isinstance(_raw_provider_caps, dict):
+        compression_provider_threshold_tokens = {
+            str(k).strip().lower(): v for k, v in _raw_provider_caps.items()
+        }
+    elif _raw_provider_caps is not None:
+        _ra().logger.warning(
+            "Invalid compression.provider_threshold_tokens=%r (expected a "
+            "provider -> tokens map); using the defaults.",
+            _raw_provider_caps,
+        )
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2610,6 +2635,12 @@ def init_agent(
         # and may ignore the attribute.
         if compression_model_thresholds:
             agent.context_compressor.model_thresholds = compression_model_thresholds
+        if hasattr(agent.context_compressor, "provider_threshold_tokens"):
+            agent.context_compressor.provider_threshold_tokens = (
+                ContextCompressor._coerce_provider_threshold_tokens(
+                    compression_provider_threshold_tokens
+                )
+            )
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=_plugin_ctx_len,
@@ -2638,6 +2669,7 @@ def init_agent(
             max_tokens=agent.max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,
+            provider_threshold_tokens=compression_provider_threshold_tokens,
             proactive_prune_tokens=compression_proactive_prune_tokens,
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
@@ -2875,8 +2907,13 @@ def init_agent(
                 agent.context_compressor, "threshold_percent", compression_threshold
             )
             _cap_note = ""
-            _cap = getattr(agent.context_compressor, "threshold_tokens_cap", None)
-            if _cap and _cap > 0:
+            _cap_fn = getattr(agent.context_compressor, "_effective_threshold_tokens_cap", None)
+            _cap = (
+                _cap_fn()
+                if callable(_cap_fn)
+                else getattr(agent.context_compressor, "threshold_tokens_cap", None)
+            )
+            if isinstance(_cap, int) and _cap > 0:
                 _cap_note = f" (capped at {_cap:,} tokens)"
             print(f"📊 Context limit: {agent.context_compressor.context_length:,} tokens (compress at {int(_active_threshold_pct*100)}% = {agent.context_compressor.threshold_tokens:,}{_cap_note})")
         else:
