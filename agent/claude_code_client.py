@@ -56,6 +56,8 @@ from agent.claude_code_session import (
     _HERMES_BACKEND_SYSTEM_PROMPT,
     _HERMES_TOOL_PROTOCOL,
     _STREAM_DIVERGED_SEPARATOR,
+    _STREAM_REFUSED_SEPARATOR,
+    ClaudeCodeRefusal,
     ClaudeCodeSession,
     _mask_code,
     _parse_claude_reply,
@@ -536,6 +538,11 @@ class ClaudeCodeClient:
         stream: bool = False,
         **kwargs: Any,
     ) -> Any:
+        # The agent says whether anything shows the deltas live (a streaming
+        # chat display, TTS). Without one the answer is sent in one piece at
+        # the end: prose from an attempt Claude Code abandoned (a dropped
+        # connection, a refusal) never reaches the final answer then.
+        live_display = kwargs.pop("live_display", True) is not False
         system_prompt, prompt_text, prompt_images = _build_claude_code_request(
             messages or [],
             model=model,
@@ -599,6 +606,7 @@ class ClaudeCodeClient:
                 prompt_text=prompt_text,
                 run_kwargs=run_kwargs,
                 model=model or "sonnet",
+                live_display=live_display,
             )
 
         response_text, reasoning_text = self._claude_session.run(prompt_text, **run_kwargs)
@@ -637,13 +645,20 @@ class ClaudeCodeClient:
         prompt_text: str,
         run_kwargs: dict[str, Any],
         model: str,
+        live_display: bool = True,
     ):
         """Yield OpenAI-style stream chunks as Claude Code output arrives.
 
         Thinking streams live as ``reasoning_content``. Prose streams live once
         the session's gate has validated the attempt (never raw ``<tool_call>``
-        markup). Contract: concatenated ``delta.content`` over the whole stream
+        markup); without a ``live_display`` it is sent in one chunk at the
+        end. Contract: concatenated ``delta.content`` over the whole stream
         equals the non-streaming ``cleaned_text``.
+
+        A refusal after part of the reply was streamed ends the stream with
+        the CLI's explanation and finish reason ``content_filter`` (Hermes then
+        tries its fallback once or shows the refusal) rather than an error,
+        which Hermes would take for a cut-off stream and continue.
 
         While Claude produces output that is not streamed as content (tool-call
         JSON, thinking without a summary), an empty chunk is yielded at most
@@ -674,7 +689,7 @@ class ClaudeCodeClient:
             try:
                 response_text, reasoning_text = self._claude_session.run(
                     prompt_text,
-                    on_text_chunk=on_text,
+                    on_text_chunk=on_text if live_display else None,
                     on_reasoning_chunk=on_reasoning,
                     on_activity=on_activity,
                     cancel_event=cancel,
@@ -740,8 +755,21 @@ class ClaudeCodeClient:
                 elif item[0] == "final":
                     final_text = item[1] or ""
                     final_reasoning = item[2] or ""
-            if error_box.get("exc"):
-                raise error_box["exc"]
+            error = error_box.get("exc")
+            if error is not None:
+                shown = "".join(emitted_text)
+                if isinstance(error, ClaudeCodeRefusal) and shown.strip():
+                    _LOG.warning(
+                        "Claude Code refused after %d streamed chars; ending the "
+                        "stream as a refusal",
+                        len(shown),
+                    )
+                    yield _chunk(
+                        content=_STREAM_REFUSED_SEPARATOR + (error.detail or str(error))
+                    )
+                    yield _chunk(role=None, finish_reason="content_filter")
+                    return
+                raise error
 
             last_usage = self._claude_session.last_usage
             tool_calls, cleaned, finish = _completion_parts(

@@ -1048,6 +1048,15 @@ def _classify_claude_code(
     start) before falling back.
     """
 
+    # Claude declined to answer (API stop reason ``refusal``, no CLI fallback
+    # model): the same request gets the same refusal. Hermes's fallback may
+    # answer it; otherwise the user sees the CLI's explanation.
+    if (error_code or "").lower() == "refusal":
+        return result_fn(
+            FailoverReason.content_policy_blocked,
+            retryable=False,
+            should_fallback=True,
+        )
     # The CLI is missing or not executable (a stale versioned path after an
     # auto-update): every retry fails identically. The error text is kept
     # for the final response if the fallback fails too.

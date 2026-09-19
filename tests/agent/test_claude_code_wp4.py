@@ -32,6 +32,7 @@ from agent.claude_code_client import (
 from agent.claude_code_session import (
     ClaudeCodeAPIError,
     ClaudeCodeLaunchError,
+    ClaudeCodeRefusal,
     ClaudeCodeSession,
     ClaudeCodeSoftLimitNotice,
     ClaudeCodeUsageLimitError,
@@ -111,6 +112,27 @@ ERROR_CLI = textwrap.dedent(
             out({"type": "result", "subtype": "success", "is_error": True,
                  "api_error_status": reply["error_status"], "result": reply["result"],
                  "session_id": sid})
+            continue
+        if reply.get("refusal"):
+            # Claude Code 2.1.277 when the API refuses and no fallback model
+            # is configured (captured from the real CLI).
+            explanation = reply["refusal"]
+            if reply.get("refused_text"):
+                out({"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": sid,
+                     "message": {"id": "msg_refused", "model": "claude-opus-5",
+                                 "stop_reason": None,
+                                 "content": [{"type": "text", "text": reply["refused_text"]}]}})
+            out({"type": "system", "subtype": "model_refusal_no_fallback",
+                 "original_model": "claude-opus-5", "api_refusal_category": None,
+                 "api_refusal_explanation": None, "content": "", "session_id": sid})
+            out({"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": sid,
+                 "error": "invalid_request", "is_api_error_message": True,
+                 "message": {"model": "<synthetic>", "stop_reason": "refusal",
+                             "content": [{"type": "text", "text": explanation}]}})
+            out({"type": "result", "subtype": "success", "is_error": True,
+                 "stop_reason": "refusal", "terminal_reason": "api_error",
+                 "api_error_status": None, "result": explanation, "session_id": sid,
+                 "total_cost_usd": 0.000825})
             continue
         text = reply.get("text", "ok")
         out({"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": sid,
@@ -388,6 +410,167 @@ def test_crashed_turn_keeps_the_result_status():
         ClaudeCodeSession()._raise_process_failure(1, stdout, "", None)
     assert info.value.status_code == 401
     assert classify_api_error(info.value, provider="claude-code").is_auth
+
+
+# ---------------------------------------------------------------------------
+# Safety refusals (Claude Code 2.1.277, API stop reason "refusal")
+# ---------------------------------------------------------------------------
+
+REFUSAL_TEXT = (
+    "API Error: Opus 5's safeguards flagged this message "
+    "(https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal "
+    "conversations. Claude Code can't respond to this message with Opus 5.\n\n"
+    "Try rephrasing the request in a new session or change your model."
+)
+
+# The real CLI's events for a refused reply, trimmed of unrelated fields.
+REAL_REFUSAL_EVENTS = [
+    {"type": "system", "subtype": "init", "session_id": SID, "model": "claude-opus-5"},
+    {"type": "stream_event", "session_id": SID, "event": {
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "REFUSEDTEXT some partial answer"}}},
+    {"type": "assistant", "session_id": SID, "uuid": "287bb463-3411-46cf-987f-77c45220959a",
+     "message": {"id": "msg_b570f97256f846dca184", "model": "claude-opus-5", "stop_reason": None,
+                 "content": [{"type": "text", "text": "REFUSEDTEXT some partial answer"}]}},
+    {"type": "system", "subtype": "model_refusal_no_fallback", "session_id": SID,
+     "original_model": "claude-opus-5", "request_id": None, "api_refusal_category": None,
+     "api_refusal_explanation": None, "content": "",
+     "refused_user_message_uuid": "892bd1c0-1b05-42ad-aec8-ceeafb1d88f6"},
+    {"type": "assistant", "session_id": SID, "uuid": "739b1aab-0734-4b3a-a692-a0c58246c7b6",
+     "error": "invalid_request", "is_api_error_message": True,
+     "message": {"id": "81dafded-3923-442a-bfa3-e58212fb675f", "model": "<synthetic>",
+                 "stop_reason": "refusal", "content": [{"type": "text", "text": REFUSAL_TEXT}]}},
+    {"type": "stream_event", "session_id": SID, "event": {
+        "type": "message_delta", "delta": {"stop_reason": "refusal", "stop_sequence": None}}},
+    {"type": "result", "subtype": "success", "is_error": True, "stop_reason": "refusal",
+     "terminal_reason": "api_error", "api_error_status": None, "result": REFUSAL_TEXT,
+     "session_id": SID, "total_cost_usd": 0.000825, "num_turns": 1},
+]
+REAL_REFUSAL_STDOUT = "\n".join(json.dumps(event) for event in REAL_REFUSAL_EVENTS)
+
+
+def _assert_refusal_classification(error):
+    classified = classify_api_error(error, provider="claude-code", model="claude-opus-5")
+    assert classified.reason == FailoverReason.content_policy_blocked
+    assert classified.retryable is False and classified.should_fallback is True
+
+
+def test_real_refusal_result_is_a_refusal_not_a_retryable_error():
+    """Regression (f1): the real shape (is_error, subtype "success", no API
+    status) raised a generic error that Hermes retried as ``unknown``."""
+
+    with pytest.raises(ClaudeCodeRefusal) as info:
+        _parse_stream_json_output(REAL_REFUSAL_STDOUT)
+    assert "safeguards flagged this message" in info.value.detail
+    assert info.value.response.json()["error"]["type"] == "refusal"
+    _assert_refusal_classification(info.value)
+
+
+def test_refusal_on_a_failed_exit_is_a_refusal():
+    with pytest.raises(ClaudeCodeRefusal) as info:
+        ClaudeCodeSession()._raise_process_failure(1, REAL_REFUSAL_STDOUT, "", SID)
+    assert "safeguards flagged this message" in info.value.detail
+    _assert_refusal_classification(info.value)
+
+
+def test_refusal_event_alone_marks_the_failure_as_a_refusal():
+    events = [e for e in REAL_REFUSAL_EVENTS if e["type"] != "result"]
+    events.append({"type": "result", "subtype": "success", "is_error": True,
+                   "result": REFUSAL_TEXT, "session_id": SID})
+    with pytest.raises(ClaudeCodeRefusal):
+        _parse_stream_json_output("\n".join(json.dumps(e) for e in events))
+
+
+def test_refusal_answered_by_the_cli_fallback_model_is_an_answer():
+    events = [
+        {"type": "system", "subtype": "init", "session_id": SID},
+        {"type": "system", "subtype": "model_refusal_fallback", "session_id": SID,
+         "original_model": "claude-opus-5", "fallback_model": "claude-opus-4-8"},
+        {"type": "result", "subtype": "success", "is_error": False,
+         "result": "The fallback's answer.", "session_id": SID, "stop_reason": "end_turn"},
+    ]
+    response, _reasoning, _sid = _parse_stream_json_output(
+        "\n".join(json.dumps(e) for e in events)
+    )
+    assert response == "The fallback's answer."
+
+
+def test_refusal_is_not_retried_by_the_bridge(error_cli):
+    error_cli.script({"refusal": REFUSAL_TEXT, "refused_text": "REFUSEDTEXT partial"}, {})
+    session = ClaudeCodeSession()
+    with pytest.raises(ClaudeCodeRefusal):
+        _run4(session, error_cli)
+    assert len(error_cli.spawns()) == 1
+
+
+def test_refusal_ends_the_turn_with_the_explanation(monkeypatch):
+    """Hermes neither retries a refusal nor treats it as a cut-off reply."""
+
+    refusal = ccs._refusal_error(REAL_REFUSAL_STDOUT, REAL_REFUSAL_EVENTS[-1])
+    agent = _claude_agent()
+    try:
+        result, _statuses, _reasons, calls = _drive(agent, refusal, monkeypatch)
+    finally:
+        agent.close()
+    assert calls == 1
+    assert result["error"].startswith("content_policy_blocked")
+    assert "safeguards flagged this message" in result["final_response"]
+    assert "truncated" not in result["final_response"].lower()
+
+
+def test_refusal_falls_back_once(monkeypatch):
+    refusal = ccs._refusal_error(REAL_REFUSAL_STDOUT, REAL_REFUSAL_EVENTS[-1])
+    agent = _claude_agent(fallback_model=[{"provider": "zai", "model": "glm-5.3"}])
+    try:
+        _result, _statuses, reasons, calls = _drive(agent, refusal, monkeypatch)
+    finally:
+        agent.close()
+    assert calls == 1
+    assert reasons == [FailoverReason.content_policy_blocked]
+
+
+def test_refusal_after_streamed_text_ends_the_stream_as_a_refusal(monkeypatch):
+    """With a live display, part of the refused reply is already on screen:
+    the stream ends as ``content_filter`` with the CLI's explanation instead
+    of an error Hermes would continue as a truncated reply."""
+
+    from agent.claude_code_client import ClaudeCodeClient
+
+    client = ClaudeCodeClient(cwd="/tmp")
+    refusal = ccs._refusal_error(REAL_REFUSAL_STDOUT, REAL_REFUSAL_EVENTS[-1])
+
+    def fake_run(prompt, *, on_text_chunk=None, **kwargs):
+        on_text_chunk("REFUSEDTEXT " * 40)
+        raise refusal
+
+    monkeypatch.setattr(client._claude_session, "run", fake_run)
+    chunks = list(
+        client._create_chat_completion(
+            model="opus", messages=[{"role": "user", "content": "q"}], stream=True
+        )
+    )
+    content = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
+    finish = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    assert finish == ["content_filter"]
+    assert content.endswith(ccs._STREAM_REFUSED_SEPARATOR + REFUSAL_TEXT)
+    client.close()
+
+
+def test_refusal_before_any_streamed_text_is_raised(monkeypatch):
+    from agent.claude_code_client import ClaudeCodeClient
+
+    client = ClaudeCodeClient(cwd="/tmp")
+    refusal = ccs._refusal_error(REAL_REFUSAL_STDOUT, REAL_REFUSAL_EVENTS[-1])
+
+    def fake_run(prompt, **kwargs):
+        raise refusal
+
+    monkeypatch.setattr(client._claude_session, "run", fake_run)
+    with pytest.raises(ClaudeCodeRefusal):
+        list(client._create_chat_completion(
+            model="opus", messages=[{"role": "user", "content": "q"}], stream=True
+        ))
+    client.close()
 
 
 def test_unlaunchable_cli_fails_fast_with_a_launch_error(tmp_path, monkeypatch):

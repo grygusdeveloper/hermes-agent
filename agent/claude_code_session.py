@@ -1441,6 +1441,12 @@ _PREVIEW_LOOKAHEAD_CHARS = 64
 # not continue what was shown.
 _STREAM_RESTART_SEPARATOR = "\n\n⚠ Connection to Claude dropped — retrying the answer:\n\n"
 _STREAM_DIVERGED_SEPARATOR = "\n\n⚠ The streamed text above was incomplete; full answer:\n\n"
+# ...when Claude refused to go on: its fallback model answers the message
+# again (restart), or the CLI's explanation follows (no fallback model).
+_STREAM_REFUSAL_RESTART_SEPARATOR = (
+    "\n\n⚠ Claude declined to continue this reply — answering with the fallback model:\n\n"
+)
+_STREAM_REFUSED_SEPARATOR = "\n\n⚠ Claude declined to continue this reply:\n\n"
 
 
 class _StreamGate:
@@ -1608,26 +1614,30 @@ class _StreamGate:
         self._pending = self._pending[end:]
         self._send(segment[begin:end])
 
-    def restart(self) -> None:
+    def restart(self, reason: str = "") -> None:
         """Claude Code replaced the message it was streaming with a new one.
 
         A dropped API connection makes the CLI end the partial message
         (``message_stop`` without a stop reason) and stream the whole message
-        again; a refused message is answered again by the fallback model. If
-        nothing of it was shown yet the restart is invisible; otherwise what
-        was shown stays, followed by a separator and the new attempt.
-        Idempotent.
+        again; a refused message (``reason`` "refusal") is answered again by
+        the fallback model. If nothing of it was shown yet the restart is
+        invisible; otherwise what was shown stays, followed by a separator
+        that says why and the new attempt. Idempotent.
         """
 
         if self._emit_end <= len(self._head):
             self._reset(self._head)
             return
         _LOG.warning(
-            "Claude Code re-streams a message after %d chars were shown; the "
+            "Claude Code re-streams a message after %d chars were shown%s; the "
             "answer continues after a separator",
             self._emitted_size,
+            " (refusal)" if reason == "refusal" else "",
         )
-        self._reset(self._separated(self.emitted, _STREAM_RESTART_SEPARATOR))
+        separator = (
+            _STREAM_REFUSAL_RESTART_SEPARATOR if reason == "refusal" else _STREAM_RESTART_SEPARATOR
+        )
+        self._reset(self._separated(self.emitted, separator))
 
     @staticmethod
     def _separated(shown: str, separator: str) -> str:
@@ -1961,6 +1971,9 @@ class _TurnMonitor:
         # Stop reason of the latest finished message (None: none, or it
         # ended without one).
         self._last_stop: str | None = None
+        # Claude refused the message being streamed (a refusal stop reason or
+        # a CLI refusal event since the latest message_start).
+        self._refusal_seen = False
         self.api_retries = 0
         self.compacted = False
         self.fallback_model: str | None = None
@@ -2037,7 +2050,9 @@ class _TurnMonitor:
                 # a message it abandons (dropped API connection) without a
                 # stop reason and streams the whole message again; a refusal
                 # is answered again by the fallback model.
-                self._emit("restart")
+                refused = self._refusal_seen or self._last_stop == "refusal"
+                self._emit("restart", "refusal" if refused else "")
+            self._refusal_seen = False
             self._messages += 1
             message = event.get("message")
             message_id = message.get("id") if isinstance(message, dict) else None
@@ -2050,6 +2065,8 @@ class _TurnMonitor:
             reason = delta.get("stop_reason") if isinstance(delta, dict) else None
             if isinstance(reason, str) and reason:
                 self._stop_reason = reason
+                if reason == "refusal":
+                    self._refusal_seen = True
         elif kind == "message_stop":
             if not self._message_open:
                 return
@@ -2144,6 +2161,8 @@ class _TurnMonitor:
                 else None,
             )
         elif subtype in ("model_fallback", "model_refusal_fallback", "model_refusal_no_fallback"):
+            if subtype != "model_fallback":
+                self._refusal_seen = True
             original = event.get("originalModel") or event.get("original_model")
             fallback = event.get("fallbackModel") or event.get("fallback_model")
             scope = event.get("scope")
@@ -2315,6 +2334,50 @@ class ClaudeCodeAPIError(RuntimeError):
         self.response = SimpleNamespace(
             status_code=self.status_code, headers={}, json=lambda: payload
         )
+
+
+class ClaudeCodeRefusal(ClaudeCodeAPIError):
+    """Claude declined to answer: the API ended the reply with stop reason
+    ``refusal`` and Claude Code had no fallback model to answer instead.
+
+    Deterministic for the unchanged request, so neither the bridge nor Hermes
+    retries it (its body type ``refusal`` classifies as a content-policy
+    block). ``detail`` is the CLI's explanation ("… safeguards flagged this
+    message …").
+    """
+
+
+def _refusal_error(stdout: str, result: dict[str, Any] | None) -> ClaudeCodeRefusal | None:
+    """The refusal a failed turn ended in, from what the CLI itself wrote.
+
+    Claude Code 2.1.277 reports it as ``system/model_refusal_no_fallback``
+    followed by an ``is_error`` result with ``stop_reason`` "refusal" (its
+    subtype still says "success").
+    """
+
+    if isinstance(result, dict) and result.get("is_error") is False:
+        # A refusal the CLI's fallback model answered, or a successful
+        # result the client maps to ``content_filter``.
+        return None
+    refused = isinstance(result, dict) and result.get("stop_reason") == "refusal"
+    if not refused:
+        refused = any(
+            event.get("subtype") == "model_refusal_no_fallback"
+            for event in _stream_events(stdout, "system")
+        )
+    if not refused:
+        return None
+    text = result.get("result") if isinstance(result, dict) else None
+    detail = (
+        text.strip()[:1000]
+        if isinstance(text, str) and text.strip()
+        else "Claude declined to respond to this request."
+    )
+    return ClaudeCodeRefusal(
+        f"Claude Code refusal: {detail}",
+        body={"error": {"type": "refusal", "message": detail}},
+        detail=detail,
+    )
 
 
 class ClaudeCodeSoftLimitNotice(ClaudeCodeAPIError):
@@ -4974,7 +5037,7 @@ class ClaudeCodeSession:
                                 pass
                     elif kind == "restart":
                         if _gate is not None:
-                            _gate.restart()
+                            _gate.restart(text)
                     elif kind == "tick" and on_activity is not None:
                         try:
                             on_activity()
@@ -5964,11 +6027,15 @@ class ClaudeCodeSession:
             )
             # Route to the fresh-session fallback for this request.
             raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
-        if session_id and _is_expired_session_error(detail):
-            raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
         # The turn's result event, when the CLI got that far, says what the
         # API answered.
-        status, code, text = _result_error(_last_stream_event(stdout, "result"))
+        result_event = _last_stream_event(stdout, "result")
+        refusal = _refusal_error(stdout, result_event)
+        if refusal is not None:
+            raise refusal
+        if session_id and _is_expired_session_error(detail):
+            raise ClaudeCodeSessionExpired(f"Claude Code failed: {detail}")
+        status, code, text = _result_error(result_event)
         body = _api_error_body(status, code, text or detail[-300:]) if status or code else None
         # Rate-limit / spend-limit notices arrive as exit 1 with
         # is_error:true and a 429 / rate_limit signal.  These are
@@ -6144,6 +6211,10 @@ def _parse_stream_json_output(
             subtype = str(event.get("subtype") or "").strip().lower()
             errors = event.get("errors")
             if is_error is not False:
+                # A safety refusal: retrying the same request only repeats it.
+                refusal = _refusal_error(stdout, event)
+                if refusal is not None:
+                    raise refusal
                 detail = str(event.get("result") or errors or "is_error not false")[:300]
                 if _is_expired_session_error(detail) or (
                     isinstance(errors, list)

@@ -1643,7 +1643,8 @@ def _add_claude_code_reasoning(agent, kwargs: dict) -> None:
     bridge fell back to the global ``agent.reasoning_effort`` and ignored
     per-model ``reasoning_overrides``, ``/reasoning`` and presets. The bridge
     maps it to ``--effort`` (and ``--thinking disabled`` when reasoning is
-    off); only ``ClaudeCodeClient`` ever sees this key.
+    off); only ``ClaudeCodeClient`` ever sees this key. ``live_display`` (see
+    below) rides along the same way.
     """
 
     if not _is_claude_code_agent(agent):
@@ -1651,6 +1652,14 @@ def _add_claude_code_reasoning(agent, kwargs: dict) -> None:
     config = getattr(agent, "reasoning_config", None)
     if isinstance(config, dict):
         kwargs["reasoning"] = dict(config)
+    # Whether anything shows the reply live (streaming display, TTS). Without
+    # it the bridge sends the final answer in one piece, so text from an
+    # attempt Claude Code abandoned (dropped connection, refusal) never ends
+    # up in the delivered answer or the stored history.
+    try:
+        kwargs["live_display"] = bool(agent._has_stream_consumers())
+    except Exception:
+        pass
 
 
 

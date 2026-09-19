@@ -969,6 +969,102 @@ def test_monitor_detects_restarts_but_not_output_limit_continuations():
     assert seen.count("restart") == 2
 
 
+def test_monitor_names_a_refusal_restart():
+    seen = []
+    monitor = _TurnMonitor(lambda kind, text: seen.append((kind, text)), _Progress(),
+                           mode="warm", pid=1, started=time.monotonic(), payload_chars=0)
+
+    def stream(event):
+        monitor.observe({"type": "stream_event", "event": event})
+
+    def message(stop_reason, *, refusal_event=False):
+        stream({"type": "message_start", "message": {"id": f"m{len(seen)}"}})
+        stream({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}})
+        if refusal_event:
+            monitor.observe({"type": "system", "subtype": "model_refusal_fallback",
+                             "original_model": "claude-opus-5",
+                             "fallback_model": "claude-opus-4-8"})
+        if stop_reason:
+            stream({"type": "message_delta", "delta": {"stop_reason": stop_reason}})
+        stream({"type": "message_stop"})
+
+    message("refusal")
+    message("end_turn")  # the fallback model answers again: "refusal"
+    message(None, refusal_event=True)  # replaces a normal message: ""
+    message("end_turn")  # the CLI event alone names the refusal: "refusal"
+    message(None)  # ""
+    message("end_turn")  # after a dropped connection: ""
+    assert [text for kind, text in seen if kind == "restart"] == [
+        "refusal", "", "refusal", "", ""
+    ]
+
+
+def test_gate_restart_after_a_refusal_says_so():
+    out = []
+    gate = _StreamGate(out.append, commit_chars=5)
+    _feed(gate, "A reply the safeguards stopped halfway through")
+    shown = "".join(out)
+    gate.restart("refusal")
+    final = "The fallback model's answer."
+    _feed(gate, final)
+    answer = gate.finish(final)
+    assert answer == shown + ccs._STREAM_REFUSAL_RESTART_SEPARATOR + final
+    assert "Connection to Claude dropped" not in answer
+
+
+@pytest.mark.parametrize("tools", [True, False])
+def test_without_a_display_an_abandoned_attempt_never_reaches_the_answer(fake_cli, tools):
+    """Regression (f2): with streaming off nothing was shown live, yet the
+    abandoned attempt, a separator and the full answer were all delivered."""
+
+    answer = "Fresh full answer. " * 25 + "\n\nMEDIA:/tmp/hermes/report.pdf"
+    abandoned = "An earlier attempt that streamed for a while. " * 12
+    fake_cli.script({"text": answer, "abandoned": abandoned, "abandon": 400})
+    client = ClaudeCodeClient(command=fake_cli.command, cwd="/tmp")
+    content, _calls, finish, _ = _stream(
+        client, model="opus", messages=[{"role": "user", "content": "status?"}],
+        tools=TOOLS if tools else None, live_display=False,
+    )
+    assert content == answer.strip()
+    assert finish == ["stop"]
+    client.close()
+
+
+def test_agent_tells_the_bridge_whether_the_reply_is_displayed():
+    from agent.chat_completion_helpers import _add_claude_code_reasoning
+
+    agent = SimpleNamespace(provider="claude-code", base_url="acp://claude-code",
+                            reasoning_config=None, _has_stream_consumers=lambda: False)
+    kwargs = {}
+    _add_claude_code_reasoning(agent, kwargs)
+    assert kwargs == {"live_display": False}
+    agent._has_stream_consumers = lambda: True
+    _add_claude_code_reasoning(agent, kwargs)
+    assert kwargs == {"live_display": True}
+
+
+def test_client_runs_without_a_text_callback_when_nothing_shows_it(monkeypatch):
+    client = ClaudeCodeClient(cwd="/tmp")
+    seen = {}
+
+    def fake_run(prompt, *, on_text_chunk=None, on_activity=None, **kwargs):
+        seen["on_text_chunk"] = on_text_chunk
+        seen["on_activity"] = on_activity
+        return "Answer.", ""
+
+    monkeypatch.setattr(client._claude_session, "run", fake_run)
+    content, _calls, finish, _ = _stream(
+        client, model="opus", messages=[{"role": "user", "content": "q"}], live_display=False
+    )
+    assert seen["on_text_chunk"] is None and seen["on_activity"] is not None
+    assert content == "Answer." and finish == ["stop"]
+    list(client._create_chat_completion(
+        model="opus", messages=[{"role": "user", "content": "q"}], stream=True
+    ))
+    assert seen["on_text_chunk"] is not None  # default: a live display
+    client.close()
+
+
 # ---------------------------------------------------------------------------
 # stream-gate-hides-progress-sentence / progress-sentence-held-until-toolcall-done
 # ---------------------------------------------------------------------------
