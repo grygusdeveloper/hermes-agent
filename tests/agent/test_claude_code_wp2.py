@@ -318,7 +318,7 @@ MARKUP_MENTIONS = [
 
 
 @pytest.mark.parametrize("answer", MARKUP_MENTIONS)
-def test_delivered_answer_keeps_markup_quoted_in_code(answer):
+def test_answer_keeps_markup_quoted_in_code(answer):
     """Regression (f3): Hermes's content stripping removed tool-call markup
     inside inline code and fences (from the first mention to the next
     closing tag), mangling answers the bridge had parsed intact."""
