@@ -3373,6 +3373,14 @@ class GatewaySlashCommandsMixin:
         if provider != cc.CLAUDE_CODE_PROVIDER:
             return cc.not_claude_text(provider)
         if sub == "stop":
+            from gateway.run import _AGENT_PENDING_SENTINEL
+
+            key = self._session_key_for_source(event.source)
+            if self._running_agents.get(key) is _AGENT_PENDING_SENTINEL:
+                # The turn is still starting (transcript, media, agent build):
+                # no agent to interrupt yet. The regular /stop bumps the run
+                # generation and interrupts the agent the moment it exists.
+                return await self._busy_stop_command(event, key, event.source)
             return cc.do_stop(agent, running_agent)
         if sub == "reset" and running_agent is not None:
             return cc.BUSY_RESET_TEXT

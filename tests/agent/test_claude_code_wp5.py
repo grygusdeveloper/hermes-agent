@@ -1116,6 +1116,29 @@ def test_gateway_claude_reset_waits_for_the_running_turn():
     assert "can't run mid-turn" in busy
 
 
+def test_gateway_claude_stop_while_the_turn_is_starting_stops_it():
+    """Regression (WP5-R2): before the turn's agent exists (pending sentinel)
+    ``/claude stop`` said "not answering" and the turn ran to completion."""
+
+    from unittest.mock import AsyncMock
+
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    idle = MagicMock()
+    idle.describe.return_value = {"busy": False}
+    cached = SimpleNamespace(
+        provider="claude-code", model=MODEL, client=SimpleNamespace(_claude_session=idle)
+    )
+    runner = _runner(agent=cached, running=_AGENT_PENDING_SENTINEL)
+    runner._interrupt_and_clear_session = AsyncMock()
+    event = _event("stop")
+    reply = asyncio.run(runner._busy_claude_command(event, "sk", event.source))
+    runner._interrupt_and_clear_session.assert_awaited_once()
+    assert runner._interrupt_and_clear_session.await_args.args[0] == "sk"
+    assert "not answering" not in str(getattr(reply, "text", reply))
+    idle.abort.assert_not_called()
+
+
 def test_media_auto_append_names_results_by_their_own_tool():
     from gateway.run import _collect_auto_append_media_tags
 
