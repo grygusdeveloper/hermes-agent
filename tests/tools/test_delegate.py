@@ -1750,3 +1750,39 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClaudeCodeDelegationProvider(unittest.TestCase):
+    """delegation.provider: claude-code keeps the bridge's identity.
+
+    The resolver hands back the CLI path as the ACP command; relabelling the
+    child copilot-acp made it run `claude acp` (2026-09-19, subagent failed
+    three times and fell back to zai).
+    """
+
+    def test_claude_code_child_is_not_relabelled_copilot_acp(self):
+        parent = _make_mock_parent()
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "shutil.which", return_value="/root/.local/bin/claude"
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Investigate",
+                context=None,
+                toolsets=None,
+                model="claude-sonnet-5",
+                max_iterations=10,
+                parent_agent=parent,
+                override_provider="claude-code",
+                override_base_url="acp://claude-code",
+                override_api_key="claude-code",
+                override_api_mode="chat_completions",
+                override_acp_command="/root/.local/bin/claude",
+                task_count=1,
+                role="leaf",
+            )
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "claude-code")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertEqual(kwargs["model"], "claude-sonnet-5")

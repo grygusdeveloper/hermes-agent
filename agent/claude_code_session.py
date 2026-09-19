@@ -172,6 +172,11 @@ _CLI_ENV_DEFAULTS = {
     # subscription within its limits), pinned: Discord replies often come
     # more than 5 minutes apart.
     "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h",
+    # One reply is one step of a chat turn, never a 64k-token document. A
+    # runaway reply (Claude writing calls in a syntax Hermes does not run,
+    # then continuing without results) is cut here instead of at the CLI's
+    # 64k default; a cut-off call gets the split-the-payload repair turn.
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000",
 }
 
 
@@ -1064,6 +1069,12 @@ def _system_prompt_file(system_prompt: str) -> str:
 # answer is a mention, not a broken call.
 _TOOL_CALL_OPEN_RE = re.compile(r"<tool_call(?:\s[^>]*)?>(?=\s*(?:\{|\Z))")
 _TOOL_CALL_CLOSE_RE = re.compile(r"</tool_call\s*>")
+# Claude's native tool-use XML. Hermes runs none of it; a reply that uses it
+# instead of <tool_call> would otherwise be delivered as prose (observed:
+# 116 <invoke> blocks, 64k output tokens, streamed into Discord).
+_PSEUDO_NATIVE_RE = re.compile(
+    r"<(?:antml:)?(?:invoke|function_calls)(?![A-Za-z0-9_])(?:\s+name=\"([^\"]*)\")?"
+)
 # A closing tag without a start is the tail of a cut-off call only when the
 # text before it ends like a JSON object; otherwise it is a mention in prose.
 _ORPHAN_TAIL_RE = re.compile(r"[}\]]\s*\Z")
@@ -1285,6 +1296,18 @@ def _parse_claude_reply(text: str | None) -> _ClaudeReply:
     masked = _mask_code(text)
     first = _TOOL_CALL_OPEN_RE.search(masked)
     prose_end = first.start() if first is not None else len(text)
+    pseudo = _PSEUDO_NATIVE_RE.search(masked, 0, prose_end)
+    if pseudo is not None:
+        # Native-syntax calls before any <tool_call>: nothing runs, nothing
+        # of the markup is prose, and the repair turn restates the protocol.
+        failure = _ToolCallFailure(
+            0,
+            (pseudo.group(1) or "").strip(),
+            "tool calls written as <invoke>/<parameter> XML instead of "
+            "<tool_call>{JSON}</tool_call>; Hermes runs no native tools",
+            _excerpt(text, pseudo.start()),
+        )
+        return _ClaudeReply([], [failure], text[: pseudo.start()].strip(), text, "", False)
     orphan = next(
         (
             closing
@@ -1430,6 +1453,13 @@ def _tool_call_repair_prompt(reply: _ClaudeReply, *, shown: bool = False) -> str
             "The text after your last </tool_call> was discarded: tool results "
             "come only from Hermes."
         )
+    if any("<invoke>" in failure.error for failure in reply.failures):
+        lines.append(
+            "Hermes has no native tools, so <invoke>, <function_calls> and "
+            "<parameter> tags do nothing. Write each call as one "
+            '<tool_call>{"id": "...", "name": "...", "arguments": {...}}</tool_call> '
+            "block and stop after the last one; Hermes returns the results."
+        )
     lines.append(
         "Re-emit every tool call from that reply now, each as "
         '<tool_call>{"id": "c1", "name": "...", "arguments": {...}}</tool_call> '
@@ -1470,7 +1500,9 @@ _STREAM_HOLDBACK_CHARS = 16
 # Opening or closing tags; inline-code mentions also pause live streaming
 # (the gate cannot know yet whether the span closes) and are released by
 # finish(). Only fenced blocks stream through.
-_TOOL_MARKUP_RE = re.compile(r"</?tool_call(?![A-Za-z0-9_])")
+_TOOL_MARKUP_RE = re.compile(
+    r"</?tool_call(?![A-Za-z0-9_])|<(?:antml:)?(?:invoke|function_calls)(?![A-Za-z0-9_])"
+)
 # Shown between the part of an answer the user already saw and the full
 # answer, when Claude Code abandoned the message it was streaming (a dropped
 # API connection makes it re-stream the whole message) or the final text does

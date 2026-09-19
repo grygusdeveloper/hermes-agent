@@ -1552,6 +1552,15 @@ def _build_child_agent(
         ):
             effective_provider = "cursor"
             effective_api_mode = "chat_completions"
+        elif (
+            str(effective_provider or "").strip().lower() == "claude-code"
+            or str(effective_base_url or "").strip().lower().startswith("acp://claude-code")
+        ):
+            # The Claude Code bridge has its own client (ClaudeCodeClient);
+            # relabelling it copilot-acp would run `claude acp`, which the
+            # CLI does not have.
+            effective_provider = "claude-code"
+            effective_api_mode = "chat_completions"
         else:
             effective_provider = "copilot-acp"
             effective_api_mode = "chat_completions"
