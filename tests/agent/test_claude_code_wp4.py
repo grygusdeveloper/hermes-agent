@@ -887,19 +887,24 @@ def test_usage_limit_ends_the_turn_at_once_with_the_reset_time(monkeypatch):
     assert calls == 1
     assert result["failed"] is True and result["failure_reason"] == "rate_limit"
     assert result["final_response"].startswith("Claude 5-hour session limit reached — resets ")
-    assert any(s.startswith("⏳ Claude 5-hour session limit reached") for s in statuses)
+    # Regression (f5): the limit is the reply; a status line said it again.
+    assert not any(s.startswith("⏳") for s in statuses)
     assert reasons == []  # no fallback configured
 
 
 def test_usage_limit_falls_back_with_its_reason(monkeypatch):
     agent = _claude_agent(fallback_model=[{"provider": "zai", "model": "glm-5.3"}])
     try:
-        result, _statuses, reasons, calls = _drive(agent, _usage_limit_error(), monkeypatch)
+        result, statuses, reasons, calls = _drive(agent, _usage_limit_error(), monkeypatch)
     finally:
         agent.close()
     assert reasons == [FailoverReason.rate_limit]
     assert calls == 1
     assert "5-hour session limit reached" in result["final_response"]
+    # Announced before the fallback takes over.
+    assert [s for s in statuses if s.startswith("⏳")] == [
+        s for s in statuses if s.startswith("⏳ Claude 5-hour session limit reached")
+    ] != []
 
 
 class _BillingError(Exception):

@@ -4996,14 +4996,16 @@ def run_conversation(
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
 
-                # Claude subscription limit: say so right away (not buffered),
-                # with the reset time. The eager fallback below switches to a
-                # fallback provider when one is configured; otherwise the turn
-                # ends here instead of retrying a limit that holds until its
-                # reset.
+                # Claude subscription limit, with the reset time. The eager
+                # fallback below switches to a fallback provider when one is
+                # configured (announcing the limit first, not buffered);
+                # otherwise the turn ends here with the limit as its reply
+                # instead of retrying a limit that holds until its reset.
                 _claude_limit = _claude_code_limit_notice(agent, classified)
-                if _claude_limit and not _retry.primary_failure_notice:
-                    agent._emit_status(f"⏳ {_claude_limit}")
+                _announce_claude_limit = bool(
+                    _claude_limit and not _retry.primary_failure_notice
+                )
+                if _announce_claude_limit:
                     _remember_primary_failure(agent, _retry, _claude_limit)
 
                 # Eager fallback for rate-limit errors (429 or quota exhaustion)
@@ -5075,6 +5077,10 @@ def run_conversation(
                         _remember_primary_failure(
                             agent, _retry, f"Claude Code failed: {agent._summarize_api_error(api_error)}"
                         )
+                        if _announce_claude_limit:
+                            # Before the fallback's own notice. Without a
+                            # fallback the limit is the reply itself: once.
+                            agent._emit_status(f"⏳ {_claude_limit}")
                         if agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
