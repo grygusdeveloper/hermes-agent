@@ -555,10 +555,9 @@ def do_stop(agent: Any, running_agent: Any) -> str:
             logger.debug("Agent interrupt for /claude stop failed", exc_info=True)
         if session is not None:
             session.abort()
-        return (
-            "⏹ Stopping Claude's reply. The Claude session is kept; your next "
-            "message continues after the interrupted reply."
-        )
+        # No promise about the next message: whether Claude still holds the
+        # stopped reply depends on how the interrupt landed.
+        return "⏹ Stopping Claude's reply. The Claude session is kept."
     if session is not None and session.describe().get("busy"):
         session.abort()
         return "⏹ Stopped the running Claude Code request."

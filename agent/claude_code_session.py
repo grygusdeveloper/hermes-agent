@@ -350,6 +350,39 @@ def _normalize_for_digest(value: Any) -> Any:
     return str(value)
 
 
+def _durable_text(message: dict[str, Any]) -> str:
+    """The content text a message's fingerprint hashes (trusted out-of-band
+    suffix removed)."""
+
+    durable_content = _render_content(message.get("content"))
+    trusted_oob = message.get("_hermes_oob_user_message")
+    if (
+        isinstance(trusted_oob, str)
+        and trusted_oob
+        and durable_content.endswith(trusted_oob)
+    ):
+        durable_content = durable_content[: -len(trusted_oob)]
+    return durable_content
+
+
+def _text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _last_user_text_digest(messages: list[dict[str, Any]]) -> tuple[int, str] | None:
+    """``(length, sha256)`` of the request's last message when it is a plain
+    text user message (no text is retained)."""
+
+    rows = [message for message in messages if isinstance(message, dict)]
+    if not rows:
+        return None
+    last = rows[-1]
+    if str(last.get("role") or "").lower() != "user" or not isinstance(last.get("content"), str):
+        return None
+    text = _durable_text(last)
+    return len(text), _text_digest(text)
+
+
 def _message_fingerprint(messages: list[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
     """Return exact structural prefix identity without retaining prompt text."""
 
@@ -358,14 +391,7 @@ def _message_fingerprint(messages: list[dict[str, Any]]) -> tuple[tuple[str, str
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").lower()
-        durable_content = _render_content(message.get("content"))
-        trusted_oob = message.get("_hermes_oob_user_message")
-        if (
-            isinstance(trusted_oob, str)
-            and trusted_oob
-            and durable_content.endswith(trusted_oob)
-        ):
-            durable_content = durable_content[: -len(trusted_oob)]
+        durable_content = _durable_text(message)
         # ``name`` is deliberately not part of the identity. Live tool results
         # carry it, but history reloaded from the session DB does not (only
         # ``tool_name``, which the chat-completions transport strips), so
@@ -2247,6 +2273,8 @@ class _InterruptContext(NamedTuple):
     # Checkpoints that are ancestors of the chain the run resumed (a rewind
     # drops those of the branch it abandoned).
     checkpoints: tuple[tuple[int, str], ...] = ()
+    # ``_last_user_text_digest`` of the request (see ``_InterruptedTurn``).
+    last_user: tuple[int, str] | None = None
 
 
 class _InterruptedTurn(NamedTuple):
@@ -2264,6 +2292,10 @@ class _InterruptedTurn(NamedTuple):
     marker: str
     # Checkpoints still valid in the chain that ends at ``marker``.
     checkpoints: tuple[tuple[int, str], ...] = ()
+    # ``(length, sha256)`` of the request's last user message: Hermes merges
+    # it with the next user message (alternation repair) when the stopped
+    # turn left no reply in its history.
+    last_user: tuple[int, str] | None = None
 
 
 class ClaudeCodeSessionExpired(RuntimeError):
@@ -3392,6 +3424,42 @@ def _time_line(now_label: str | None) -> str:
 
 def _has_user_turn(fingerprints: tuple[tuple[str, str], ...]) -> bool:
     return any(role not in {"assistant", "tool"} for role, _digest in fingerprints)
+
+
+def _merged_follow_up(
+    messages: list[dict[str, Any]],
+    current: tuple[tuple[str, str], ...],
+    interrupted: "_InterruptedTurn",
+) -> str | None:
+    """The prompt for a follow-up Hermes merged into the interrupted request.
+
+    A stopped plain reply leaves no assistant row, so Hermes's alternation
+    repair joins the next user message to the interrupted one ("<interrupted>
+    \\n\\n<new>"). When the request is otherwise unchanged and the merged
+    message starts with exactly the interrupted text, only the new text is
+    sent after the "[Request interrupted by user]" entry. None otherwise.
+    """
+
+    last = interrupted.last_user
+    count = len(interrupted.fingerprints)
+    if last is None or count < 1 or len(current) < count:
+        return None
+    if current[: count - 1] != interrupted.fingerprints[: count - 1]:
+        return None
+    if _has_foreign_reply(messages, count - 1):
+        return None
+    rows = [message for message in messages if isinstance(message, dict)]
+    message = rows[count - 1]
+    content = message.get("content")
+    if str(message.get("role") or "").lower() != "user" or not isinstance(content, str):
+        return None
+    length, digest = last
+    text = _durable_text(message)
+    if text[length : length + 2] != "\n\n" or _text_digest(text[:length]) != digest:
+        return None
+    # ``content`` starts with ``text`` (only a trusted suffix differs).
+    added = content[length + 2 :]
+    return f"User:\n{added}" if added.strip() else None
 
 
 def _has_foreign_reply(messages: list[dict[str, Any]], reply: int) -> bool:
@@ -4550,7 +4618,12 @@ class ClaudeCodeSession:
                 prompt = f"{prompt}\n\n{time_line}"
             # A graceful interrupt of this run leaves it resumable.
             self._interrupt_context = _InterruptContext(
-                self._session_id, self._previous_messages, current, persist, plan.checkpoints
+                self._session_id,
+                self._previous_messages,
+                current,
+                persist,
+                plan.checkpoints,
+                _last_user_text_digest(messages),
             )
             try:
                 response, reasoning, session_id = self._execute_with_soft_limit_retry(
@@ -4816,23 +4889,35 @@ class ClaudeCodeSession:
             return None
         self._interrupted_turn = None
         count = len(interrupted.fingerprints)
-        usable = (
+        resumable = (
             interrupted.session_id == self._session_id
             and interrupted.base == self._previous_messages
-            and len(current) > count
-            and current[:count] == interrupted.fingerprints
-            # Claude's partial reply may follow the request; any later
-            # assistant turn is another provider's (see _has_foreign_reply).
-            and not _has_foreign_reply(messages, count)
             and (
                 self._session_persisted
                 or (keepalive and self._warm_parked_at(self._session_id, interrupted.marker))
             )
         )
-        if not usable:
+        if not resumable:
             return None
+        head = ""
+        if (
+            len(current) > count
+            and current[:count] == interrupted.fingerprints
+            # Claude's partial reply may follow the request; any later
+            # assistant turn is another provider's (see _has_foreign_reply).
+            and not _has_foreign_reply(messages, count)
+        ):
+            pass
+        else:
+            # The stopped turn left no reply in Hermes's history, so the next
+            # user message was merged into the interrupted one.
+            head = _merged_follow_up(messages, current, interrupted) or ""
+            if not head:
+                return None
         offset = _prefix_image_count(messages, count)
         prompt, images = _incremental_prompt_with_images(messages, count, image_offset=offset)
+        if head:
+            prompt = f"{head}\n\n{prompt}" if prompt else head
         if not prompt:
             return None
         # Kept until this continuation is published: a failed attempt can
@@ -4840,10 +4925,11 @@ class ClaudeCodeSession:
         self._interrupted_turn = interrupted
         _LOG.info(
             "Claude Code continuation: mode=interrupted messages=%d resume_at=%s "
-            "(after the interrupted request of %d messages)",
+            "(after the interrupted request of %d messages%s)",
             len(current),
             interrupted.marker,
             count,
+            ", merged follow-up" if head else "",
         )
         return _Continuation(
             "interrupted",
@@ -4852,7 +4938,7 @@ class ClaudeCodeSession:
             interrupted.marker,
             interrupted.checkpoints,
             offset,
-            _has_user_turn(current[count:]),
+            bool(head) or _has_user_turn(current[count:]),
         )
 
     def _next_checkpoints(
@@ -5976,6 +6062,7 @@ class ClaudeCodeSession:
                     context.fingerprints,
                     marker,
                     context.checkpoints,
+                    context.last_user,
                 )
                 recorded = True
         if not parked:

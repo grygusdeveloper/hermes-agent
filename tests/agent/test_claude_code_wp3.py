@@ -709,6 +709,63 @@ def test_interrupted_request_resumes_cold_at_the_marker(fake_cli):
     session.shutdown()
 
 
+@pytest.mark.parametrize("warm", [True, False])
+def test_follow_up_merged_into_the_stopped_request_continues_after_it(fake_cli, warm):
+    """Regression (L1, interrupt re-park): a stopped plain reply leaves no
+    assistant row, so Hermes merges the next user message into the stopped
+    one ("count\n\nnew question"). That no longer extended the interrupted
+    request: the parked process was discarded and Claude lost the partial
+    reply and the interruption."""
+
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    fake_cli.script({"text": "Hello."}, {"text": LONG, "delay": 0.02, "chunk": 5}, {"text": "Next."})
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run(session, fake_cli, history)
+    history += [{"role": "assistant", "content": "Hello."}, {"role": "user", "content": "count"}]
+    _interrupt_second_turn(session, fake_cli, history)
+    marker = session._interrupted_turn.marker
+    if not warm:
+        session._discard_warm()  # e.g. evicted while idle: resume cold at the marker
+    history = [dict(m) for m in history] + [{"role": "user", "content": "new question"}]
+    assert repair_message_sequence(None, history) == 1
+    assert history[-1]["content"] == "count\n\nnew question"
+    assert _run(session, fake_cli, history)[0] == "Next."
+    spawns = fake_cli.events("spawn")
+    if warm:
+        assert len(spawns) == 1  # the parked process answers
+    else:
+        argv = spawns[-1]["argv"]
+        assert argv[argv.index("--resume-session-at") + 1] == marker
+    turn = fake_cli.events("turn")[-1]
+    assert turn["content"] == "User:\nnew question"  # "count" is never sent twice
+    assert turn["context"][-2] == "[Request interrupted by user]"
+    # The published history is Hermes's merged one: the next turn advances.
+    history += [{"role": "assistant", "content": "Next."}, {"role": "user", "content": "more"}]
+    fake_cli.script({"text": "More."})
+    assert _run(session, fake_cli, history)[0] == "More."
+    assert fake_cli.events("turn")[-1]["content"] == "User:\nmore"
+    session.shutdown()
+
+
+def test_edited_stopped_request_is_not_continued(fake_cli):
+    fake_cli.script({"text": "Hello."}, {"text": LONG, "delay": 0.02, "chunk": 5}, {"text": "Next."})
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run(session, fake_cli, history)
+    history += [{"role": "assistant", "content": "Hello."}, {"role": "user", "content": "count"}]
+    _interrupt_second_turn(session, fake_cli, history)
+    published = session._checkpoints[-1][1]
+    # Not the stopped text followed by more: resume at the published reply.
+    history[-1] = {"role": "user", "content": "countdown\n\nnew question"}
+    assert _run(session, fake_cli, history)[0] == "Next."
+    argv = fake_cli.events("spawn")[-1]["argv"]
+    assert argv[argv.index("--resume-session-at") + 1] == published
+    assert fake_cli.events("turn")[-1]["content"] == "User:\ncountdown\n\nnew question"
+    session.shutdown()
+
+
 def test_fallback_answer_after_an_interrupted_request_is_replayed(fake_cli):
     """Regression (H1): an answer another provider gave after the interrupted
     request is not in the Claude session; continuing at the marker with only

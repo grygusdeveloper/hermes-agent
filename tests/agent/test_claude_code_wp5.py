@@ -985,6 +985,8 @@ def test_stop_interrupts_the_running_agent_and_the_claude_turn():
     running.interrupt.assert_called_once_with()
     session.abort.assert_called_once_with()
     assert "Stopping Claude's reply" in text
+    # Regression (L1): no promise that the next message continues the reply.
+    assert "continues" not in text
     idle = MagicMock()
     idle.describe.return_value = {"busy": False}
     assert "not answering" in cc.do_stop(SimpleNamespace(client=SimpleNamespace(_claude_session=idle)), None)
