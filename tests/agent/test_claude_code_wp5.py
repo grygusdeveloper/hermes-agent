@@ -152,7 +152,14 @@ FAKE_CLI = textwrap.dedent(
         out({"type": "control_response", "response": {
             "subtype": "success", "request_id": msg["request_id"], "response": payload}})
 
-    cost = 0.0
+    # Like Claude Code, --resume restores the session's cumulative cost and
+    # modelUsage from the cost state its last clean exit saved (this fake
+    # saves it after every turn; FAKE_NO_COST_STATE: the process was killed).
+    cost_path = os.path.join(store, (arg("--resume") or sid) + ".cost.json")
+    cost, tokens = 0.0, [0, 0, 0]
+    if "--resume" in argv and os.path.exists(cost_path):
+        saved = json.load(open(cost_path))
+        cost, tokens = saved["cost"], saved["tokens"]
     for line in sys.stdin:
         msg = json.loads(line)
         if msg.get("type") == "control_request":
@@ -177,11 +184,18 @@ FAKE_CLI = textwrap.dedent(
              "message": {"id": "msg_" + uid[:8], "model": model,
                          "content": [{"type": "text", "text": text}]}})
         cost += float(reply.get("cost", 0.25))
+        tokens = [tokens[0] + 100, tokens[1] + 900, tokens[2] + 50]
         out({"type": "result", "subtype": "success", "is_error": False, "result": text,
              "session_id": sid, "stop_reason": "end_turn", "total_cost_usd": cost,
              "duration_api_ms": 1200,
              "usage": {"input_tokens": 100, "cache_read_input_tokens": 900,
-                       "output_tokens": 50}})
+                       "output_tokens": 50},
+             "modelUsage": {model: {"inputTokens": tokens[0], "cacheReadInputTokens": tokens[1],
+                                    "outputTokens": tokens[2], "cacheCreationInputTokens": 0,
+                                    "costUSD": cost}}})
+        if persist and not os.environ.get("FAKE_NO_COST_STATE"):
+            with open(os.path.join(store, sid + ".cost.json"), "w") as fh:
+                json.dump({"cost": cost, "tokens": tokens}, fh)
     """
 )
 
@@ -227,7 +241,8 @@ def fake_cli(tmp_path, monkeypatch):
 
 
 def _env(**extra):
-    keys = ("PATH", "FAKE_CLAUDE_LOG", "FAKE_CLAUDE_STORE", "FAKE_CLAUDE_SCRIPT", "FAKE_IGNORE_CONTROL")
+    keys = ("PATH", "FAKE_CLAUDE_LOG", "FAKE_CLAUDE_STORE", "FAKE_CLAUDE_SCRIPT", "FAKE_IGNORE_CONTROL",
+            "FAKE_NO_COST_STATE")
     env = {key: os.environ[key] for key in keys if key in os.environ}
     env.update(extra)
     return env
@@ -449,6 +464,68 @@ def test_conversation_loop_shows_bridge_notices_only_for_claude_code():
     cli = SimpleNamespace(provider="claude-code", platform="cli", _emit_status=shown.append)
     _show_provider_notices(cli, usage)
     assert len(shown) == 2
+
+
+@pytest.mark.parametrize("keepalive", ["0", "30"])
+@pytest.mark.parametrize("cost_state", [True, False])
+def test_turn_cost_is_the_turns_own_on_a_resumed_process(fake_cli, monkeypatch, keepalive, cost_state):
+    """Regression (f6): ``--resume`` restores the session's cumulative cost,
+    so every turn served by a new process (warm expiry, gateway restart)
+    reported the whole session's cost: footers showed $1, $2, $3, $4."""
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", keepalive)
+    if not cost_state:
+        monkeypatch.setenv("FAKE_NO_COST_STATE", "1")  # killed: nothing restored
+    fake_cli.script(*[{"cost": 1.0}] * 4)
+    session = ClaudeCodeSession()
+    seen = []
+    for n in range(1, 5):
+        before = session.cost_total_usd
+        _run(session, fake_cli, _history(n))
+        seen.append((session.last_usage["total_cost_usd"], session.cost_total_usd - before))
+    assert seen == [(pytest.approx(1.0), pytest.approx(1.0))] * 4
+    spawns = fake_cli.events("spawn")
+    assert len(spawns) == (4 if keepalive == "0" else 1)
+    session.shutdown()
+
+
+def test_turn_cost_survives_a_gateway_restart(fake_cli, monkeypatch):
+    """A new ClaudeCodeSession (restart, agent-cache eviction) knows the
+    session's last total from the durable state."""
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    fake_cli.script(*[{"cost": 1.0}] * 3)
+    _run(ClaudeCodeSession(), fake_cli, _history(1))
+    _run(ClaudeCodeSession(), fake_cli, _history(2))
+    assert ccs._load_durable_state("root|main").cli_cost_usd == pytest.approx(2.0)
+    session = ClaudeCodeSession()
+    _run(session, fake_cli, _history(3))
+    assert "--resume" in fake_cli.events("spawn")[-1]["argv"]
+    assert session.last_usage["total_cost_usd"] == pytest.approx(1.0)
+    assert session.cost_total_usd == pytest.approx(1.0)
+
+
+def test_unknown_restored_cost_is_left_out(fake_cli, monkeypatch):
+    """No known baseline for a restored session: no cost rather than the
+    session's total (the footer then leaves the cost out)."""
+
+    from gateway import claude_code_commands as cc
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    fake_cli.script(*[{"cost": 1.0}] * 2)
+    _run(ClaudeCodeSession(), fake_cli, _history(1))
+    state = ccs._load_durable_state("root|main")
+    ccs._save_durable_state(  # a state written before the baseline was kept
+        "root|main", state.session_id, state.fingerprints, model=state.model,
+        effort=state.effort, tools_digest=state.tools_digest,
+        system_digest=state.system_digest, checkpoints=state.checkpoints,
+    )
+    agent = SimpleNamespace(provider="claude-code", model=MODEL,
+                            client=SimpleNamespace(_claude_session=ClaudeCodeSession()))
+    before = cc.cost_total(agent)
+    _run(agent.client._claude_session, fake_cli, _history(2))
+    assert agent.client._claude_session.last_usage["total_cost_usd"] is None
+    assert "turn_cost_usd" not in (cc.footer_meta(agent, cost_before=before) or {})
 
 
 def test_cost_total_sums_every_cli_turn(fake_cli):

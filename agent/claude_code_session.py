@@ -510,6 +510,9 @@ class _DurableState(NamedTuple):
     # oldest first: resuming at ``assistant_uuid`` restores Claude's view of
     # the first ``request_message_count`` messages plus its own reply.
     checkpoints: tuple[tuple[int, str], ...]
+    # The session's cumulative ``total_cost_usd`` after its last CLI turn:
+    # what ``--resume`` restores (see ``_restored_cost_baseline``).
+    cli_cost_usd: float | None = None
 
 
 def _load_durable_state(state_key: str) -> _DurableState | None:
@@ -570,6 +573,7 @@ def _load_durable_state(state_key: str) -> _DurableState | None:
         ):
             return None
         checkpoints.append((count, uuid_text))
+    cli_cost = payload.get("cli_cost_usd")
     return _DurableState(
         session_id=session_id,
         fingerprints=tuple(fingerprints),
@@ -578,6 +582,13 @@ def _load_durable_state(state_key: str) -> _DurableState | None:
         tools_digest=tools_digest,
         system_digest=system_digest,
         checkpoints=tuple(checkpoints),
+        cli_cost_usd=(
+            float(cli_cost)
+            if isinstance(cli_cost, (int, float))
+            and not isinstance(cli_cost, bool)
+            and cli_cost >= 0
+            else None
+        ),
     )
 
 
@@ -591,6 +602,7 @@ def _save_durable_state(
     tools_digest: str,
     system_digest: str = "",
     checkpoints: tuple[tuple[int, str], ...] = (),
+    cli_cost_usd: float | None = None,
 ) -> None:
     directory = _state_dir()
     path = _state_path(state_key)
@@ -605,6 +617,8 @@ def _save_durable_state(
         "system_digest": system_digest,
         "checkpoints": [list(item) for item in checkpoints[-_MAX_CHECKPOINTS:]],
     }
+    if cli_cost_usd is not None:
+        payload["cli_cost_usd"] = cli_cost_usd
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     with _STATE_LOCK:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1718,6 +1732,10 @@ class _WarmProcessGone(RuntimeError):
     """A parked process died before producing any output for the new turn."""
 
 
+# Claude sessions whose cumulative CLI cost a ClaudeCodeSession remembers.
+_CLI_COST_SESSIONS_KEPT = 16
+
+
 class _WarmProcess:
     """One ``claude -p`` stream-json process that can serve several turns.
 
@@ -1735,7 +1753,12 @@ class _WarmProcess:
         # its in-memory conversation ends at. It may only serve a resume at
         # exactly this checkpoint.
         self.tip: str | None = None
-        self.cost_total = 0.0
+        # The process's cumulative ``total_cost_usd`` after its latest turn;
+        # None until the first result of a ``--resume`` spawn, whose total
+        # starts at the cost the CLI restored for the session.
+        self.cost_total: float | None = 0.0
+        # The session's cumulative cost we last saw (the likely restored one).
+        self.restored_cost: float | None = None
         self.turns = 0
         self._stderr: list[str] = []
         self._stderr_lock = threading.Lock()
@@ -3812,6 +3835,9 @@ class ClaudeCodeSession:
         # Sum of every CLI turn's API-equivalent cost this session reported
         # (retried attempts included): callers diff it around a Hermes turn.
         self._cost_total_usd = 0.0
+        # Cumulative CLI cost per Claude session id after its latest turn:
+        # the baseline a ``--resume`` of it restores.
+        self._cli_cost_by_sid: dict[str, float] = {}
         self._warm: _WarmProcess | None = None
         self._progress = _Progress()
         # Per-turn log context set by the retry loop ("turn=2 reason=…").
@@ -4126,6 +4152,20 @@ class ClaudeCodeSession:
         self._bound_system_digest = durable.system_digest
         self._checkpoints = durable.checkpoints
         self._session_persisted = True
+        if durable.cli_cost_usd is not None:
+            # Another process may have run later turns of it (costs only grow).
+            known = self._cli_cost_by_sid.get(durable.session_id)
+            if known is None or durable.cli_cost_usd > known:
+                self._remember_cli_cost(durable.session_id, durable.cli_cost_usd)
+
+    def _remember_cli_cost(self, session_id: str | None, total: float) -> None:
+        if not session_id:
+            return
+        costs = self._cli_cost_by_sid
+        costs.pop(session_id, None)
+        costs[session_id] = total
+        while len(costs) > _CLI_COST_SESSIONS_KEPT:
+            costs.pop(next(iter(costs)))
 
     def _warm_parked_at(self, session_id: str | None, tip: str | None) -> bool:
         warm = self._warm
@@ -4878,6 +4918,7 @@ class ClaudeCodeSession:
                 tools_digest=tools_digest,
                 system_digest=system_digest,
                 checkpoints=self._checkpoints,
+                cli_cost_usd=self._cli_cost_by_sid.get(session_id),
             )
 
     def _execute_with_soft_limit_retry(
@@ -5626,6 +5667,11 @@ class ClaudeCodeSession:
             # Only real subprocesses are parked; test doubles run one turn.
             can_park = keep_seconds > 0 and isinstance(process, subprocess.Popen)
             warm = _WarmProcess(process, session_id=session_id, identity=identity)
+            if session_id:
+                # ``--resume`` restores the session's cumulative cost; the
+                # first result tells how much of its total is this turn's.
+                warm.cost_total = None
+                warm.restored_cost = self._cli_cost_by_sid.get(session_id)
             return self._run_turn(
                 warm,
                 input_payload,
@@ -5852,12 +5898,20 @@ class ClaudeCodeSession:
                 self._raise_process_failure(process.returncode, stdout, stderr, session_id)
             # Clean exit without a result: let the strict parser explain it.
             return self._parse_turn(
-                stdout, session_id, cost_offset=warm.cost_total, stop_reasons=monitor.stop_reasons
+                stdout,
+                session_id,
+                cost_offset=warm.cost_total,
+                restored_cost=warm.restored_cost,
+                stop_reasons=monitor.stop_reasons,
             )
 
         try:
             response, reasoning, sid = self._parse_turn(
-                stdout, session_id, cost_offset=warm.cost_total, stop_reasons=monitor.stop_reasons
+                stdout,
+                session_id,
+                cost_offset=warm.cost_total,
+                restored_cost=warm.restored_cost,
+                stop_reasons=monitor.stop_reasons,
             )
         except BaseException:
             warm.close()
@@ -5878,6 +5932,7 @@ class ClaudeCodeSession:
         total_cost = self._last_usage.get("_cumulative_cost_usd")
         if isinstance(total_cost, (int, float)):
             warm.cost_total = float(total_cost)
+            self._remember_cli_cost(sid, float(total_cost))
         if monitor.fallback_session_wide:
             # Claude Code swapped the whole session to the fallback model; a
             # new process resumes it on the requested model again.
@@ -6066,7 +6121,8 @@ class ClaudeCodeSession:
         stdout: str,
         session_id: str | None,
         *,
-        cost_offset: float,
+        cost_offset: float | None,
+        restored_cost: float | None = None,
         stop_reasons: dict[str, str | None] | None = None,
     ) -> tuple[str, str, str]:
         try:
@@ -6084,12 +6140,22 @@ class ClaudeCodeSession:
         self._last_turn_synthetic = _assistant_is_synthetic(last_assistant)
         usage = _parse_stream_json_usage(stdout)
         # ``total_cost_usd`` is cumulative for the lifetime of one CLI
-        # process; report this turn's share.
+        # process, starting from what ``--resume`` restored; report this
+        # turn's share, or nothing when that share is unknown.
         cumulative = usage.get("total_cost_usd")
+        model_tokens = usage.pop("_model_usage_tokens", None)
         if isinstance(cumulative, (int, float)):
             usage["_cumulative_cost_usd"] = float(cumulative)
-            usage["total_cost_usd"] = max(0.0, float(cumulative) - cost_offset)
-            self._cost_total_usd += usage["total_cost_usd"]
+            offset = cost_offset
+            if offset is None:
+                offset = _restored_cost_baseline(
+                    float(cumulative), restored_cost, model_tokens, usage.get("total_tokens")
+                )
+            if offset is None:
+                usage["total_cost_usd"] = None
+            else:
+                usage["total_cost_usd"] = max(0.0, float(cumulative) - offset)
+                self._cost_total_usd += usage["total_cost_usd"]
         self._last_usage = usage
         return response, reasoning, result_session_id
 
@@ -6485,6 +6551,7 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
     prompt_tokens = input_tokens + cache_write_tokens + cached_tokens
     service_tier = raw.get("service_tier")
     total_cost = result.get("total_cost_usd")
+    model_tokens = _model_usage_tokens(result.get("modelUsage"))
     context_window, max_output_tokens = _model_usage_limits(
         result.get("modelUsage"), served_by=served_by
     )
@@ -6510,7 +6577,52 @@ def _parse_stream_json_usage(stdout: str) -> dict[str, Any]:
         # context meter and compression threshold to it).
         "context_window": context_window,
         "max_output_tokens": max_output_tokens,
+        # Internal (popped by ``_parse_turn``): tokens ``modelUsage`` counts.
+        "_model_usage_tokens": model_tokens,
     }
+
+
+def _model_usage_tokens(model_usage: Any) -> int | None:
+    """All tokens ``modelUsage`` counts (cumulative, restored ones included)."""
+
+    if not isinstance(model_usage, dict) or not model_usage:
+        return None
+    total = 0
+    for entry in model_usage.values():
+        if not isinstance(entry, dict):
+            return None
+        for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"):
+            value = entry.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total += int(value)
+    return total
+
+
+def _restored_cost_baseline(
+    cumulative: float,
+    known: float | None,
+    model_tokens: int | None,
+    turn_tokens: Any,
+) -> float | None:
+    """The cost a ``--resume`` spawn started from, or None when unknown.
+
+    Claude Code restores the session's cost (and ``modelUsage``) from what it
+    saved at its last clean exit; a killed process saved nothing. When
+    ``modelUsage`` holds no more tokens than this turn used, nothing was
+    restored. Otherwise the session's last known total is the baseline, as
+    long as the new total has not fallen below it (then an older, unknown
+    value was restored).
+    """
+
+    if (
+        model_tokens is not None
+        and isinstance(turn_tokens, int)
+        and model_tokens <= turn_tokens
+    ):
+        return 0.0
+    if known is not None and known <= cumulative:
+        return known
+    return None
 
 
 def _model_usage_limits(

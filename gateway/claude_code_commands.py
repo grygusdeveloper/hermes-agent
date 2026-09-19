@@ -611,7 +611,9 @@ def footer_meta(agent: Any, *, cost_before: Optional[float] = None) -> Optional[
     if prompt > 0:
         meta["cache_pct"] = round(100 * (_number(usage.get("cached_tokens")) or 0.0) / prompt)
     after = cost_total(agent)
-    if cost_before is not None and after is not None and after >= cost_before:
+    # Nothing added: no CLI turn ran, or its share of a restored session's
+    # total was unknown. Leave the cost out rather than show $0.00.
+    if cost_before is not None and after is not None and after > cost_before:
         meta["turn_cost_usd"] = after - cost_before
     info, _recorded_at = plan_snapshot(session)
     windows = live_plan_windows(info)
