@@ -78,14 +78,14 @@ class TestClaudeCodePromptUX:
         )
 
         assert "Avoid walls of text" in prompt
-        assert "short descriptive headings" in prompt
-        assert "bullets or numbered steps" in prompt
+        assert "headings only when an answer covers more than\none topic" in prompt
+        assert "never recount the steps you took" in prompt
         assert "icons are optional" in prompt
         # One style block, and Hermes's own instructions take precedence.
         assert prompt.count("Avoid walls of text") == 1
         assert "authoritative policy for\npersona, tone, formatting" in prompt
 
-    def test_tool_turns_allow_one_safe_progress_sentence(self):
+    def test_tool_turns_do_not_narrate(self):
         prompt = _format_messages_as_prompt(
             _messages(("user", "Inspect the repository and run tests.")),
             model="claude-opus-5",
@@ -101,9 +101,10 @@ class TestClaudeCodePromptUX:
             ],
         )
 
-        # Optional, in the same reply as the calls, never a reply of its own.
-        assert "A short progress sentence is optional" in prompt
-        assert "never in a reply of its own" in prompt
+        # Calls only; one sentence is allowed only for something the user
+        # needs to know now.
+        assert "Do not narrate tool use" in prompt
+        assert "One plain\n  sentence before the calls is allowed only" in prompt
         assert "stop right after\n  your final </tool_call>" in prompt
         assert '"arguments" is a JSON object' in prompt
         assert "arguments must be a JSON string" not in prompt
@@ -1345,6 +1346,7 @@ class TestOpusDeepReviewFixes:
                 stream=True,
             )
             parts = []
+            commentary = []
             saw_tools = False
             for chunk in stream:
                 if not chunk.choices:
@@ -1352,11 +1354,14 @@ class TestOpusDeepReviewFixes:
                 delta = chunk.choices[0].delta
                 if getattr(delta, "content", None):
                     parts.append(delta.content)
+                if getattr(delta, "commentary", None):
+                    commentary.append(delta.commentary)
                 if getattr(delta, "tool_calls", None):
                     saw_tools = True
-            joined = "".join(parts)
-            assert joined == cleaned
-            assert "<tool_call>" not in joined
+            # Narration before the call is commentary, never streamed answer.
+            assert "".join(parts) == ""
+            assert "".join(commentary) == cleaned
+            assert "<tool_call>" not in "".join(commentary)
             assert saw_tools
 
     def test_auxiliary_path_uses_distinct_client_type(self):

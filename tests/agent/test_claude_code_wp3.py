@@ -914,6 +914,25 @@ def test_gate_finish_keeps_shown_text_when_the_answer_diverges():
     assert "".join(out) == answer.strip()
 
 
+def _stream_full(client, **kwargs):
+    """``(content, commentary, calls, finish)`` of a streamed completion."""
+
+    content, commentary, calls, finish = [], [], [], []
+    for chunk in client._create_chat_completion(stream=True, **kwargs):
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta.content:
+            content.append(delta.content)
+        if getattr(delta, "commentary", None):
+            commentary.append(delta.commentary)
+        if delta.tool_calls:
+            calls.extend(delta.tool_calls)
+        if chunk.choices[0].finish_reason:
+            finish.append(chunk.choices[0].finish_reason)
+    return "".join(content), "".join(commentary), calls, finish
+
+
 def _stream(client, **kwargs):
     content, calls, finish, empty = [], [], [], 0
     for chunk in client._create_chat_completion(stream=True, **kwargs):
@@ -955,8 +974,8 @@ def test_cli_retry_after_commit_keeps_both_and_the_media_tag(fake_cli, tools):
     from gateway.platforms.base import BasePlatformAdapter
 
     answer = "Fresh full answer. " * 25 + "\n\nMEDIA:/tmp/hermes/report.pdf"
-    abandoned = "An earlier attempt that streamed for a while. " * 12
-    fake_cli.script({"text": answer, "abandoned": abandoned, "abandon": 400})
+    abandoned = "An earlier attempt that streamed for a while. " * 20
+    fake_cli.script({"text": answer, "abandoned": abandoned, "abandon": 700})
     client = ClaudeCodeClient(command=fake_cli.command, cwd="/tmp")
     content, _calls, _finish, _ = _stream(
         client, model="opus", messages=[{"role": "user", "content": "status?"}],
@@ -969,15 +988,18 @@ def test_cli_retry_after_commit_keeps_both_and_the_media_tag(fake_cli, tools):
     client.close()
 
 
-def test_cli_retry_after_a_previewed_call_reopens_the_gate(fake_cli):
+def test_cli_retry_before_a_call_shows_nothing_and_keeps_the_answer(fake_cli):
+    """Narration before a call never streams, so a restart before the call
+    is invisible: no separator, and only the final narration is commentary."""
+
     call = _call(arguments={"command": "uptime"})
     fake_cli.script({"text": "Checking uptime now.\n\n" + call,
                      "abandoned": "Checking uptime.\n\n<tool_call>{\"id\": \"c1\", \"na", "abandon": 40})
     client = ClaudeCodeClient(command=fake_cli.command, cwd="/tmp")
-    content, calls, finish, _ = _stream(
+    content, commentary, calls, finish = _stream_full(
         client, model="opus", messages=[{"role": "user", "content": "uptime?"}], tools=TOOLS,
     )
-    assert content == "Checking uptime." + _STREAM_RESTART_SEPARATOR.rstrip() + "\n\nChecking uptime now."
+    assert content == "" and commentary == "Checking uptime now."
     assert [c.function.name for c in calls] == ["terminal"] and finish == ["tool_calls"]
     client.close()
 
@@ -1127,29 +1149,42 @@ def test_client_runs_without_a_text_callback_when_nothing_shows_it(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_progress_sentence_is_shown_as_soon_as_the_call_starts():
+def test_narration_before_a_call_is_held_not_streamed():
+    """A progress sentence before a tool call never reaches the live stream:
+    it is work narration, which the client passes on as commentary."""
+
     out = []
     gate = _StreamGate(out.append)
-    _feed(gate, "I'll check the servers.\n\n<tool_call>", step=3)
-    assert out == []  # "{" not seen yet: could still be a mention
-    gate.feed('{"id": "c1", "name": "terminal", "arguments": {"comm')
-    assert "".join(out) == "I'll check the servers."
-    assert gate.previewed and not gate.committed
-    _feed(gate, 'and": "ls"}}</tool_call>')
     reply = "I'll check the servers.\n\n" + _call()
+    _feed(gate, reply, step=3)
+    assert out == [] and not gate.committed
     assert gate.finish(reply) == reply
-    assert "".join(out) == _parse_claude_reply(reply).cleaned
+    assert out == []
+    assert gate.held == _parse_claude_reply(reply).cleaned == "I'll check the servers."
 
 
-def test_mentions_are_not_previewed():
+def test_committed_prose_still_streams_up_to_the_call():
+    out = []
+    gate = _StreamGate(out.append, commit_chars=40)
+    prose = "A long explanation that is clearly an answer, not narration. " * 3
+    _feed(gate, prose + _call(), step=9)
+    assert gate.committed and "".join(out) == prose.strip()
+    gate.finish(prose + _call())
+    assert "".join(out) == prose.strip() and gate.held == ""
+
+
+def test_mentions_are_not_streamed_before_finish():
     for text in ("Use the `<tool_call>` tag", "Hermes closes calls with </tool_call> here and"):
         out = []
         gate = _StreamGate(out.append)
-        _feed(gate, text + " " * 70 + "more words")
-        assert out == [] and not gate.previewed
+        full = text + " " * 70 + "more words"
+        _feed(gate, full)
+        assert out == []
+        gate.finish(full)
+        assert "".join(out) == full.strip() and gate.held == ""
 
 
-def test_repair_after_a_previewed_sentence_does_not_repeat_it(monkeypatch):
+def test_repair_after_a_held_sentence_streams_nothing(monkeypatch):
     session = ClaudeCodeSession()
     broken = "Checking the disk.\n\n<tool_call>{\"id\": \"c1\", \"name\": \"terminal\", \"arguments\": {\"command\": \"df"
     replies = iter([broken, _call(arguments={"command": "df -h"})])
@@ -1168,16 +1203,17 @@ def test_repair_after_a_previewed_sentence_does_not_repeat_it(monkeypatch):
         "prompt", session_id=SID, model="opus", effort=None, timeout_seconds=5,
         cwd="/tmp", env={}, on_text_chunk=chunks.append, had_tools=True,
     )
-    assert "".join(chunks) == "Checking the disk."
+    # Nothing was shown, so nothing is carried and the repair starts clean.
+    assert chunks == []
     reply = _parse_claude_reply(response)
-    assert reply.cleaned == "Checking the disk."
+    assert reply.cleaned == ""
     assert len(reply.executable_calls) == 1
-    assert "continue the answer after the text already shown" in prompts[1]
+    assert "already shown" not in prompts[1]
 
 
-def test_retry_after_a_previewed_sentence_keeps_it_once(monkeypatch):
-    """A 429 after the progress sentence was shown: the retry's reply follows
-    the shown sentence instead of being glued to it or replacing it."""
+def test_retry_after_a_held_sentence_shows_only_the_final_reply(monkeypatch):
+    """A 429 after a progress sentence that was never shown: the retry's
+    reply is the whole answer; nothing is glued to it."""
 
     monkeypatch.setattr(ccs.time, "sleep", lambda _seconds: None)
     session = ClaudeCodeSession()
@@ -1200,10 +1236,9 @@ def test_retry_after_a_previewed_sentence_keeps_it_once(monkeypatch):
         "prompt", session_id=SID, model="opus", effort=None, timeout_seconds=5,
         cwd="/tmp", env={}, on_text_chunk=chunks.append, had_tools=True,
     )
-    joined = "".join(chunks)
-    assert joined == "Checking the disk.\n\nChecking the disk now."
+    assert chunks == []
     reply = _parse_claude_reply(response)
-    assert reply.cleaned == joined and len(reply.executable_calls) == 1
+    assert reply.cleaned == "Checking the disk now." and len(reply.executable_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1360,13 +1395,13 @@ def test_output_limit_split_tool_call_end_to_end(fake_cli):
     text = "Writing the report.\n\n" + call
     fake_cli.script({"text": text, "split": len(text) // 2})
     client = ClaudeCodeClient(command=fake_cli.command, cwd="/tmp")
-    content, calls, finish, _ = _stream(
+    content, commentary, calls, finish = _stream_full(
         client, model="opus", messages=[{"role": "user", "content": "report"}],
         tools=[{"type": "function", "function": {"name": "write_file", "parameters": {}}}],
     )
-    assert content == "Writing the report."
+    assert content == "" and commentary == "Writing the report."
     assert [c.function.name for c in calls] == ["write_file"] and finish == ["tool_calls"]
-    assert "<tool_call" not in content
+    assert "<tool_call" not in commentary
     client.close()
 
 

@@ -56,13 +56,13 @@ def test_claude_code_prompt_requires_efficient_tool_only_turns():
             }
         ],
     )
-    assert "If no tool is needed, give the\n  complete answer" in prompt
-    assert "Do not repeat an inspection" in prompt
+    assert "If no tool\n  is needed, give the complete answer" in prompt
+    assert "Do not repeat an\n  inspection" in prompt
     assert "Independent calls may share one reply" in prompt
     assert "the Hermes tools listed\nbelow are available" in prompt
     assert "thoughtful collaborator" in prompt
     assert "compliance form, code-review template" in prompt
-    assert "Use bold\nlabels sparingly" in prompt
+    assert "Use bold labels sparingly" in prompt
     # One identity, no duplicated rule blocks.
     assert "active reasoning model" not in prompt
     assert "STYLE RULE" not in prompt and "TOOL RULE" not in prompt

@@ -77,7 +77,52 @@ _KEEPALIVE_CHUNK_SECONDS = 5.0
 # envelopes, one backend contract. Part of ``_tools_digest``, so a bump starts
 # every durable conversation fresh (Claude Code would otherwise replay the old
 # system prompt snapshot on --resume).
-_PROMPT_FORMAT_VERSION = 6
+_PROMPT_FORMAT_VERSION = 7
+
+# Chat platforms show a reply as push-notified messages on a small screen and
+# cap one message (Discord: 2,000 characters). The budget keeps a normal
+# answer inside a single message; the platform comes from the "Platform:"
+# line Hermes puts in its system prompt.
+_CHAT_ANSWER_BUDGETS = {
+    "discord": 1500,
+    "whatsapp": 1500,
+    "signal": 1500,
+    "imessage": 1500,
+    "line": 1500,
+    "sms": 600,
+    "telegram": 3000,
+    "slack": 2500,
+    "matrix": 2000,
+    "mattermost": 3000,
+    "feishu": 2500,
+    "dingtalk": 2500,
+    "wecom": 2000,
+}
+_PLATFORM_LINE_RE = re.compile(r"^Platform:\s*([A-Za-z0-9_-]+)", re.MULTILINE)
+_CHAT_ANSWER_FORMAT = """\
+Chat delivery ({platform}): the reply arrives as push-notified messages on a
+small screen, so a normal final answer is one message of at most {limit}
+characters (an answer the user asked to be detailed may be longer). Lead with
+the outcome and the figures that matter, then at most six short bullets with
+concrete values (paths, counts, sizes, times; commands and names in inline
+code). No headings for a single topic, no tables (they do not render), no
+restatement of the request, no account of the steps taken. When more detail
+exists, end with one line naming what can be shown on request, for example:
+"Ask for the file list or the log excerpt."
+""".strip()
+
+
+def _chat_answer_format(system_text: str) -> str | None:
+    """The chat delivery rule for the platform named in Hermes's prompt."""
+
+    match = _PLATFORM_LINE_RE.search(system_text)
+    if match is None:
+        return None
+    platform = match.group(1).lower()
+    limit = _CHAT_ANSWER_BUDGETS.get(platform)
+    if limit is None:
+        return None
+    return _CHAT_ANSWER_FORMAT.format(platform=platform, limit=f"{limit:,}")
 _LOG = logging.getLogger(__name__)
 
 from agent.copilot_acp_client import (  # noqa: E402
@@ -210,10 +255,14 @@ def _build_claude_code_request(
             leading_system.append(rendered)
         index += 1
     if leading_system:
+        system_text = "\n\n".join(leading_system)
         sections.append(
             "Hermes system instructions (authoritative policy for this conversation):\n\n"
-            + "\n\n".join(leading_system)
+            + system_text
         )
+        chat_format = _chat_answer_format(system_text)
+        if chat_format:
+            sections.append(chat_format)
 
     transcript: list[str] = []
     # Tool results reloaded from the session DB carry no ``name``; recover it
@@ -705,7 +754,15 @@ class ClaudeCodeClient:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        def _chunk(*, content=None, reasoning=None, tool_calls=None, finish_reason=None, role="assistant"):
+        def _chunk(
+            *,
+            content=None,
+            reasoning=None,
+            tool_calls=None,
+            commentary=None,
+            finish_reason=None,
+            role="assistant",
+        ):
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
@@ -716,6 +773,9 @@ class ClaudeCodeClient:
                             tool_calls=tool_calls,
                             reasoning_content=reasoning,
                             reasoning=reasoning,
+                            # Narration before tool calls: Hermes shows it on
+                            # its interim-message rail, never as the answer.
+                            commentary=commentary,
                         ),
                         finish_reason=finish_reason,
                     )
@@ -780,10 +840,20 @@ class ClaudeCodeClient:
                 stop_reason=last_usage.get("stop_reason"),
             )
             already = "".join(emitted_text)
-            # Safety net: emit any cleaned remainder the session did not stream.
+            reply = _parse_claude_reply(final_text) if run_kwargs.get("has_tools") else None
+            narration = reply is not None and bool(reply.calls or reply.broken)
+            # Emit any cleaned remainder the session did not stream. Prose
+            # before tool calls that never started streaming is narration of
+            # the work: it goes out as commentary (Hermes's interim-message
+            # rail, off by default on Discord) and stays in the message
+            # content for history.
             if cleaned and cleaned != already:
                 if cleaned.startswith(already):
-                    yield _chunk(content=cleaned[len(already):])
+                    remainder = cleaned[len(already):]
+                    if narration and not already:
+                        yield _chunk(commentary=remainder)
+                    else:
+                        yield _chunk(content=remainder)
                 elif not already.endswith(cleaned):
                     # The answer does not continue what was shown: keep both
                     # rather than lose its end (a trailing MEDIA: path).

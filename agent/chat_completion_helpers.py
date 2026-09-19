@@ -3557,6 +3557,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     except Exception:
                         pass
 
+            # Provider commentary: narration the model wrote before its tool
+            # calls (Claude Code bridge). It is part of the assistant message
+            # for history but reaches the user only through the interim
+            # message rail, like Codex commentary, never the answer stream.
+            commentary = getattr(delta, "commentary", None) if delta else None
+            if isinstance(commentary, str) and commentary:
+                content_parts.append(commentary)
+                _fire_commentary = getattr(agent, "_fire_streamed_codex_commentary", None)
+                if callable(_fire_commentary):
+                    _fire_commentary(commentary)
+
             # Accumulate tool call deltas — notify display on first name
             if delta and delta.tool_calls:
                 for tc_delta in delta.tool_calls:

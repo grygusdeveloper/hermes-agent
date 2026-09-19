@@ -832,7 +832,7 @@ async def test_discord_send_does_not_cache_nonconversational_status_as_history_b
     """Automated status notifications should not move the backfill boundary."""
 
     class SendingChannel(FakeTextChannel):
-        async def send(self, content, reference=None):
+        async def send(self, content, reference=None, silent=None):
             return SimpleNamespace(id=222)
 
     channel = SendingChannel(channel_id=777)
@@ -857,7 +857,7 @@ async def test_discord_send_does_not_cache_nonconversational_status_as_history_b
 @pytest.mark.asyncio
 async def test_discord_send_persists_first_completed_response_message(adapter):
     class SendingChannel(FakeTextChannel):
-        async def send(self, content, reference=None):
+        async def send(self, content, reference=None, silent=None):
             return SimpleNamespace(id=333)
 
     channel = SendingChannel(channel_id=777)

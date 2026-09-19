@@ -91,6 +91,26 @@ def _scripted_client(monkeypatch, replies):
     return client, seen
 
 
+def _stream_full(client, **kwargs):
+    """``(content, commentary, calls, finish)`` of a streamed completion."""
+
+    chunks = list(client._create_chat_completion(stream=True, **kwargs))
+    content = "".join(
+        c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content
+    )
+    commentary = "".join(
+        c.choices[0].delta.commentary
+        for c in chunks
+        if c.choices and getattr(c.choices[0].delta, "commentary", None)
+    )
+    calls = [
+        tc for c in chunks if c.choices and c.choices[0].delta.tool_calls
+        for tc in c.choices[0].delta.tool_calls
+    ]
+    finish = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    return content, commentary, calls, finish
+
+
 def _stream(client, **kwargs):
     chunks = list(client._create_chat_completion(stream=True, **kwargs))
     content = "".join(
@@ -222,9 +242,12 @@ def test_invented_results_never_run_or_reach_content(monkeypatch, keyed):
     assert [tc.id for tc in message.tool_calls] == ["ts1"]
     assert message.content == "Waiting for the render."
 
-    content, calls, finish = _stream(client, model="opus", messages=messages, tools=TOOLS)
-    assert content == "Waiting for the render."
-    assert "Tool Result" not in content
+    content, commentary, calls, finish = _stream_full(
+        client, model="opus", messages=messages, tools=TOOLS
+    )
+    # Narration before the call is commentary, not streamed answer text.
+    assert content == "" and commentary == "Waiting for the render."
+    assert "Tool Result" not in commentary
     assert [tc.function.name for tc in calls] == ["process"] and finish == ["tool_calls"]
 
 
@@ -366,7 +389,10 @@ def test_gate_stops_at_real_markup_and_inline_mentions():
     out = []
     gate = _StreamGate(out.append, commit_chars=10)
     gate.feed("Here is the long plan for today. " + _call())
-    assert "".join(out) == "Here is the long plan for today."
+    # Not streaming yet when the call arrived: narration, kept off the stream.
+    assert out == []
+    gate.finish("Here is the long plan for today. " + _call())
+    assert out == [] and gate.held == "Here is the long plan for today."
     inline = []
     gate = _StreamGate(inline.append, commit_chars=10)
     text = "Claude writes `<tool_call>{json}</tool_call>` and Hermes parses it into calls."
@@ -455,7 +481,7 @@ def test_stateless_repair_without_a_warm_process_rerolls(fake_cli):
 
 
 def test_streamed_prose_survives_a_repair(monkeypatch, keyed):
-    prose = "Here is what I found in the logs. " * 12
+    prose = "Here is what I found in the logs. " * 20
     broken = prose + '\n<tool_call>{"name":"terminal","arguments":{"command":"ls",}}</tool_call>'
     client, seen = _scripted_client(monkeypatch, [broken, FIXED])
     content, calls, finish = _stream(
@@ -915,7 +941,7 @@ def test_repair_prompt_lets_an_example_be_an_example(monkeypatch, keyed):
     assert "continue the answer after the text already shown" in _tool_call_repair_prompt(
         reply, shown=True
     )
-    prose = "Here is what I found in the logs. " * 12
+    prose = "Here is what I found in the logs. " * 20
     example = prose + '\nThe format: <tool_call>{"name": ...}</tool_call>'
     fixed = "Put it in code: `<tool_call>{...}</tool_call>`."
     client, seen = _live_client(monkeypatch, [example, fixed])
@@ -932,7 +958,7 @@ def test_prose_streamed_before_a_continued_cut_off_call_is_kept(monkeypatch, key
     streamed live, but the result text is only the tail of the call. The
     repaired answer keeps that prose, so the stream equals the content."""
 
-    prose = "I looked at the renderer and found the problem in the loader. " * 8
+    prose = "I looked at the renderer and found the problem in the loader. " * 12
     live = prose + '\n<tool_call>{"id":"c1","name":"terminal","arguments":{"command":"echo done"}}\n</tool_call>'
     tail = 'done"}}\n</tool_call>'
     client, seen = _live_client(monkeypatch, [(live, tail), FIXED])

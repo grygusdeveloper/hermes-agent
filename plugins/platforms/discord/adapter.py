@@ -1572,6 +1572,19 @@ class DiscordAdapter(BasePlatformAdapter):
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        # Status-only sends (tool progress, "⏳ Working", notices) carry
+        # Discord's suppress-notifications flag: visible in the channel, no
+        # push. The answer itself still notifies. Off via
+        # platforms.discord.extra.silent_status_messages: false or
+        # DISCORD_SILENT_STATUS_MESSAGES=false.
+        _extra_cfg = getattr(config, "extra", None)
+        _silent_cfg = os.getenv("DISCORD_SILENT_STATUS_MESSAGES")
+        if _silent_cfg is None and isinstance(_extra_cfg, dict):
+            _silent_cfg = _extra_cfg.get("silent_status_messages")
+        self._silent_status_messages: bool = (
+            True if _silent_cfg is None
+            else str(_silent_cfg).strip().lower() not in {"0", "false", "no", "off"}
+        )
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
@@ -3809,6 +3822,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 }
                 if chunk_view is not None:
                     _send_kwargs["view"] = chunk_view
+                if nonconversational and self._silent_status_messages:
+                    _send_kwargs["silent"] = True
                 try:
                     msg = await channel.send(**_send_kwargs)
                 except Exception as e:
@@ -3832,6 +3847,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         _retry_kwargs: Dict[str, Any] = {"content": chunk, "reference": None}
                         if chunk_view is not None:
                             _retry_kwargs["view"] = chunk_view
+                        if nonconversational and self._silent_status_messages:
+                            _retry_kwargs["silent"] = True
                         msg = await channel.send(**_retry_kwargs)
                     else:
                         raise

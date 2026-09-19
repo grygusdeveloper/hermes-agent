@@ -425,3 +425,53 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
 
 
+
+
+# ---------------------------------------------------------------------------
+# Status-only sends carry Discord's suppress-notifications flag
+# ---------------------------------------------------------------------------
+
+
+def _silent_adapter(monkeypatch, tmp_path, extra=None):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("DISCORD_SILENT_STATUS_MESSAGES", raising=False)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***", extra=extra or {}))
+    sent = SimpleNamespace(id=4242)
+    channel = SimpleNamespace(send=AsyncMock(return_value=sent))
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=channel), fetch_channel=AsyncMock()
+    )
+    return adapter, channel
+
+
+@pytest.mark.asyncio
+async def test_status_sends_are_silent_and_answers_are_not(monkeypatch, tmp_path):
+    adapter, channel = _silent_adapter(monkeypatch, tmp_path)
+
+    await adapter.send("1", "⚙️ terminal: ls", metadata={"non_conversational": True})
+    assert channel.send.await_args.kwargs.get("silent") is True
+
+    await adapter.send("1", "The answer.", metadata={"notify": True, "final_response": True})
+    assert "silent" not in channel.send.await_args.kwargs
+
+    await adapter.send("1", "A streamed preview", metadata={"expect_edits": True})
+    assert "silent" not in channel.send.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_silent_status_sends_can_be_switched_off(monkeypatch, tmp_path):
+    adapter, channel = _silent_adapter(
+        monkeypatch, tmp_path, extra={"silent_status_messages": False}
+    )
+    await adapter.send("1", "⚙️ terminal: ls", metadata={"non_conversational": True})
+    assert "silent" not in channel.send.await_args.kwargs
+
+    monkeypatch.setenv("DISCORD_SILENT_STATUS_MESSAGES", "off")
+    adapter, channel = _silent_adapter(monkeypatch, tmp_path)
+    monkeypatch.setenv("DISCORD_SILENT_STATUS_MESSAGES", "off")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=channel), fetch_channel=AsyncMock()
+    )
+    await adapter.send("1", "⏳ Working — 3 min", metadata={"non_conversational": True})
+    assert "silent" not in channel.send.await_args.kwargs

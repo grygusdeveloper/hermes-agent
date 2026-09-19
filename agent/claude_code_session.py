@@ -232,10 +232,10 @@ Hermes or the user.
 Answer defaults: communicate naturally and directly. Match the user's
 language, tone and level of detail, and lead with the useful conclusion. Sound
 like a thoughtful collaborator, not a compliance form, code-review template or
-status bot. Avoid walls of text: when an answer has several findings,
-decisions, comparisons or steps, use short descriptive headings, compact
-paragraphs, and bullets or numbered steps where they help scanning. Use bold
-labels sparingly; icons are optional and only for a real visual cue. Keep
+status bot. Avoid walls of text: put concrete facts (paths, counts, sizes, times,
+commands) in short bullets, use headings only when an answer covers more than
+one topic, and never recount the steps you took. Use bold labels sparingly;
+icons are optional and only for a real visual cue. Keep
 simple conversation as natural prose, without canned openings or needless
 restatement. Never end a reply with process narration such as "I'll check" or
 "let me inspect": either call a tool now or give the complete answer. Do not
@@ -259,10 +259,12 @@ below are available. To use one, end your reply with one block per call:
   your final </tool_call>. Never write tool results, "User:" or "Assistant:"
   turns yourself; Hermes runs the calls and returns the real <tool_result>
   blocks in its next message.
-- A short progress sentence is optional; it belongs in the same reply, before
-  the calls, never in a reply of its own. If no tool is needed, give the
-  complete answer with no calls. Do not repeat an inspection whose result is
-  already in the conversation.
+- Do not narrate tool use: a reply that calls tools normally holds the calls
+  and nothing else (Hermes shows the user which tools run). One plain
+  sentence before the calls is allowed only for something the user needs to
+  know now: a decision made on their behalf, a risk, or a blocker. If no tool
+  is needed, give the complete answer with no calls. Do not repeat an
+  inspection whose result is already in the conversation.
 - When you show this markup in an answer, put it in a code block or inline
   code; markup inside code is never executed.
 """.strip()
@@ -1458,12 +1460,15 @@ def _tool_call_repair_prompt(reply: _ClaudeReply, *, shown: bool = False) -> str
 # ---------------------------------------------------------------------------
 
 # A reply is only a candidate stalled preamble (<= 350 chars, tool turns only)
-# while it is short. Prose starts streaming once it is past that bound. Once
+# while it is short. On tool turns prose starts streaming once it is past a
+# larger bound: narration before a tool call ("Checking the logs...") is
+# almost always shorter, and text that has not started streaming when the
+# call arrives is kept off the live answer (see _StreamGate.finish). Once
 # streaming has committed, the attempt is accepted as the answer (never
 # retried), so the user never sees text that is later retried away or
 # duplicated. Soft-limit banners are not a reason to hold text: the CLI emits
 # them as whole synthetic messages, never as live text deltas.
-_STREAM_COMMIT_CHARS_WITH_TOOLS = 350
+_STREAM_COMMIT_CHARS_WITH_TOOLS = 600
 _STREAM_COMMIT_CHARS_NO_TOOLS = 80
 # Hold back enough tail to never emit a partial "<tool_call>" opener.
 _STREAM_HOLDBACK_CHARS = 16
@@ -1471,12 +1476,6 @@ _STREAM_HOLDBACK_CHARS = 16
 # (the gate cannot know yet whether the span closes) and are released by
 # finish(). Only fenced blocks stream through.
 _TOOL_MARKUP_RE = re.compile(r"</?tool_call(?![A-Za-z0-9_])")
-# A tag that certainly opens a call: the JSON object has started. The prose
-# before it is a progress sentence and is shown right away.
-_TOOL_CALL_PREVIEW_RE = re.compile(r"<tool_call(?:\s[^>]*)?>\s*\{")
-# ...and one that certainly does not (a closing tag, or other text after ">").
-_TOOL_CALL_NOT_OPENER_RE = re.compile(r"</|<tool_call(?:\s[^>]*)?>\s*[^\s{]")
-_PREVIEW_LOOKAHEAD_CHARS = 64
 # Shown between the part of an answer the user already saw and the full
 # answer, when Claude Code abandoned the message it was streaming (a dropped
 # API connection makes it re-stream the whole message) or the final text does
@@ -1497,6 +1496,9 @@ class _StreamGate:
     Emitted text is always a prefix of the final answer's cleaned text (the
     prose before the tool calls, see :func:`_parse_claude_reply`) so the
     consumer's concatenated deltas equal the non-streaming ``message.content``.
+    Prose that precedes a tool call and had not started streaming when the
+    call arrived is never streamed: it is narration of the work, which the
+    client hands to Hermes's interim-message rail instead (``held``).
 
     The answer is ``head + attempt``: ``head`` is text that precedes this CLI
     attempt in the final answer. A repair turn continues a reply whose prose
@@ -1530,8 +1532,8 @@ class _StreamGate:
         # Without tools there is no protocol: markup is plain text.
         self._had_tools = had_tools
         self.committed = committed
-        # The prose before a tool call was shown ahead of the call itself.
-        self.previewed = False
+        # Narration before tool calls that finish() kept off the stream.
+        self.held = ""
         self._emitted_parts: list[str] = [emitted] if emitted else []
         self._emitted_size = len(emitted)
         self._reset(prefix)
@@ -1546,9 +1548,6 @@ class _StreamGate:
         # The answer text from ``_emit_end`` on: everything not emitted yet.
         self._pending = head[self._emit_end:]
         self._closed = False
-        self._markup: int | None = None
-        self._after_markup = ""
-        self._preview_open = False
 
     @property
     def emitted(self) -> str:
@@ -1562,27 +1561,18 @@ class _StreamGate:
         return self._head + (attempt or "")
 
     def feed(self, delta: str) -> None:
-        if not delta:
-            return
-        if self._closed:
-            if self._preview_open:
-                self._after_markup = (self._after_markup + delta)[:_PREVIEW_LOOKAHEAD_CHARS]
-                self._check_preview()
+        if not delta or self._closed:
             return
         self._size += len(delta)
         self._pending += delta
         markup = self._find_markup() if self._had_tools else None
         if markup is not None:
+            # A tool call (or a mention of the markup) starts here. Text that
+            # was already streaming continues up to it; text that was not is
+            # narration and stays off the live answer until finish() decides.
             self._closed = True
-            self._markup = markup
             if self.committed:
                 self._emit_until(markup)
-                return
-            self._preview_open = True
-            self._after_markup = self._pending[markup - self._emit_end :][
-                :_PREVIEW_LOOKAHEAD_CHARS
-            ]
-            self._check_preview()
             return
         limit = self._size - _STREAM_HOLDBACK_CHARS
         if not self.committed:
@@ -1623,23 +1613,6 @@ class _StreamGate:
         # up to ``_emit_end``; blanks stand in for the stripped lead.
         lead = " " * max(0, self._emit_end - self._emitted_size)
         return (lead + self.emitted + self._pending)[:offset]
-
-    def _check_preview(self) -> None:
-        if _TOOL_CALL_PREVIEW_RE.match(self._after_markup):
-            self._preview_open = False
-            markup = self._markup or 0
-            line = self._pending[: max(0, markup - self._emit_end)].rsplit("\n", 1)[-1]
-            if line.count("`") % 2:
-                # Inside an inline code span: a mention, not a call.
-                return
-            before = self._emitted_size
-            self._emit_until(markup)
-            self.previewed = self.previewed or self._emitted_size > before
-        elif (
-            _TOOL_CALL_NOT_OPENER_RE.match(self._after_markup)
-            or len(self._after_markup) >= _PREVIEW_LOOKAHEAD_CHARS
-        ):
-            self._preview_open = False
 
     def _emit_until(self, limit: int) -> None:
         """Emit the answer text up to ``limit``, without trailing whitespace."""
@@ -1697,7 +1670,7 @@ class _StreamGate:
         """
 
         full = self.answer(response)
-        cleaned = self._cleaned(full)
+        reply, cleaned = self._parsed(full)
         emitted = self.emitted
         if not cleaned.startswith(emitted):
             _LOG.warning(
@@ -1707,13 +1680,22 @@ class _StreamGate:
             )
             self._head = self._separated(emitted, _STREAM_DIVERGED_SEPARATOR)
             full = self.answer(response)
-            cleaned = self._cleaned(full)
+            reply, cleaned = self._parsed(full)
         if len(cleaned) > len(emitted):
-            self._send(cleaned[len(emitted):])
+            if not emitted and reply is not None and (reply.calls or reply.broken):
+                # Narration before tool calls: kept in the reply's content
+                # (history, interim messages) but never streamed as the
+                # answer, so a working turn does not post it to the chat.
+                self.held = cleaned
+            else:
+                self._send(cleaned[len(emitted):])
         return full
 
-    def _cleaned(self, text: str) -> str:
-        return _parse_claude_reply(text).cleaned if self._had_tools else text.strip()
+    def _parsed(self, text: str) -> tuple[_ClaudeReply | None, str]:
+        if not self._had_tools:
+            return None, text.strip()
+        reply = _parse_claude_reply(text)
+        return reply, reply.cleaned
 
     def _send(self, chunk: str) -> None:
         self._emitted_parts.append(chunk)
@@ -1728,7 +1710,7 @@ class _StreamGate:
 # Warm (persistent) Claude Code processes
 # ---------------------------------------------------------------------------
 
-_KEEPALIVE_DEFAULT_SECONDS = 90.0
+_KEEPALIVE_DEFAULT_SECONDS = 300.0
 _MAX_WARM_DEFAULT = 3
 _WARM_LOCK = threading.Lock()
 _WARM_IDLE: "dict[int, _WarmProcess]" = {}
