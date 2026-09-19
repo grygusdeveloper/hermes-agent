@@ -3306,6 +3306,25 @@ def _has_user_turn(fingerprints: tuple[tuple[str, str], ...]) -> bool:
     return any(role not in {"assistant", "tool"} for role, _digest in fingerprints)
 
 
+def _has_foreign_reply(messages: list[dict[str, Any]], reply: int) -> bool:
+    """Whether an assistant turn follows Claude's own reply at index ``reply``.
+
+    Claude produced at most the reply to the request it last answered; any
+    later assistant message was written by another provider (a fallback, a
+    /model switch) and is not in the Claude session. Empty assistant rows
+    (Hermes's hidden interrupt placeholders) carry nothing Claude could miss.
+    Indexes count dict messages only, like :func:`_message_fingerprint`.
+    """
+
+    rows = [message for message in messages if isinstance(message, dict)]
+    for message in rows[reply + 1 :]:
+        if str(message.get("role") or "").lower() != "assistant":
+            continue
+        if message.get("tool_calls") or _render_content(message.get("content")).strip():
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Control requests (no model turn)
 # ---------------------------------------------------------------------------
@@ -4563,6 +4582,15 @@ class ClaudeCodeSession:
         if resumed is not None:
             return resumed
 
+        if prefix_ok and _has_foreign_reply(messages, previous_count):
+            # Only current[previous_count] can be Claude's own reply; a later
+            # assistant turn came from a fallback provider or another model
+            # (/model switch) and was never in this Claude session. The
+            # incremental prompt skips assistant turns, so Claude would never
+            # see it: replay the whole transcript instead.
+            skipped("foreign-reply")
+            return None
+
         if prefix_ok:
             latest = (
                 checkpoints[-1][1]
@@ -4688,6 +4716,9 @@ class ClaudeCodeSession:
             and interrupted.base == self._previous_messages
             and len(current) > count
             and current[:count] == interrupted.fingerprints
+            # Claude's partial reply may follow the request; any later
+            # assistant turn is another provider's (see _has_foreign_reply).
+            and not _has_foreign_reply(messages, count)
             and (
                 self._session_persisted
                 or (keepalive and self._warm_parked_at(self._session_id, interrupted.marker))

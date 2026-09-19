@@ -709,6 +709,29 @@ def test_interrupted_request_resumes_cold_at_the_marker(fake_cli):
     session.shutdown()
 
 
+def test_fallback_answer_after_an_interrupted_request_is_replayed(fake_cli):
+    """Regression (H1): an answer another provider gave after the interrupted
+    request is not in the Claude session; continuing at the marker with only
+    the user messages would drop it."""
+
+    fake_cli.script({"text": "Hello."}, {"text": LONG, "delay": 0.02, "chunk": 5}, {"text": "Next."})
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run(session, fake_cli, history)
+    history += [{"role": "assistant", "content": "Hello."}, {"role": "user", "content": "count"}]
+    _interrupt_second_turn(session, fake_cli, history)
+    history += [
+        {"role": "assistant", "content": ""},  # hidden placeholder: nothing to miss
+        {"role": "user", "content": "new question"},
+        {"role": "assistant", "content": "FALLBACK ANSWER: PINEAPPLE"},
+        {"role": "user", "content": "and now?"},
+    ]
+    assert _run(session, fake_cli, history)[0] == "Next."
+    assert "--session-id" in fake_cli.events("spawn")[-1]["argv"]
+    assert fake_cli.events("turn")[-1]["content"] == "FULL PROMPT"
+    session.shutdown()
+
+
 def test_unrelated_next_request_ignores_the_interrupted_one(fake_cli):
     fake_cli.script({"text": "Hello."}, {"text": LONG, "delay": 0.02, "chunk": 5}, {"text": "Other."})
     session = ClaudeCodeSession()

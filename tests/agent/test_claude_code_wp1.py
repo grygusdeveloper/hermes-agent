@@ -739,6 +739,107 @@ def test_rewind_then_advance_stays_on_the_new_branch(fake_cli, monkeypatch):
     assert context[-1] == "User:\nu3"
 
 
+def _run_transcript(session, cli, messages, **kwargs):
+    """``_run`` with the transcript the client renders as the fresh prompt."""
+
+    _system, prompt, _images = _build_claude_code_request(messages)
+    return session.run(
+        prompt,
+        messages=messages,
+        model="sonnet",
+        tools_digest="digest",
+        timeout_seconds=30,
+        cwd="/tmp",
+        env=_env(),
+        state_key="root|main",
+        command=cli.command,
+        system_prompt="SYSTEM",
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("keepalive", ["0", "30"])
+def test_fallback_answers_reach_claude_when_it_takes_over_again(fake_cli, monkeypatch, keepalive):
+    """Regression (H1): turns a fallback provider answered (usage limit,
+    errors) were never in the Claude session, and the incremental prompt
+    skips assistant turns, so Claude lost them once the primary returned."""
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", keepalive)
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "Tell me a secret word"}]
+    _run_transcript(session, fake_cli, history)
+    history += [
+        {"role": "assistant", "content": "Fake reply."},
+        {"role": "user", "content": "Tell me another secret word"},
+        # Answered by the fallback provider while Claude was limited.
+        {"role": "assistant", "content": "FALLBACK ANSWER 2: PINEAPPLE-2"},
+        {"role": "user", "content": "Which secret words did you tell me?"},
+    ]
+    _run_transcript(session, fake_cli, history)
+    spawn, turn = fake_cli.events("spawn")[-1], fake_cli.events("turn")[-1]
+    assert "--session-id" in spawn["argv"]  # a full replay, not a resume
+    assert "PINEAPPLE-2" in turn["content"]
+    assert [cp[0] for cp in _load_durable_state("root|main").checkpoints] == [5]
+
+
+def test_fallback_tool_loop_reaches_claude_with_its_calls(fake_cli, monkeypatch):
+    """A fallback's tool results must not arrive without the calls that made them."""
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run_transcript(session, fake_cli, history)
+    history += [
+        {"role": "assistant", "content": "Fake reply."},
+        {"role": "user", "content": "list the files"},
+        {"role": "assistant", "content": "", "tool_calls": [_tool_call("call_fb")]},
+        {"role": "tool", "name": "terminal", "tool_call_id": "call_fb", "content": "PINEAPPLE.txt"},
+        {"role": "assistant", "content": "There is one file."},
+        {"role": "user", "content": "thanks"},
+    ]
+    _run_transcript(session, fake_cli, history)
+    turn = fake_cli.events("turn")[-1]
+    assert "--session-id" in fake_cli.events("spawn")[-1]["argv"]
+    assert "call_fb" in turn["content"] and "There is one file." in turn["content"]
+
+
+def test_hidden_interrupt_placeholder_does_not_force_a_replay(fake_cli, monkeypatch):
+    """Hermes's empty placeholder row (a redirect with nothing on screen) holds
+    nothing Claude could miss: the request still resumes incrementally."""
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run_transcript(session, fake_cli, history)
+    history += [
+        {"role": "assistant", "content": "Fake reply."},
+        {"role": "user", "content": "count"},
+        {"role": "assistant", "content": "", "display_kind": "hidden"},
+        {"role": "user", "content": "no, do this instead"},
+    ]
+    _run_transcript(session, fake_cli, history)
+    assert "--resume" in fake_cli.events("spawn")[-1]["argv"]
+    assert fake_cli.events("turn")[-1]["content"].startswith(
+        "User:\ncount\n\nUser:\nno, do this instead"
+    )
+
+
+def test_claude_tool_loop_still_resumes_incrementally(fake_cli, monkeypatch):
+    """Claude's own reply (and the tool results after it) keep the cheap path."""
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
+    session = ClaudeCodeSession()
+    history = [{"role": "user", "content": "hi"}]
+    _run_transcript(session, fake_cli, history)
+    history = _tool_turn(history)
+    _run_transcript(session, fake_cli, history)
+    history += [{"role": "assistant", "content": "Fake reply."}, {"role": "user", "content": "more"}]
+    _run_transcript(session, fake_cli, history)
+    spawns = fake_cli.events("spawn")
+    assert all("--resume" in spawn["argv"] for spawn in spawns[1:])
+    assert fake_cli.events("turn")[-1]["content"].startswith("User:\nmore")
+
+
 def test_cli_rejecting_resume_session_at_falls_back_then_resumes_plainly(fake_cli, monkeypatch):
     import agent.claude_code_session as ccs
 
