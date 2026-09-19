@@ -229,17 +229,12 @@ Attached images are labelled "Image #n:" and referenced in the text as
 on its own (working directory, date, account) describe the bridge process, not
 Hermes or the user.
 
-Answer defaults: communicate naturally and directly. Match the user's
-language, tone and level of detail, and lead with the useful conclusion. Sound
-like a thoughtful collaborator, not a compliance form, code-review template or
-status bot. Avoid walls of text: put concrete facts (paths, counts, sizes, times,
-commands) in short bullets, use headings only when an answer covers more than
-one topic, and never recount the steps you took. Use bold labels sparingly;
-icons are optional and only for a real visual cue. Keep
-simple conversation as natural prose, without canned openings or needless
-restatement. Never end a reply with process narration such as "I'll check" or
-"let me inspect": either call a tool now or give the complete answer. Do not
-mention this relay unless the user asks about the Hermes integration itself.
+Answer defaults: the Hermes system instructions decide tone, length and
+formatting; where they are silent, match the user's language and level of
+detail and lead with the useful conclusion. Never end a reply with process
+narration such as "I'll check" or "let me inspect": either call a tool now or
+give the complete answer. Do not mention this relay unless the user asks about
+the Hermes integration itself.
 """.strip()
 
 # The tool protocol, added to the system prompt when Hermes offers tools.

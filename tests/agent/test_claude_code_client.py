@@ -77,12 +77,12 @@ class TestClaudeCodePromptUX:
             model="claude-opus-5",
         )
 
-        assert "Avoid walls of text" in prompt
-        assert "headings only when an answer covers more than\none topic" in prompt
-        assert "never recount the steps you took" in prompt
-        assert "icons are optional" in prompt
-        # One style block, and Hermes's own instructions take precedence.
-        assert prompt.count("Avoid walls of text") == 1
+        # Style belongs to Hermes's own instructions (SOUL); the bridge only
+        # keeps the Claude-specific rules.
+        assert "the Hermes system instructions decide tone, length and\nformatting" in prompt
+        assert "Never end a reply with process\nnarration" in prompt
+        for stale in ("Avoid walls of text", "headings", "bold labels", "icons are optional", "collaborator"):
+            assert stale not in prompt.split("Hermes system instructions", 1)[0]
         assert "authoritative policy for\npersona, tone, formatting" in prompt
 
     def test_tool_turns_do_not_narrate(self):
