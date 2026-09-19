@@ -59,6 +59,7 @@ from agent.claude_code_session import (
     _STREAM_REFUSED_SEPARATOR,
     ClaudeCodeRefusal,
     ClaudeCodeSession,
+    _StreamGate,
     _mask_code,
     _parse_claude_reply,
     _render_content_collecting_images,
@@ -764,9 +765,9 @@ class ClaudeCodeClient:
                         "stream as a refusal",
                         len(shown),
                     )
-                    yield _chunk(
-                        content=_STREAM_REFUSED_SEPARATOR + (error.detail or str(error))
-                    )
+                    # Closes a code block the refused text left open.
+                    separator = _StreamGate._separated(shown, _STREAM_REFUSED_SEPARATOR)[len(shown):]
+                    yield _chunk(content=separator + (error.detail or str(error)))
                     yield _chunk(role=None, finish_reason="content_filter")
                     return
                 raise error

@@ -553,6 +553,20 @@ def test_refusal_after_streamed_text_ends_the_stream_as_a_refusal(monkeypatch):
     finish = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
     assert finish == ["content_filter"]
     assert content.endswith(ccs._STREAM_REFUSED_SEPARATOR + REFUSAL_TEXT)
+
+    def refused_in_code(prompt, *, on_text_chunk=None, **kwargs):
+        on_text_chunk("Here:\n\n```python\nprint(1)\n")
+        raise refusal
+
+    monkeypatch.setattr(client._claude_session, "run", refused_in_code)
+    chunks = list(
+        client._create_chat_completion(
+            model="opus", messages=[{"role": "user", "content": "q"}], stream=True
+        )
+    )
+    content = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
+    # The explanation is not rendered inside the open code block.
+    assert "print(1)\n\n```" + ccs._STREAM_REFUSED_SEPARATOR in content
     client.close()
 
 
