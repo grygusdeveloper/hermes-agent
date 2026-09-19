@@ -247,3 +247,56 @@ def test_chat_platforms_get_a_one_message_answer_budget():
 def test_warm_process_outlives_a_slow_tool(monkeypatch):
     monkeypatch.delenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", raising=False)
     assert ccs._keepalive_seconds() == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Full replay: long arguments of older tool calls are elided
+# ---------------------------------------------------------------------------
+
+
+def _tool_reply(call_id, name, **arguments):
+    import json
+
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+        ],
+    }
+
+
+def test_replay_elides_long_arguments_of_older_calls_only():
+    script = "".join(f"print('line {index}')\n" for index in range(200))  # ~3.5 KB, non-repeating
+    messages = [
+        {"role": "user", "content": "write and run it"},
+        _tool_reply("c1", "write_file", path="/tmp/a.py", content=script),
+        {"role": "tool", "tool_call_id": "c1", "name": "write_file", "content": "ok"},
+        _tool_reply("c2", "write_file", path="/tmp/b.py", content=script),
+        {"role": "tool", "tool_call_id": "c2", "name": "write_file", "content": "ok"},
+        _tool_reply("c3", "terminal", command="python3 /tmp/b.py"),
+        {"role": "tool", "tool_call_id": "c3", "name": "terminal", "content": "hello"},
+        _tool_reply("c4", "write_file", path="/tmp/c.py", content=script),
+        {"role": "tool", "tool_call_id": "c4", "name": "write_file", "content": "ok"},
+    ]
+    _system, prompt, _images = _build_claude_code_request(messages, tools=TOOLS)
+    # The two most recent tool-call replies (c3, c4) keep their arguments.
+    assert prompt.count("more characters elided") == 2
+    import json
+
+    middle = json.dumps(script)[1200:1300]  # past the kept head: only c4 has it
+    assert prompt.count(middle) == 1
+    assert '"path": "/tmp/a.py"' in prompt and '"path": "/tmp/b.py"' in prompt
+    assert "this call already ran; the file is on disk" in prompt
+    assert '"command": "python3 /tmp/b.py"' in prompt
+    assert prompt.count("[... ") == 2
+
+
+def test_short_arguments_are_never_elided():
+    messages = [{"role": "user", "content": "go"}]
+    for index in range(5):
+        messages.append(_tool_reply(f"c{index}", "terminal", command=f"echo {index}"))
+        messages.append({"role": "tool", "tool_call_id": f"c{index}", "name": "terminal", "content": str(index)})
+    _system, prompt, _images = _build_claude_code_request(messages, tools=TOOLS)
+    assert "elided" not in prompt
+    assert all(f'"command": "echo {index}"' in prompt for index in range(5))

@@ -2833,7 +2833,9 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF). "
+        "Every call costs a model turn: for a job you expect to run long, 'wait' once "
+        "with a timeout covering the whole job (up to 1800 s) instead of polling."
     ),
     "parameters": {
         "type": "object",
@@ -2853,7 +2855,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": "Max seconds to block for 'wait' action (up to 1800; pick the whole expected runtime so one wait covers the job). Returns partial output on timeout.",
                 "minimum": 1
             },
             "offset": {

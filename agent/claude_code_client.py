@@ -152,7 +152,34 @@ def _strip_invented_results(text: str) -> str:
     return text[: match.start()].rstrip() if match else text
 
 
-def _replayed_tool_call(call: Any) -> dict[str, Any] | None:
+# On a full replay, string arguments of older tool calls longer than this
+# (file contents, patches, scripts) are elided: the call already ran, its
+# result follows in the transcript, and the file is on disk. The most recent
+# tool-call replies keep their arguments, so a call in progress stays exact.
+_ELIDE_ARG_CHARS = 1500
+_ELIDE_KEEP_CHARS = 160
+_RECENT_TOOL_REPLIES_KEPT = 2
+
+
+def _elide_arguments(arguments: Any) -> Any:
+    """Shorten long string arguments of a call that already ran."""
+
+    if not isinstance(arguments, dict):
+        return arguments
+    elided: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if isinstance(value, str) and len(value) > _ELIDE_ARG_CHARS:
+            head = value[:_ELIDE_KEEP_CHARS].rstrip()
+            elided[key] = (
+                f"{head}\n[... {len(value) - len(head):,} more characters elided: "
+                "this call already ran; the file is on disk]"
+            )
+        else:
+            elided[key] = value
+    return elided
+
+
+def _replayed_tool_call(call: Any, *, elide: bool = False) -> dict[str, Any] | None:
     """A stored assistant tool call in the v6 protocol shape."""
 
     import json
@@ -186,7 +213,8 @@ def _replayed_tool_call(call: Any) -> dict[str, Any] | None:
     if isinstance(call_id, str) and call_id.strip():
         replayed["id"] = call_id.strip()
     replayed["name"] = name.strip()
-    replayed["arguments"] = arguments if arguments not in (None, "") else {}
+    arguments = arguments if arguments not in (None, "") else {}
+    replayed["arguments"] = _elide_arguments(arguments) if elide else arguments
     return replayed
 
 
@@ -269,8 +297,19 @@ def _build_claude_code_request(
     # from the preceding assistant call so replays label results like live
     # turns.
     tool_names = _ToolNameResolver(messages[:index])
-    for message in messages[index:]:
-        if not isinstance(message, dict):
+    # Older tool-call replies lose their long arguments on replay; the last
+    # few keep them (see _elide_arguments).
+    tool_reply_positions = [
+        position
+        for position, message in enumerate(messages)
+        if position >= index
+        and isinstance(message, dict)
+        and str(message.get("role") or "").strip().lower() == "assistant"
+        and message.get("tool_calls")
+    ]
+    recent_tool_replies = set(tool_reply_positions[-_RECENT_TOOL_REPLIES_KEPT:])
+    for position, message in enumerate(messages):
+        if position < index or not isinstance(message, dict):
             continue
         tool_name = tool_names.feed(message)
         role = str(message.get("role") or "unknown").strip().lower()
@@ -289,7 +328,9 @@ def _build_claude_code_request(
             tool_calls = message.get("tool_calls")
             for tc in tool_calls if isinstance(tool_calls, list) else []:
                 try:
-                    replayed = _replayed_tool_call(tc)
+                    replayed = _replayed_tool_call(
+                        tc, elide=position not in recent_tool_replies
+                    )
                     if replayed is None:
                         continue
                     call_blocks.append(
