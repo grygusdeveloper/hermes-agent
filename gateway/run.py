@@ -16388,22 +16388,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # and interrupt alike.
             self._restore_moa_one_shot(event, _quick_key)
             self._restore_pending_one_turn_model_override(_quick_key)
-            # Normal completion/exception/interrupt owns and clears this exact
-            # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
-            # the next unclean startup's recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
-            # Turn lease (#64934): release THIS turn's lease token — keyed by
-            # (routing key, run generation) so this unwind can only ever free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # Normal completion/exception/interrupt owns and clears this exact
+                # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
+                # the next unclean startup's recovery pass.
+                await self._clear_durable_active_turn(event)
+            finally:
+                # /stop and /new cancel this task (cancel_session_processing): a
+                # CancelledError landing on the marker-clear await above must not
+                # skip these, or the next message waits behind a lease nobody
+                # releases until HERMES_TURN_LEASE_TIMEOUT (30 min by default).
+                #
+                # Unconditional release covers every exit path. _release_running_agent_state
+                # is idempotent (pop-on-absent is harmless) and, called without a
+                # run_generation guard, always clears the slot regardless of which
+                # generation it holds. This evicts the zombie left when session_reset
+                # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
+                # inside _run_agent returns False, and the old sentinel-only check here
+                # missed the leftover real agent — locking the session out forever (#28686).
+                self._release_running_agent_state(_quick_key)
+                # Turn lease (#64934): release THIS turn's lease token — keyed by
+                # (routing key, run generation) so this unwind can only ever free
+                # the lease its own turn acquired, never a newer turn's.
+                self._release_turn_lease(_quick_key, _run_generation)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.

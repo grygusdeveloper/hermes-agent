@@ -212,6 +212,56 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._post_turn_goal_continuation.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_cancel_during_marker_cleanup_still_releases_slot_and_lease(
+    monkeypatch, tmp_path
+):
+    """Regression (f7): /stop cancels the dispatch task. A CancelledError that
+    landed on the durable-marker cleanup await skipped the slot and lease
+    releases after it, so the next message waited behind a lease nobody
+    released until HERMES_TURN_LEASE_TIMEOUT (30 min)."""
+    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._post_turn_goal_continuation = AsyncMock()
+    cleanup_started = asyncio.Event()
+
+    async def turn(event, source, quick_key, run_generation):
+        # What _handle_message_with_agent does before running the agent.
+        token = await runner._turn_leases.acquire(
+            "sess-dedup", owner_key=quick_key, generation=run_generation, timeout=1
+        )
+        state = runner._session_state(quick_key).turn
+        state.lease_token = token
+        state.lease_generation = run_generation
+        return "done"
+
+    async def slow_marker_cleanup(event):
+        cleanup_started.set()
+        await asyncio.sleep(30)
+
+    runner._handle_message_with_agent = turn
+    runner._clear_durable_active_turn = slow_marker_cleanup
+
+    task = asyncio.create_task(runner._handle_message(_event()))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    key = "agent:main:telegram:group:-1001:12345"
+    state = runner._peek_session_state(key)
+    assert state is None or state.turn.agent is None
+    assert state is None or state.turn.lease_token is None
+    # A follow-up turn on the same session gets the lease at once.
+    follow = await runner._turn_leases.acquire(
+        "sess-dedup", owner_key="follow-up", generation=2, timeout=0.5
+    )
+    assert follow is not None
+    assert runner._turn_leases.release(follow) is True
+
+
 # ---------------------------------------------------------------------------
 # Bounded registry
 # ---------------------------------------------------------------------------
