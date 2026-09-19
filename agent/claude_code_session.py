@@ -1086,7 +1086,7 @@ _MISSING = object()
 
 
 def _blank(text: str, fill: str = " ") -> str:
-    return re.sub(r"[^\n]", lambda _match: fill, text)
+    return re.sub(r"[^\n]", fill.replace("\\", "\\\\"), text)
 
 
 def _fence_opened(line: str) -> tuple[str, int] | None:
