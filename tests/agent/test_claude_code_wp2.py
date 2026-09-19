@@ -305,6 +305,46 @@ def test_real_call_after_an_example_still_runs():
     assert reply.cleaned == "Format: `<tool_call>{...}</tool_call>`. Running it."
 
 
+MARKUP_MENTIONS = [
+    'Use `<tool_call>` tags.\n\n```\n<tool_call>{"id":"x"}</tool_call>\n```\nEnd.',
+    "Results come back as `<tool_result>` blocks; see `</tool_result>`. Rest of the answer.",
+    (
+        "To call a tool, Claude writes a `<tool_call>` tag followed by JSON. " * 4
+        + "Here is an example:\n\n```\n" + _call() + "\n```\n\n"
+        + "That is the whole protocol. " * 10
+    ).strip(),
+    "Named calls look like `<function name=\"x\">…</function>`. Done.",
+] + EXAMPLES
+
+
+@pytest.mark.parametrize("answer", MARKUP_MENTIONS)
+def test_delivered_answer_keeps_markup_quoted_in_code(answer):
+    """Regression (f3): Hermes's content stripping removed tool-call markup
+    inside inline code and fences (from the first mention to the next
+    closing tag), mangling answers the bridge had parsed intact."""
+
+    from types import SimpleNamespace
+
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    agent = SimpleNamespace(provider="claude-code", base_url="acp://claude-code")
+    assert strip_think_blocks(agent, answer) == answer
+
+
+def test_markup_outside_code_is_still_hidden_for_claude_code():
+    from types import SimpleNamespace
+
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    agent = SimpleNamespace(provider="claude-code", base_url="acp://claude-code")
+    text = '<tool_call>{"id": "a"}</tool_call>\nSee `<tool_call>` and </tool_result> here.'
+    assert strip_think_blocks(agent, text) == "\nSee `<tool_call>` and here."
+    assert strip_think_blocks(agent, "Done.\n<tool_result>junk</tool_result>") == "Done.\n"
+    # Other providers keep the old behaviour.
+    other = SimpleNamespace(provider="openrouter", base_url="https://openrouter.ai/api/v1")
+    assert strip_think_blocks(other, MARKUP_MENTIONS[1]) == "Results come back as ``. Rest of the answer."
+
+
 def test_gate_streams_json_and_fenced_examples_live():
     out = []
     gate = _StreamGate(out.append, commit_chars=40)

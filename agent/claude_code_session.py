@@ -1045,8 +1045,8 @@ _MAX_TOOL_CALL_REPAIRS = 2
 _MISSING = object()
 
 
-def _blank(text: str) -> str:
-    return re.sub(r"[^\n]", " ", text)
+def _blank(text: str, fill: str = " ") -> str:
+    return re.sub(r"[^\n]", lambda _match: fill, text)
 
 
 def _fence_opened(line: str) -> tuple[str, int] | None:
@@ -1063,12 +1063,14 @@ def _closes_fence(line: str, fence: tuple[str, int]) -> bool:
     return len(stripped) >= length and set(stripped) == {char}
 
 
-def _mask_code(text: str) -> str:
+def _mask_code(text: str, fill: str = " ") -> str:
     """Return ``text`` with fenced blocks and inline code spans blanked out.
 
     Offsets are preserved, so a match in the masked copy indexes the original.
     An unclosed fence runs to the end of the text. Tool-call markup inside
-    code is an example or an explanation, never a call.
+    code is an example or an explanation, never a call. Code characters
+    become ``fill`` (newlines stay); a non-space ``fill`` keeps a whitespace
+    pattern (``\\s*``) from running into code.
     """
 
     pieces: list[str] = []
@@ -1077,11 +1079,11 @@ def _mask_code(text: str) -> str:
         if fence is None:
             fence = _fence_opened(line)
             if fence is not None:
-                pieces.append(_blank(line))
+                pieces.append(_blank(line, fill))
             else:
-                pieces.append(_INLINE_CODE_RE.sub(lambda m: _blank(m.group(0)), line))
+                pieces.append(_INLINE_CODE_RE.sub(lambda m: _blank(m.group(0), fill), line))
             continue
-        pieces.append(_blank(line))
+        pieces.append(_blank(line, fill))
         if _closes_fence(line, fence):
             fence = None
     return "".join(pieces)

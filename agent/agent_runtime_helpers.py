@@ -806,6 +806,29 @@ def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
 
 
 
+def _strip_outside_code(content: str, patterns) -> str:
+    """Remove the ``patterns`` matches that lie outside code.
+
+    Fenced blocks and inline code spans are masked first (offsets kept), so
+    markup Claude quotes as an example or names in backticks survives.
+    """
+    from agent.claude_code_session import _mask_code
+
+    masked = None
+    for pattern in patterns:
+        if not pattern.search(content):
+            continue
+        if masked is None:
+            masked = _mask_code(content, fill="\x00")
+        spans = [match.span() for match in pattern.finditer(masked)]
+        if not spans:
+            continue
+        for start, end in reversed(spans):
+            content = content[:start] + content[end:]
+        masked = None
+    return content
+
+
 def strip_think_blocks(agent, content: str) -> str:
     """Remove reasoning/thinking blocks from content, returning only visible text.
 
@@ -877,17 +900,33 @@ def strip_think_blocks(agent, content: str) -> str:
     #    the unterminated-tag pass and take trailing content with them.
     for _pattern in _REASONING_BLOCK_PATTERNS:
         content = _pattern.sub('', content)
+    # Claude Code answers are told to put tool-call markup they show in code
+    # (the bridge's own protocol; the bridge already parsed out real calls),
+    # so for them the tool-call passes skip fenced blocks and inline code.
+    _code_aware = False
+    if agent is not None:
+        try:
+            from agent.chat_completion_helpers import _is_claude_code_agent
+
+            _code_aware = _is_claude_code_agent(agent)
+        except Exception:
+            _code_aware = False
     # 1b. Tool-call XML blocks (openclaw/openclaw#67318). Handle the
     #     generic tag names first — they have no attribute gating since
     #     a literal <tool_call> in prose is already vanishingly rare.
-    for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
-        content = _pattern.sub('', content)
     # 1c. <function name="...">...</function> — Gemma-style standalone
     #     tool call. Only strip when the tag sits at a block boundary
     #     (start of text, after a newline, or after sentence-ending
     #     punctuation) AND carries a name="..." attribute. This keeps
     #     prose mentions like "Use <function> to declare" safe.
-    content = _NAMED_FUNCTION_BLOCK_PATTERN.sub('', content)
+    if _code_aware:
+        content = _strip_outside_code(
+            content, _TOOL_CALL_BLOCK_PATTERNS + (_NAMED_FUNCTION_BLOCK_PATTERN,)
+        )
+    else:
+        for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
+            content = _pattern.sub('', content)
+        content = _NAMED_FUNCTION_BLOCK_PATTERN.sub('', content)
     # 2. Unterminated reasoning block — open tag at a block boundary
     #    (start of text, or after a newline) with no matching close.
     #    Strip from the tag to end of string.  Fixes #8878 / #9568
@@ -899,7 +938,10 @@ def strip_think_blocks(agent, content: str) -> str:
     #     unterminated <function name="..."> because a truncated tail
     #     during streaming may still be valuable to the user; matches
     #     OpenClaw's intentional asymmetry.)
-    content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', content)
+    if _code_aware:
+        content = _strip_outside_code(content, (_STRAY_TOOL_CALL_CLOSER_PATTERN,))
+    else:
+        content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', content)
     return content
 
 
