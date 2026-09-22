@@ -1,7 +1,21 @@
 import json
 from unittest.mock import patch
 
-from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
+from hermes_cli.codex_models import (
+    DEFAULT_CODEX_MODELS,
+    _add_forward_compat_models,
+    get_codex_model_ids,
+)
+
+
+def test_astra_is_the_preferred_curated_codex_model():
+    assert DEFAULT_CODEX_MODELS[0] == "gpt-6-astra"
+
+
+def test_astra_forward_compat_uses_modern_codex_lineup():
+    models = _add_forward_compat_models(["gpt-5.6-sol"])
+
+    assert models == ["gpt-5.6-sol", "gpt-6-astra"]
 
 
 
@@ -32,7 +46,8 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
         def json(self):
             return {
                 "models": [
-                    {"slug": "gpt-5.5", "priority": 0, "supported_in_api": True},
+                    {"slug": "gpt-6-astra", "priority": 0, "supported_in_api": True},
+                    {"slug": "gpt-5.5", "priority": 1, "supported_in_api": True},
                     {"slug": "gpt-5.3-codex-spark", "priority": 7, "supported_in_api": False},
                     {"slug": "gpt-5-internal", "priority": 99, "visibility": "hidden"},
                 ]
@@ -47,6 +62,7 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
 
     models = codex_models._fetch_models_from_api(access_token="tok")
 
+    assert models[0] == "gpt-6-astra"
     assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
     assert "gpt-5-internal" not in models
