@@ -176,6 +176,22 @@ class GatewaySlashCommandsMixin(
 
     async_session_store: AsyncSessionStore
 
+    async def _handle_heart_command(self, event: MessageEvent) -> str:
+        """Toggle the current Discord thread's heart through its receiving bot."""
+        source = event.source
+        if source.platform != Platform.DISCORD or not source.thread_id:
+            return "`/heart` is available inside Discord threads."
+        adapter = self._delivery_adapter_for(source)  # type: ignore[attr-defined]  # GatewayRunner MRO
+        toggle = getattr(adapter, "toggle_forum_thread_heart", None)
+        if not callable(toggle):
+            return "❌ This Discord bot cannot toggle thread hearts."
+        result = await toggle(str(source.thread_id))  # type: ignore[misc]
+        if not result:
+            return "❌ Could not toggle heart on this thread."
+        if result["hearted"]:
+            return f"❤️ Marked thread as favorite: `{result['title']}`"
+        return f"🤍 Removed thread from favorites: `{result['title']}`"
+
     # ------------------------------------------------------------------ shared helpers
     def _cached_agent_for(self, session_key: str, *, lockless_fallback: bool = False):
         """Peek the cached AIAgent for *session_key* without evicting it, or None. Entries are

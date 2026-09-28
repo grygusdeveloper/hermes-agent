@@ -1542,6 +1542,7 @@ DEFAULT_CONFIG = {
 
     "discord": {
         "require_mention": True,  # require @mention to respond in server channels
+        "promoted_skill_commands": [],  # opt-in native slash slots; other skills remain under /skill
         "free_response_channels": "",  # comma-separated channel IDs answered without mention
         "allowed_channels": "",  # if set, ONLY respond in these channel IDs (whitelist)
         "auto_thread": True,  # auto-create threads on @mention in channels (like Slack)

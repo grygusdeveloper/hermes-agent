@@ -52,6 +52,7 @@ class CommandDef:
     subcommands: tuple[str, ...] = ()  # tab-completable subcommands
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
+    native_platforms: tuple[str, ...] | None = None  # optional menu visibility, not dispatch auth
     gateway_config_gate: str | None = None  # config dotpath; truthy overrides cli_only for gateway
     # Mid-run (agent busy) gateway behavior (gateway/run.py Guard-2 dispatcher): "dispatch" = run
     # while busy (normal handler or the ``busy_handler`` variant); "reject" = refuse mid-run
@@ -89,6 +90,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
+    CommandDef("heart", "Toggle the heart on this Discord thread", "Session",
+               gateway_only=True, aliases=("fav", "favorite_topic", "pin_topic"),
+               busy_policy="dispatch", native_platforms=("discord",)),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True, desktop="terminal"),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",

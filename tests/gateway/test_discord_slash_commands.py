@@ -173,6 +173,35 @@ async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter)
 # Auto-registration from COMMAND_REGISTRY
 # ------------------------------------------------------------------
 
+@pytest.mark.asyncio
+async def test_promoted_skill_remains_available_in_native_and_skill_picker(adapter):
+    adapter._run_simple_slash = AsyncMock()
+
+    def catalog(*, reserved_names):
+        entries = [("show-me", "Explain visually", "/show-me")]
+        return {}, [entry for entry in entries if entry[0] not in reserved_names], 0
+
+    with (
+        patch("hermes_cli.config.load_config_readonly", return_value={
+            "discord": {"promoted_skill_commands": ["show-me", "status", "not-installed"]},
+        }),
+        patch("agent.skill_commands.get_skill_commands", return_value={
+            "/show-me": {"description": "Explain visually"},
+            "/status": {"description": "Collision"},
+        }),
+        patch("hermes_cli.commands_platforms.discord_skill_commands_by_category", side_effect=catalog),
+    ):
+        adapter._register_slash_commands()
+
+    assert "show-me" in adapter._client.tree.commands
+    assert "show-me" in adapter._skill_lookup
+    assert adapter._client.tree.commands["status"].__name__ == "slash_status"
+    await adapter._client.tree.commands["show-me"].callback(
+        SimpleNamespace(), args="map the request flow"
+    )
+    adapter._run_simple_slash.assert_awaited_once()
+    assert adapter._run_simple_slash.await_args.args[1] == "/show-me map the request flow"
+
 
 @pytest.mark.asyncio
 async def test_auto_registers_plugin_commands_for_discord(adapter):

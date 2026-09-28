@@ -91,7 +91,8 @@ def telegram_bot_commands(*, include_plugins: bool = True) -> list[tuple[str, st
     """(command_name, description) pairs for Telegram setMyCommands: sanitized canonical names
     only (no aliases). Built-ins needing arguments are included (their handlers show usage when
     selected bare); plugin commands needing arguments are excluded (may lack a no-arg fallback)."""
-    pairs = [(cmd.name, cmd.describe()) for cmd in _gateway_available_commands()]
+    pairs = [(cmd.name, cmd.describe()) for cmd in _gateway_available_commands()
+             if cmd.native_platforms is None or "telegram" in cmd.native_platforms]
     if include_plugins:
         pairs += [(n, d) for n, d, hint in _iter_plugin_command_entries()
                   if not _requires_argument(hint)]
@@ -396,7 +397,8 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     (canonical names first so they win slots at the cap, then aliases, then plugins) becomes a
     standalone slash, deduped and clamped to the 50-command cap; Slack built-ins and
     _SLACK_VIA_HERMES_ONLY are skipped. ``/hermes`` is always first for anything dropped."""
-    available = _gateway_available_commands()
+    available = [cmd for cmd in _gateway_available_commands()
+                 if cmd.native_platforms is None or "slack" in cmd.native_platforms]
     wanted = [(cmd.name, cmd.describe(), cmd.args_hint or "") for cmd in available]
     wanted += [(alias, t("slash.shared.slack_alias_for", name=cmd.name, description=cmd.describe()),
                 cmd.args_hint or "") for cmd in available for alias in cmd.aliases]

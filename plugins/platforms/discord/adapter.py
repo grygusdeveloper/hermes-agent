@@ -4511,6 +4511,39 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             except Exception:
                 # e.g. name conflict with a subcommand group.
                 pass
+        # Promote only explicitly configured, installed skills. The /skill picker
+        # remains the fallback for the rest of the catalog and for collisions.
+        self._discord_promoted_skill_names: set[str] = set()
+        try:
+            from agent.skill_commands import get_skill_commands
+            from hermes_cli.config import load_config_readonly
+
+            discord_cfg = (load_config_readonly() or {}).get("discord", {})
+            raw = discord_cfg.get("promoted_skill_commands", []) if isinstance(discord_cfg, dict) else []
+            if isinstance(raw, str):
+                raw = raw.split(",")
+            if not isinstance(raw, (list, tuple, set)):
+                raw = []
+            installed = get_skill_commands()
+            already_registered = {cmd.name for cmd in tree.get_commands()}
+            for requested in raw:
+                slug = str(requested or "").strip().lower().lstrip("/").replace("_", "-")
+                if not slug or slug in self._discord_promoted_skill_names:
+                    continue
+                if f"/{slug}" not in installed or len(slug) > 32 or not re.fullmatch(r"[a-z0-9-]+", slug):
+                    logger.warning("[%s] Invalid or unavailable promoted skill %r", self.name, requested)
+                    continue
+                if slug in already_registered:
+                    continue
+                if len(already_registered) >= slot_cap:
+                    dropped_over_cap += 1
+                    continue
+                description = str(installed[f"/{slug}"].get("description") or f"Run /{slug}")
+                _auto_register(slug, description, "Optional instruction for the skill")
+                if slug in already_registered:
+                    self._discord_promoted_skill_names.add(slug)
+        except Exception as e:
+            logger.warning("[%s] Discord promoted skill registration failed: %s", self.name, e)
         try:
             from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
             try:
@@ -4595,7 +4628,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # Instance-level state so the callbacks always read the freshest entries.
             self._skill_entries: list[tuple[str, str, str]] = []
             self._skill_lookup: dict[str, tuple[str, str]] = {}
-            self._skill_group_reserved_names: set[str] = set(existing_names)
+            self._skill_group_reserved_names: set[str] = existing_names.difference(
+                getattr(self, "_discord_promoted_skill_names", set())
+            )
             self._refresh_skill_catalog_state()
             if not self._skill_entries:
                 return
@@ -5442,6 +5477,58 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] Failed to rename Discord thread %s", self.name, thread_id, exc_info=True)
             return False
+
+    async def toggle_forum_thread_heart(self, thread_id: str) -> Optional[dict[str, Any]]:
+        """Toggle a heart prefix and the forum's heart tag without discarding other tags."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+        try:
+            channel_id = int(thread_id)
+        except (TypeError, ValueError):
+            return None
+        locks = getattr(self, "_forum_heart_locks", None)
+        if locks is None:
+            locks = self._forum_heart_locks = {}
+        async with locks.setdefault(channel_id, asyncio.Lock()):
+            try:
+                thread = self._client.get_channel(channel_id)
+                if thread is None:
+                    thread = await self._client.fetch_channel(channel_id)
+                if thread is None or not callable(getattr(thread, "edit", None)):
+                    return None
+                current = str(thread.name or "").strip()
+                parent = getattr(thread, "parent", None)
+                if parent is None and getattr(thread, "parent_id", None):
+                    parent = await self._client.fetch_channel(int(thread.parent_id))
+                available = list(getattr(parent, "available_tags", None) or [])
+                hearts = [tag for tag in available if str(tag.name).casefold() in
+                          {"❤️", "❤", "favorite", "heart"}]
+                tags = list(getattr(thread, "applied_tags", None) or [])
+                heart_ids = {str(tag.id) for tag in hearts}
+                tagged = any(str(tag.id) in heart_ids for tag in tags)
+                prefix = next((p for p in ("❤️ ", "❤ ", "❤️", "❤") if current.startswith(p)), None)
+                hearted = not (prefix or tagged)
+                if hearted:
+                    from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
+                    title = f"❤️ {current}"
+                    if utf16_len(title) > 80:
+                        title = _prefix_within_utf16_limit(title, 77).rstrip() + "..."
+                    if hearts and len(tags) < 5 and not tagged:
+                        tags.append(hearts[0])
+                else:
+                    title = current[len(prefix):].strip() if prefix else current
+                    tags = [tag for tag in tags if str(tag.id) not in heart_ids]
+                kwargs = {}
+                if title != current:
+                    kwargs["name"] = title
+                if [str(tag.id) for tag in tags] != [str(tag.id) for tag in (thread.applied_tags or ())]:
+                    kwargs["applied_tags"] = tags
+                if kwargs:
+                    await thread.edit(**kwargs, reason="Hermes thread heart toggle")
+                return {"hearted": hearted, "title": title}
+            except Exception:
+                logger.warning("[%s] Failed to toggle heart for thread %s", self.name, thread_id, exc_info=True)
+                return None
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a handoff thread under a text channel; returns the thread id or ``None``.
