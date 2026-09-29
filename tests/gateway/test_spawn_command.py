@@ -103,9 +103,10 @@ async def test_discord_forum_creation_requires_exact_model_tag_and_marks_owned_t
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="unused"))
     adapter._client = SimpleNamespace(get_channel=lambda _id: forum)
     adapter._threads = SimpleNamespace(mark_async=AsyncMock())
-    refused = await adapter.create_spawn_thread("42", "News", "Starter", model_alias="other")
-    assert refused["success"] is False
-    forum.create_thread.assert_not_awaited()
+    for alias in ("other", None):
+        refused = await adapter.create_spawn_thread("42", "News", "Starter", model_alias=alias)
+        assert refused["success"] is False
+        forum.create_thread.assert_not_awaited()
     created = await adapter.create_spawn_thread("42", "News", "Starter", model_alias="sol")
     assert created["thread_id"] == "123"
     assert forum.create_thread.await_args.kwargs["applied_tags"] == forum.available_tags

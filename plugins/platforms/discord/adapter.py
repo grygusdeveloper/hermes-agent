@@ -5609,8 +5609,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if isinstance(parent, discord.ForumChannel):
                 tags = [tag for tag in parent.available_tags
                         if str(tag.name).casefold() == str(model_alias or "").casefold()]
-                if model_alias and len(tags) != 1:
-                    return {"success": False, "error": f"forum model tag {model_alias!r} is unavailable"}
+                # The first user post is admitted by its tag before /spawn can
+                # persist a binding. Never create an untagged/ambiguous forum
+                # workspace that cannot accept its first follow-up turn.
+                if len(tags) != 1:
+                    return {"success": False, "error": f"select exactly one available forum model tag (requested {model_alias!r})"}
                 created = await parent.create_thread(
                     name=name, content=starter_content[:self.MAX_MESSAGE_LENGTH],
                     applied_tags=tags, auto_archive_duration=1440,
