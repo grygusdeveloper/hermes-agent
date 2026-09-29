@@ -5,6 +5,49 @@ from __future__ import annotations
 from gateway.config import Platform
 
 
+async def sync_switched_model_tag(runner, source, session_key: str, result) -> str | None:
+    """Best-effort forum metadata after a durable session switch; never change execution scope."""
+    if source.platform != Platform.DISCORD or not source.thread_id:
+        return None
+    profile = await runner.async_session_store.get_execution_profile(session_key)
+    if not profile:
+        return None
+    from gateway.run import _load_gateway_config
+
+    raw = _load_gateway_config() or {}
+    gateway = raw.get("gateway") if isinstance(raw, dict) else None
+    spawn = gateway.get("spawn") if isinstance(gateway, dict) else None
+    if not isinstance(spawn, dict) or str(source.parent_chat_id or "") != str(spawn.get("parent_channel_id") or ""):
+        return None
+    models = spawn.get("models")
+    models = dict(models) if isinstance(models, dict) else {}
+    agents = spawn.get("agents")
+    agents = agents if isinstance(agents, dict) else {}
+    default_agent = str(spawn.get("default_agent") or "main").strip().lower()
+    agent_spec = agents.get(default_agent)
+    if isinstance(agent_spec, dict) and isinstance(agent_spec.get("models"), dict):
+        models.update(agent_spec["models"])
+    matches = []
+    for alias, spec in models.items():
+        route = {"model": spec} if isinstance(spec, str) else spec
+        if not isinstance(route, dict) or str(route.get("model") or "").strip() != result.new_model:
+            continue
+        if route.get("provider") and str(route["provider"]).strip() != result.target_provider:
+            continue
+        if route.get("base_url") and str(route["base_url"]).strip() != str(result.base_url or ""):
+            continue
+        if route.get("profile") and str(route["profile"]).strip() != profile:
+            continue
+        matches.append(str(alias))
+    if len(matches) != 1:
+        return "⚠️ Forum tag unchanged: switched model has no unique alias for this execution profile."
+    adapter = runner._delivery_adapter_for(source)
+    update = getattr(adapter, "set_forum_thread_model_tag", None)
+    if not callable(update) or not await update(str(source.thread_id), matches[0], model_aliases=set(map(str, models))):
+        return "⚠️ Forum tag unchanged: receiving Discord bot could not update the post."
+    return None
+
+
 async def bind_forum_post(runner, event) -> str | None:
     """Require exactly one configured model tag; persist model before the execution marker.
 

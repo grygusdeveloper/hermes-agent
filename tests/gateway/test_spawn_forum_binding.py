@@ -2,15 +2,16 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import AsyncSessionStore, SessionSource, SessionStore
-from gateway.spawn_forum import bind_forum_post
+from gateway.spawn_forum import bind_forum_post, sync_switched_model_tag
 from gateway.run import GatewayRunner
+from gateway.slash_commands_model import GatewayModelCommandsMixin, _ModelSwitchContext
 from hermes_constants import get_hermes_home
 
 
@@ -169,3 +170,80 @@ async def test_native_forum_first_post_and_followups_use_bound_secrets_after_rel
     assert seen == [(satellite, "researcher", None), (satellite, "researcher", None),
                     (home, None, None)]
     runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_bound_forum_model_switch_syncs_receiving_bot_without_changing_execution(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "researcher").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = SessionStore(home / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.DISCORD, chat_id="thread", chat_type="thread",
+                           thread_id="thread", parent_chat_id="forum")
+    key = store.get_or_create_session(source).session_key
+    store.set_execution_profile(key, "researcher")
+    store.set_model_override(key, {"model": "old"})
+    receiving = SimpleNamespace(set_forum_thread_model_tag=AsyncMock(return_value=True))
+    runner = SimpleNamespace(async_session_store=AsyncSessionStore(store),
+                             _delivery_adapter_for=lambda _: receiving)
+    config = {"gateway": {"spawn": {"parent_channel_id": "forum", "default_agent": "research",
+                                 "agents": {"research": {"profile": "researcher", "models": {
+                                     "new": {"model": "target", "provider": "openai-codex"}}}},
+                                 "models": {"old": "old", "wrong-scope": {
+                                     "model": "target", "profile": "gemini"}}}}}
+    result = SimpleNamespace(new_model="target", target_provider="openai-codex", base_url="")
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        assert await sync_switched_model_tag(runner, source, key, result) is None
+        receiving.set_forum_thread_model_tag.assert_awaited_once_with(
+            "thread", "new", model_aliases={"new", "old", "wrong-scope"})
+        assert store.get_execution_profile(key) == "researcher"
+        assert store.get_model_override(key) == {"model": "old"}
+        config["gateway"]["spawn"]["models"]["duplicate"] = "target"
+        warning = await sync_switched_model_tag(runner, source, key, result)
+        assert warning is not None and "no unique alias" in warning
+        receiving.set_forum_thread_model_tag.assert_awaited_once()
+    store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_model_commit_warns_if_forum_metadata_fails_after_persistence(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = SessionStore(home / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.DISCORD, chat_id="thread", chat_type="thread",
+                           thread_id="thread", parent_chat_id="forum")
+    key = store.get_or_create_session(source).session_key
+    store.set_execution_profile(key, "default")
+    receiving = SimpleNamespace(set_forum_thread_model_tag=AsyncMock(return_value=False))
+
+    class CommitRunner(GatewayModelCommandsMixin):
+        async_session_store = AsyncSessionStore(store)
+
+        def _switch_cached_agent_model(self, result, ctx, picker):
+            return None
+
+        def _record_switch_metrics(self, result, ctx, source):
+            return None
+
+        async def _record_model_switch(self, result, ctx, **kwargs):
+            await self.async_session_store.set_model_override(ctx.session_key, {"model": result.new_model})
+            return None
+
+        async def _model_switch_confirmation(self, *args, **kwargs):
+            return "switched"
+
+        def _delivery_adapter_for(self, _):
+            return receiving
+
+    runner = CommitRunner()
+    ctx = _ModelSwitchContext(session_key=key, source=source, config_path=home / "config.yaml",
+                              persist_global=False)
+    config = {"gateway": {"spawn": {"parent_channel_id": "forum", "models": {"new": "target"}}}}
+    result = SimpleNamespace(new_model="target", target_provider="openai-codex", base_url="")
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        reply = await runner._commit_model_switch_locked(result, ctx, source=source, picker=False)
+    assert "switched" in reply and "Forum tag unchanged" in reply
+    assert store.get_model_override(key) == {"model": "target"}
+    assert store.get_execution_profile(key) == "default"
+    store.close_all_db_handles()

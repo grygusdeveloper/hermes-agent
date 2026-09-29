@@ -418,6 +418,15 @@ class GatewayModelCommandsMixin:
             reply += "\n" + self._apply_reasoning_selection(
                 ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                 persist_global=ctx.persist_global and global_error is None)
+        if not one_turn and not ctx.persist_global:
+            from gateway.spawn_forum import sync_switched_model_tag
+            try:
+                warning = await sync_switched_model_tag(self, source, ctx.session_key, result)
+            except Exception:
+                logger.warning("Model switch persisted but forum metadata sync failed", exc_info=True)
+                warning = "⚠️ Forum tag unchanged: Discord metadata synchronization failed."
+            if warning:
+                reply += "\n" + warning
         return reply
 
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
