@@ -21,7 +21,8 @@ for line in sys.stdin:
     req = json.loads(line)
     method = req["method"]
     if method == "session/prompt":
-        print(json.dumps({"jsonrpc":"2.0", "method":"session/update", "params":{"update":{"sessionUpdate":"agent_message_chunk", "content":{"text":os.environ["HERMES_HOME"]}}}}), flush=True)
+        text = "Upgrade your plan to continue" if "quota" in req["params"]["prompt"][0]["text"] else os.environ["HERMES_HOME"]
+        print(json.dumps({"jsonrpc":"2.0", "method":"session/update", "params":{"update":{"sessionUpdate":"agent_message_chunk", "content":{"text":text}}}}), flush=True)
     print(json.dumps({"jsonrpc":"2.0", "id":req["id"], "result": {"sessionId":"cursor-session"} if method == "session/new" else {}}), flush=True)
 ''')
     child.chmod(0o700)
@@ -47,4 +48,6 @@ for line in sys.stdin:
             reset_hermes_home_override(token)
     with pytest.raises(ValueError, match="valid model ID"):
         client.chat.completions.create(model="--malicious", messages=[], timeout=5)
+    with pytest.raises(RuntimeError, match="Cursor account usage limit"):
+        client.chat.completions.create(model="cursor-grok-4.6-high", messages=[{"role": "user", "content": "quota"}], timeout=5)
     client.close()

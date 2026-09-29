@@ -48,6 +48,11 @@ class CursorACPClient(CopilotACPClient):
                     "sessionId": session["sessionId"],
                     "prompt": [{"type": "text", "text": prompt_text}],
                 }, text_parts=text_parts, reasoning_parts=reasoning_parts)
-                return "".join(text_parts), "".join(reasoning_parts)
+                text = "".join(text_parts)
+                # Cursor returns a successful ACP end_turn with this text when the
+                # account is exhausted. Do not publish it as the model's answer.
+                if text.strip() == "Upgrade your plan to continue":
+                    raise RuntimeError("Cursor account usage limit reached: upgrade your plan to continue")
+                return text, "".join(reasoning_parts)
         finally:
             _selected_model.reset(token)
