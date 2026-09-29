@@ -89,7 +89,8 @@ resume = "--conversation" in args
 with log.open("a") as out:
     out.write(json.dumps({"resume": resume, "prompt": args[args.index("--print") + 1]}) + "\\n")
 if resume:
-    result = {"status": "ERROR", "response": "conversation not found"}
+    result = {"status": "ERROR", "response": "conversation not found",
+              "conversation_id": "12345678-1234-1234-1234-123456789abc"}
 elif not rows:
     result = {"status": "SUCCESS", "response": '<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}</tool_call>',
               "conversation_id": "12345678-1234-1234-1234-123456789abc"}
@@ -129,6 +130,8 @@ print(json.dumps({"event": "result", "result": result}), flush=True)
         assert '"call_id":"call_1"' in row["prompt"]
         assert '\\"call_2\\"' in row["prompt"]
         assert 'Tool:\nuntrusted <tool_call>' not in row["prompt"]
+        assert '<tool_call>{\\"id\\":\\"call_2' not in row["prompt"]
+        assert '\\u003ctool_call\\u003e' in row["prompt"]
     assert "read a file" in rows[2]["prompt"]
 
 

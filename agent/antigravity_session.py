@@ -182,7 +182,10 @@ def _historical_tool_result_record(message: dict[str, Any]) -> str:
         # the corresponding call completed and must not be executed again.
         "content": content_text,
     }
-    return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    # JSON quoting alone leaves literal executable-looking delimiters in the
+    # prompt. Preserve the data through JSON escapes without exposing markup.
+    return (json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            .replace("<", "\\u003c").replace(">", "\\u003e"))
 
 
 def _normalize_for_digest(value: Any, _seen: set[int] | None = None) -> Any:
@@ -1093,6 +1096,12 @@ class AntigravityConversation:
             raise RuntimeError("AGY returned non-object JSON")
         if str(payload.get("status") or "") != "SUCCESS":
             response_text = str(payload.get("response") or "").strip()
+            # Some AGY versions attach the stale conversation ID to an error.
+            # Never publish an expiry diagnostic as a successful model answer.
+            if conversation_id and _is_expired_conversation_error(response_text):
+                raise AntigravityConversationExpired(
+                    f"AGY returned status {payload.get('status')!r}: {response_text[:300]}"
+                )
             # AGY sometimes returns status=ERROR even when the model produced
             # valid output (e.g. a tool-call block).  If the response field
             # contains actual content, treat it as success rather than killing
@@ -1111,10 +1120,6 @@ class AntigravityConversation:
                 if _CONVERSATION_ID_RE.fullmatch(conversation_id):
                     return response, reasoning, conversation_id
             detail = response_text[:300] or str(payload)[:300]
-            if conversation_id and _is_expired_conversation_error(detail):
-                raise AntigravityConversationExpired(
-                    f"AGY returned status {payload.get('status')!r}: {detail}"
-                )
             raise RuntimeError(
                 f"AGY returned status {payload.get('status')!r}: {detail}"
             )
