@@ -139,4 +139,7 @@ async def handle_spawn(runner, event: MessageEvent) -> str:
         dispatch = adapter.handle_message(kickoff)
         if inspect.isawaitable(dispatch):
             await dispatch
+        if not kickoff._gateway_accepted:
+            return (f"⚠️ Spawned <#{thread_id}> · agent `{agent}` · model `{model_alias or 'Default'}` "
+                    "but the initial task was not admitted. Please resend it in the thread.")
     return f"✅ Spawned <#{thread_id}> · agent `{agent}` · model `{model_alias or 'Default'}`" + (" · initial task queued" if prompt else "")

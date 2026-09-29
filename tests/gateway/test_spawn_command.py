@@ -43,6 +43,9 @@ async def test_spawn_binds_model_profile_before_first_task_and_retains_receiving
         return {"completed": True}
 
     runner._run_agent_inner = execute
+    async def admit(event):
+        event._gateway_accepted = True
+    adapter.handle_message.side_effect = admit
     source = SessionSource(platform=Platform.DISCORD, chat_id="42", chat_type="channel",
                            user_id="owner", guild_id="guild")
     event = MessageEvent(text="/spawn --agent research --model sol --title 'News today' --prompt 'Check sources'",
@@ -150,7 +153,10 @@ async def test_spawned_thread_enters_real_gateway_ingress_and_retains_scope_afte
         return await self._run_agent(event.text, "", [], source, "session", session_key=key)
 
     runner._run_agent_inner = model_turn
-    receiving.handle_message = runner._handle_message
+    async def admit(event):
+        result = await runner._handle_message(event)
+        event._gateway_accepted = result == "model reply"
+    receiving.handle_message = admit
     source = SessionSource(platform=Platform.DISCORD, chat_id="42", chat_type="channel",
                            user_id="owner", guild_id="guild")
     command = MessageEvent(text="/spawn --agent research --model sol --prompt 'Check sources'", source=source)
@@ -174,3 +180,37 @@ async def test_spawned_thread_enters_real_gateway_ingress_and_retains_scope_afte
         assert await runner._handle_message(followup) == "model reply"
     assert seen == [(satellite, "researcher"), (satellite, "researcher")]
     runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_spawn_reports_refused_initial_task_without_claiming_it_was_queued(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = SessionStore(home / "sessions", GatewayConfig())
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._session_model_overrides = {}
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="unused"))
+    adapter.create_spawn_thread = AsyncMock(return_value={
+        "success": True, "thread_id": "123", "guild_id": "guild"})
+    # A connected adapter can lose its runner callback during shutdown: the real
+    # admission path drops the kickoff even though the thread was created.
+    runner._delivery_adapter_for = lambda _: adapter
+    source = SessionSource(platform=Platform.DISCORD, chat_id="42", chat_type="channel",
+                           user_id="owner", guild_id="guild")
+    event = MessageEvent(text="/spawn --model sol --prompt 'Check sources'", source=source)
+    config = {"gateway": {"spawn": {"parent_channel_id": "42",
+                                  "models": {"sol": {"model": "gpt-test"}}}}}
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        response = await handle_spawn(runner, event)
+    assert "Spawned <#123>" in response
+    assert "not admitted" in response
+    assert "queued" not in response
+    key = store.get_or_create_session(SessionSource(platform=Platform.DISCORD, chat_id="123",
+        chat_type="thread", thread_id="123", parent_chat_id="42", guild_id="guild",
+        scope_id="guild")).session_key
+    assert store.get_model_override(key)["model"] == "gpt-test"
+    assert store.get_execution_profile(key) == "default"
+    store.close_all_db_handles()
