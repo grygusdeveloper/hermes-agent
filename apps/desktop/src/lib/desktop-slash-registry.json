@@ -102,6 +102,7 @@
   "/skin": null,
   "/snap": "terminal",
   "/snapshot": "terminal",
+  "/spawn": null,
   "/start": null,
   "/status": null,
   "/statusbar": "terminal",

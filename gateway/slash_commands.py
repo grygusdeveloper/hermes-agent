@@ -176,6 +176,10 @@ class GatewaySlashCommandsMixin(
 
     async_session_store: AsyncSessionStore
 
+    async def _handle_spawn_command(self, event: MessageEvent) -> str:
+        from gateway.spawn_command import handle_spawn
+        return await handle_spawn(self, event)
+
     async def _handle_heart_command(self, event: MessageEvent) -> str:
         """Toggle the current Discord thread's heart through its receiving bot."""
         source = event.source

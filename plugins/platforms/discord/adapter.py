@@ -4467,6 +4467,19 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # defer() happens inside the handler *after* the auth gate.
             await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
 
+    def _register_spawn_slash(self, tree) -> None:
+        @tree.command(name="spawn", description="Create a workspace thread with an agent and model")
+        @discord.app_commands.describe(agent="Agent alias", model="Model alias", title="Thread title",
+                                       prompt="Initial task to run in the new thread")
+        async def slash_spawn(interaction: discord.Interaction, agent: str = "", model: str = "",
+                              title: str = "", prompt: str = ""):
+            import shlex
+            parts = ["/spawn"]
+            for key, value in (("agent", agent), ("model", model), ("title", title), ("prompt", prompt)):
+                if value.strip():
+                    parts.extend((f"--{key}", shlex.quote(value.strip())))
+            await self._run_simple_slash(interaction, " ".join(parts))
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
@@ -4479,6 +4492,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             tree.command(name=name, description=description)(
                 self._slash_proxy(name, args, template, followup, strip=name != "insights")
             )
+        self._register_spawn_slash(tree)
         # Auto-register COMMAND_REGISTRY + plugin commands not yet on the tree. Native
         # commands above always survive the 100-command cap; reserve one slot for /skill.
         already_registered: set[str] = set()
@@ -5582,6 +5596,47 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+    async def create_spawn_thread(
+        self, parent_chat_id: str, name: str, starter_content: str,
+        owner_user_id: Optional[str] = None, model_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a tagged forum post or a text thread on this receiving bot."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return {"success": False, "error": "Discord is not connected"}
+        try:
+            parent = await self._resolve_channel(int(parent_chat_id))
+            if isinstance(parent, discord.ForumChannel):
+                tags = [tag for tag in parent.available_tags
+                        if str(tag.name).casefold() == str(model_alias or "").casefold()]
+                if model_alias and len(tags) != 1:
+                    return {"success": False, "error": f"forum model tag {model_alias!r} is unavailable"}
+                created = await parent.create_thread(
+                    name=name, content=starter_content[:self.MAX_MESSAGE_LENGTH],
+                    applied_tags=tags, auto_archive_duration=1440,
+                    reason="Hermes /spawn workspace")
+                thread = getattr(created, "thread", created)
+            else:
+                thread_id = await self.create_handoff_thread(parent_chat_id, name)
+                if not thread_id:
+                    return {"success": False, "error": "could not create thread"}
+                thread = await self._resolve_channel(int(thread_id))
+                await thread.send(starter_content[:self.MAX_MESSAGE_LENGTH])
+            if owner_user_id and not isinstance(parent, discord.ForumChannel):
+                try:
+                    await thread.add_user(discord.Object(id=int(owner_user_id)))
+                except Exception:
+                    # Membership is optional; losing the durable routing binding
+                    # after creating a real thread would orphan the workspace.
+                    logger.warning("[%s] Could not add /spawn owner to thread %s", self.name, thread.id,
+                                   exc_info=True)
+            thread_id = str(thread.id)
+            await self._threads.mark_async(thread_id)
+            return {"success": True, "thread_id": thread_id, "thread_name": str(thread.name),
+                    "guild_id": str(getattr(getattr(thread, "guild", None), "id", "") or "")}
+        except Exception as exc:
+            logger.warning("[%s] Discord /spawn creation failed", self.name, exc_info=True)
+            return {"success": False, "error": str(exc)}
 
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
