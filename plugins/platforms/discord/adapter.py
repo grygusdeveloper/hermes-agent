@@ -5599,8 +5599,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def set_forum_thread_model_tag(
         self, thread_id: str, model_alias: str, *, model_aliases: set[str],
+        title_label: Optional[str] = None, known_labels: Optional[set[str]] = None,
     ) -> bool:
-        """Replace model tags without overwriting unrelated forum tags or concurrent edits."""
+        """Replace model metadata without overwriting unrelated tags or a user-renamed title."""
         if not self._client or not DISCORD_AVAILABLE:
             return False
         try:
@@ -5631,8 +5632,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     desired.append(target)
                 if len(desired) > 5:
                     return False
+                changes = {}
                 if [str(tag.id) for tag in current] != [str(tag.id) for tag in desired]:
-                    await thread.edit(applied_tags=desired, reason="Hermes forum model synchronization")
+                    changes["applied_tags"] = desired
+                # Only rewrite a suffix we recognize as one of our own model
+                # labels. A manually renamed topic belongs to the user.
+                name = str(getattr(thread, "name", "") or "")
+                if title_label and known_labels and " · " in name:
+                    stem, old_label = name.rsplit(" · ", 1)
+                    if old_label.casefold() in {label.casefold() for label in known_labels}:
+                        candidate = f"{stem} · {title_label}"
+                        if candidate != name and utf16_len(candidate) <= 100:
+                            changes["name"] = candidate
+                if changes:
+                    await thread.edit(**changes, reason="Hermes forum model synchronization")
                 return True
             except Exception:
                 logger.warning("[%s] Failed to synchronize forum model tag for %s", self.name, thread_id, exc_info=True)

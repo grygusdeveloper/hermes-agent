@@ -196,7 +196,8 @@ async def test_bound_forum_model_switch_syncs_receiving_bot_without_changing_exe
     with patch("gateway.run._load_gateway_config", return_value=config):
         assert await sync_switched_model_tag(runner, source, key, result) is None
         receiving.set_forum_thread_model_tag.assert_awaited_once_with(
-            "thread", "new", model_aliases={"new", "old", "wrong-scope"})
+            "thread", "new", model_aliases={"new", "old", "wrong-scope"},
+            title_label="new", known_labels={"new", "old", "wrong-scope"})
         assert store.get_execution_profile(key) == "researcher"
         assert store.get_model_override(key) == {"model": "old"}
         config["gateway"]["spawn"]["models"]["duplicate"] = "target"

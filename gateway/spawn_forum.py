@@ -43,7 +43,12 @@ async def sync_switched_model_tag(runner, source, session_key: str, result) -> s
         return "⚠️ Forum tag unchanged: switched model has no unique alias for this execution profile."
     adapter = runner._delivery_adapter_for(source)
     update = getattr(adapter, "set_forum_thread_model_tag", None)
-    if not callable(update) or not await update(str(source.thread_id), matches[0], model_aliases=set(map(str, models))):
+    labels = {str(alias): str(spec.get("label") or alias) if isinstance(spec, dict) else str(alias)
+              for alias, spec in models.items()}
+    if not callable(update) or not await update(
+        str(source.thread_id), matches[0], model_aliases=set(labels),
+        title_label=labels[matches[0]], known_labels=set(labels.values()),
+    ):
         return "⚠️ Forum tag unchanged: receiving Discord bot could not update the post."
     return None
 
