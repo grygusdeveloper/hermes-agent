@@ -349,8 +349,9 @@ class CopilotACPClient:
     def _spawn(self) -> subprocess.Popen[str]:
         # Fast-fail when the CLI rejects --acp (else the parent waits the full child timeout for stdout that
         # never arrives). ``None`` falls through to the spawn's established start error.
-        if _acp_supported(self._acp_command, self._acp_args) is False:
-            preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
+        args = self._process_args()
+        if _acp_supported(self._acp_command, args) is False:
+            preview = " ".join(args[:3]) if args else "(none)"
             raise RuntimeError(
                 f"ACP transport not supported by '{self._acp_command}': `{preview}` is rejected as an unknown option. This "
                 "usually means the CLI is an older release (e.g. Claude Code v2.x) or a different tool than expected. Either "
@@ -363,8 +364,8 @@ class CopilotACPClient:
             # Hide the console the CLI child would otherwise flash on Windows (#56747). Hide-only — stdio
             # pipes stay intact for the ACP wire.
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', errors='replace', bufsize=1, cwd=self._acp_cwd, env=_build_subprocess_env(),
+                [self._acp_command] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace', bufsize=1, cwd=self._acp_cwd, env=self._process_env(),
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
@@ -377,6 +378,12 @@ class CopilotACPClient:
             self._active_processes.add(proc)
             self.is_closed = False
         return proc
+
+    def _process_args(self) -> list[str]:
+        return list(self._acp_args)
+
+    def _process_env(self) -> dict[str, str]:
+        return _build_subprocess_env()
 
     @contextlib.contextmanager
     def _session(
