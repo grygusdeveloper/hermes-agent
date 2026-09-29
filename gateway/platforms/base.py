@@ -1182,6 +1182,12 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
     resolved = _translate_docker_container_media_path(expanded, session_key=session_key)
     if resolved is None:
+        # /root/.hermes in a Docker MEDIA tag names the container's credential
+        # surface. Only an explicit cache mount may translate it; falling back to
+        # the same lexical path on the host would probe (or expose) host secrets.
+        if _docker_env_active() and (expanded == Path("/root/.hermes")
+                                     or Path("/root/.hermes") in expanded.parents):
+            return None
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
