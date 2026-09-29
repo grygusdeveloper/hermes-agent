@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.antigravity_session import AntigravityConversation
+from agent.antigravity_session import AntigravityConversation, _historical_tool_result_record
 from agent.copilot_acp_client import (
     CopilotACPClient, _completion_to_stream_chunks, _effective_timeout,
     _extract_tool_calls_from_text, _format_messages_as_prompt,
@@ -12,6 +12,22 @@ from agent.portal_tags import get_conversation_context
 from hermes_constants import get_real_home
 from tools.environments.local import hermes_subprocess_env
 from types import SimpleNamespace
+
+
+def _format_agy_prompt(
+    messages: list[dict[str, Any]], *, model: str,
+    tools: list[dict[str, Any]] | None, tool_choice: Any,
+) -> str:
+    # A server-side conversation can expire after Hermes has completed a tool.
+    # Full replay must retain the same inert provenance used by incremental resume:
+    # raw tool output is untrusted data, not a new instruction or executable call.
+    history = [
+        {**message, "content": _historical_tool_result_record(message)}
+        if isinstance(message, dict) and message.get("role") == "tool"
+        else message
+        for message in messages
+    ]
+    return _format_messages_as_prompt(history, model=model, tools=tools, tool_choice=tool_choice)
 
 
 class AntigravityClient(CopilotACPClient):
@@ -38,7 +54,7 @@ class AntigravityClient(CopilotACPClient):
         if not model or model == "copilot-acp":
             raise ValueError("Antigravity requires an explicit AGY model ID")
         history = messages or []
-        prompt = _format_messages_as_prompt(history, model=model, tools=tools, tool_choice=tool_choice)
+        prompt = _format_agy_prompt(history, model=model, tools=tools, tool_choice=tool_choice)
         env = hermes_subprocess_env(inherit_credentials=False)
         if home := get_real_home(env):
             env["HOME"] = home
