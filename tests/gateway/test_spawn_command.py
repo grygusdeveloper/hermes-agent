@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -111,3 +111,66 @@ async def test_discord_forum_creation_requires_exact_model_tag_and_marks_owned_t
     assert created["thread_id"] == "123"
     assert forum.create_thread.await_args.kwargs["applied_tags"] == forum.available_tags
     adapter._threads.mark_async.assert_awaited_once_with("123")
+
+
+@pytest.mark.asyncio
+async def test_spawned_thread_enters_real_gateway_ingress_and_retains_scope_after_reload(tmp_path, monkeypatch):
+    """A command-created thread's first task and a later inbound post use the same receiving lane."""
+    home = tmp_path / ".hermes"
+    satellite = home / "profiles" / "researcher"
+    satellite.mkdir(parents=True)
+    (satellite / "config.yaml").write_text("{}\n")
+    (home / ".env").write_text("SPAWN_SCOPE_CHECK=main\n")
+    (satellite / ".env").write_text("SPAWN_SCOPE_CHECK=researcher\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = SessionStore(home / "sessions", GatewayConfig())
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.session_store = store
+    runner._session_model_overrides = {}
+    runner._pending_messages = {}
+    runner._background_tasks = set()
+    runner._voice_mode = {}
+    runner._draining = False
+    runner._is_user_authorized = lambda _: True
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    receiving = SimpleNamespace(create_spawn_thread=AsyncMock(return_value={
+        "success": True, "thread_id": "123", "thread_name": "News · sol", "guild_id": "guild"}))
+    runner._delivery_adapter_for = lambda _: receiving
+    seen = []
+
+    async def model_turn(*args, **kwargs):
+        from agent.secret_scope import get_secret
+        seen.append((get_hermes_home(), get_secret("SPAWN_SCOPE_CHECK")))
+        return "model reply"
+
+    async def inbound_turn(self, event, source, key, generation):
+        return await self._run_agent(event.text, "", [], source, "session", session_key=key)
+
+    runner._run_agent_inner = model_turn
+    receiving.handle_message = runner._handle_message
+    source = SessionSource(platform=Platform.DISCORD, chat_id="42", chat_type="channel",
+                           user_id="owner", guild_id="guild")
+    command = MessageEvent(text="/spawn --agent research --model sol --prompt 'Check sources'", source=source)
+    config = {"gateway": {"spawn": {"parent_channel_id": "42", "agents": {"research": "researcher"},
+                                 "models": {"sol": {"model": "gpt-test", "provider": "openai-codex"}}}}}
+    with (patch("gateway.run._load_gateway_config", return_value=config),
+          patch.object(GatewayRunner, "_handle_message_with_agent", inbound_turn),
+          patch.object(GatewayRunner, "_run_post_turn_hooks", AsyncMock()),
+          patch.object(GatewayRunner, "_clear_durable_active_turn", AsyncMock()),
+          patch.object(GatewayRunner, "_persist_active_agents", lambda self: None)):
+        assert "Spawned <#123>" in await handle_spawn(runner, command)
+        key = store.get_or_create_session(SessionSource(platform=Platform.DISCORD, chat_id="123",
+            chat_type="thread", thread_id="123", parent_chat_id="42", guild_id="guild",
+            scope_id="guild")).session_key
+        assert store.get_execution_profile(key) == "researcher"
+        store.close_all_db_handles()
+        runner.session_store = SessionStore(home / "sessions", GatewayConfig())
+        followup = MessageEvent(text="New question", source=SessionSource(
+            platform=Platform.DISCORD, chat_id="123", chat_type="thread", thread_id="123",
+            parent_chat_id="42", guild_id="guild", scope_id="guild", user_id="owner"))
+        assert await runner._handle_message(followup) == "model reply"
+    assert seen == [(satellite, "researcher"), (satellite, "researcher")]
+    runner.session_store.close_all_db_handles()
