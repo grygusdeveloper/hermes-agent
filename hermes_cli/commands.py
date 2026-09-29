@@ -95,7 +95,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="dispatch", native_platforms=("discord",)),
     CommandDef("spawn", "Create a Discord workspace thread with a chosen agent and model", "Session",
                gateway_only=True, args_hint="[agent] [model] [title] [--prompt task]",
-               native_platforms=("discord",)),
+               native_platforms=("discord",), desktop="messaging"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True, desktop="terminal"),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
