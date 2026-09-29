@@ -42,10 +42,14 @@ class AntigravityClient(CopilotACPClient):
         env = hermes_subprocess_env(inherit_credentials=False)
         if home := get_real_home(env):
             env["HOME"] = home
+        # A model switch must never resume another model's server conversation,
+        # even when the Hermes session key and message prefix are unchanged.
         # Auxiliary requests do not own the main conversation's durable checkpoint.
+        conversation_key = get_conversation_context() if tools else None
+        state_key = f"{model}\0{conversation_key}" if conversation_key else None
         response, reasoning = self._conversation.run(
             prompt, messages=history, model=model, timeout_seconds=_effective_timeout(timeout),
-            cwd=self._acp_cwd, env=env, state_key=get_conversation_context() if tools else None,
+            cwd=self._acp_cwd, env=env, state_key=state_key,
         )
         tool_calls, cleaned = _extract_tool_calls_from_text(response)
         completed_ids = {str(item.get("tool_call_id")) for item in history

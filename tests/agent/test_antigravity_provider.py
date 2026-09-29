@@ -16,7 +16,7 @@ from pathlib import Path
 args = sys.argv[1:]
 prompt = args[args.index("--print") + 1]
 conversation = args[args.index("--conversation") + 1] if "--conversation" in args else None
-record = {"conversation": conversation, "prompt": prompt, "home": os.environ.get("HERMES_HOME"),
+record = {"conversation": conversation, "prompt": prompt, "model": args[args.index("--model") + 1], "home": os.environ.get("HERMES_HOME"),
           "unrelated": os.environ.get("OPENAI_API_KEY")}
 with Path(os.environ["AGY_TEST_LOG"]).open("a", encoding="utf-8") as out:
     out.write(json.dumps(record) + "\\n")
@@ -40,11 +40,11 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
 
     client = profile.create_client(base_url=credentials["base_url"], acp_cwd=str(tmp_path))
 
-    def invoke(home, history):
+    def invoke(home, history, model="gemini-test"):
         token = set_hermes_home_override(str(home))
         context = set_conversation_context("same-conversation-key")
         try:
-            answer = client.chat.completions.create(model="gemini-test", messages=history, tools=tools)
+            answer = client.chat.completions.create(model=model, messages=history, tools=tools)
             assert answer.choices[0].message.content == "AGY OK"
         finally:
             reset_conversation_context(context)
@@ -54,13 +54,24 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
     invoke(a, first)
     invoke(b, first)
     invoke(a, second)
+    invoke(a, second + [{"role": "assistant", "content": "AGY OK"}, {"role": "user", "content": "new model"}], model="gemini-other")
+    # Switching back reloads its own model-scoped checkpoint, not the other model's.
+    invoke(a, second + [{"role": "assistant", "content": "AGY OK"}, {"role": "user", "content": "back to first"}])
+    # Even without a durable key (auxiliary/no-tools), a cached client cannot
+    # carry a server conversation across model changes.
+    no_tools_client = profile.create_client(base_url=credentials["base_url"], acp_cwd=str(tmp_path))
+    for model in ("gemini-test", "gemini-other"):
+        no_tools_client.chat.completions.create(model=model, messages=first)
+    no_tools_client.close()
     client.close()
     rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert [row["conversation"] for row in rows] == [None, None, "12345678-1234-1234-1234-123456789abc"]
+    assert [row["conversation"] for row in rows] == [None, None, "12345678-1234-1234-1234-123456789abc", None, "12345678-1234-1234-1234-123456789abc", None, None]
+    assert rows[3]["model"] == "gemini-other"
+    assert "secret first" in rows[3]["prompt"]
     assert "secret first" not in rows[2]["prompt"]
     assert "second" in rows[2]["prompt"]
     assert all(row["unrelated"] is None for row in rows)
-    assert len(list((a / "state" / "antigravity-conversations").glob("*.json"))) == 1
+    assert len(list((a / "state" / "antigravity-conversations").glob("*.json"))) == 2
     assert len(list((b / "state" / "antigravity-conversations").glob("*.json"))) == 1
     assert not (tmp_path / "launch" / "state").exists()
     assert "secret first" not in next((a / "state" / "antigravity-conversations").glob("*.json")).read_text()

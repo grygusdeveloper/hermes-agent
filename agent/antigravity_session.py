@@ -545,6 +545,7 @@ class AntigravityConversation:
         self._previous_messages: tuple[tuple[str, str], ...] = ()
         self._state_key: str | None = None
         self._state_home: Path | None = None
+        self._model: str | None = None
         self._lock = threading.RLock()
         self._process_lock = threading.Lock()
         self._active_process: subprocess.Popen[str] | None = None
@@ -722,6 +723,7 @@ class AntigravityConversation:
             self._previous_messages = ()
             self._state_key = None
             self._state_home = None
+            self._model = None
 
     def abort(self) -> None:
         """Terminate the in-flight AGY process without waiting on state locks."""
@@ -758,11 +760,12 @@ class AntigravityConversation:
             # A cached client may be reused by a multiplexing process. Even when two
             # profiles share a session key, their server conversation must never cross.
             state_home = _state_dir()
-            if state_key != self._state_key or state_home != self._state_home:
+            if state_key != self._state_key or state_home != self._state_home or model != self._model:
                 self._conversation_id = None
                 self._previous_messages = ()
                 self._state_key = state_key
                 self._state_home = state_home
+                self._model = model
                 if state_key:
                     durable = _load_durable_state(state_key)
                     if durable:
