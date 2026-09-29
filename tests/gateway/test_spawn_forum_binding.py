@@ -10,6 +10,8 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 from gateway.spawn_forum import bind_forum_post
+from gateway.run import GatewayRunner
+from hermes_constants import get_hermes_home
 
 
 @pytest.mark.asyncio
@@ -75,3 +77,51 @@ async def test_forum_rejects_ambiguous_tag_and_missing_profile_without_binding(t
         assert store.get_execution_profile(key) is None
         assert store.get_model_override(key) is None
     store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_native_forum_first_post_and_followups_use_bound_secrets_after_reload(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    satellite = home / "profiles" / "researcher"
+    satellite.mkdir(parents=True)
+    (satellite / "config.yaml").write_text("{}\n")
+    (home / ".env").write_text("SPAWN_SCOPE_CHECK=main\n")
+    (satellite / ".env").write_text("SPAWN_SCOPE_CHECK=researcher\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config = {"gateway": {"spawn": {"parent_channel_id": "forum-1",
+                                 "default_agent": "research", "agents": {"research": "researcher"},
+                                 "models": {"sol": {"model": "gpt-test"}}}}}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="thread-1", chat_type="thread",
+                           thread_id="thread-1", parent_chat_id="forum-1")
+    channel = SimpleNamespace(applied_tags=[SimpleNamespace(name="sol")])
+    event = MessageEvent(text="first task", message_type=MessageType.TEXT, source=source,
+                         raw_message=SimpleNamespace(channel=channel))
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner._session_model_overrides = {}
+    runner.session_store = SessionStore(home / "sessions", GatewayConfig())
+    seen = []
+
+    async def execute(*args, **kwargs):
+        from agent.secret_scope import get_secret
+        seen.append((get_hermes_home(), get_secret("SPAWN_SCOPE_CHECK"), source.profile))
+        return {"completed": True}
+
+    runner._run_agent_inner = execute
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        assert await bind_forum_post(runner, event) is None
+        key = runner.session_store.get_or_create_session(source).session_key
+        assert key.startswith("agent:main:")
+        assert (await runner._run_agent("first task", "", [], source, "s1", session_key=key))["completed"]
+        runner.session_store.close_all_db_handles()
+        runner.session_store = SessionStore(home / "sessions", GatewayConfig())
+        channel.applied_tags[:] = [SimpleNamespace(name="unknown")]
+        assert await bind_forum_post(runner, event) is None
+        assert (await runner._run_agent("follow-up", "", [], source, "s2", session_key=key))["completed"]
+        assert runner.session_store.get_model_override(key) == {"model": "gpt-test"}
+        runner.session_store.set_execution_profile(key, None)
+        assert (await runner._run_agent("unbound", "", [], source, "s3", session_key=key))["completed"]
+    assert seen == [(satellite, "researcher", None), (satellite, "researcher", None),
+                    (home, None, None)]
+    runner.session_store.close_all_db_handles()

@@ -2929,8 +2929,11 @@ class GatewayTurnMixin:
     ) -> Dict[str, Any]:
         """Scope the turn to its runtime profile, without changing its receiving bot or key."""
         key = turn_kwargs.get("session_key")
+        # Brokered execution bindings are created only for Discord threads. Other
+        # gateway turns should not open the routing store just to check an absent binding.
         execution_profile = (
-            await self.async_session_store.get_execution_profile(key) if key else None
+            await self.async_session_store.get_execution_profile(key)
+            if key and source.platform == Platform.DISCORD and source.thread_id else None
         )
         if execution_profile and execution_profile != "default":
             from hermes_cli.profiles import get_profile_dir, profile_exists
