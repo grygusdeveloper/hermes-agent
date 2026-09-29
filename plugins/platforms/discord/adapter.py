@@ -5597,6 +5597,47 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             return None
 
+    async def set_forum_thread_model_tag(
+        self, thread_id: str, model_alias: str, *, model_aliases: set[str],
+    ) -> bool:
+        """Replace model tags without overwriting unrelated forum tags or concurrent edits."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        try:
+            channel_id = int(thread_id)
+        except (TypeError, ValueError):
+            return False
+        locks = getattr(self, "_forum_tag_locks", None)
+        if locks is None:
+            locks = self._forum_tag_locks = {}
+        async with locks.setdefault(channel_id, asyncio.Lock()):
+            try:
+                # Discord edits replace the whole applied-tag list; read it under
+                # the per-thread lock immediately before editing.
+                thread = await self._client.fetch_channel(channel_id)
+                parent = getattr(thread, "parent", None)
+                if parent is None and getattr(thread, "parent_id", None):
+                    parent = await self._client.fetch_channel(int(thread.parent_id))
+                available = list(getattr(parent, "available_tags", None) or [])
+                names = {str(name).strip().casefold() for name in model_aliases}
+                targets = [tag for tag in available if str(tag.name).strip().casefold() == model_alias.strip().casefold()]
+                if len(targets) != 1:
+                    return False
+                target = targets[0]
+                model_ids = {str(tag.id) for tag in available if str(tag.name).strip().casefold() in names}
+                current = list(getattr(thread, "applied_tags", None) or [])
+                desired = [tag for tag in current if str(tag.id) not in model_ids]
+                if str(target.id) not in {str(tag.id) for tag in desired}:
+                    desired.append(target)
+                if len(desired) > 5:
+                    return False
+                if [str(tag.id) for tag in current] != [str(tag.id) for tag in desired]:
+                    await thread.edit(applied_tags=desired, reason="Hermes forum model synchronization")
+                return True
+            except Exception:
+                logger.warning("[%s] Failed to synchronize forum model tag for %s", self.name, thread_id, exc_info=True)
+                return False
+
     async def create_spawn_thread(
         self, parent_chat_id: str, name: str, starter_content: str,
         owner_user_id: Optional[str] = None, model_alias: Optional[str] = None,
