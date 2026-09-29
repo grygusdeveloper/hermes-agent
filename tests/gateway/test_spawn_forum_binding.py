@@ -80,6 +80,47 @@ async def test_forum_rejects_ambiguous_tag_and_missing_profile_without_binding(t
 
 
 @pytest.mark.asyncio
+async def test_forum_uses_agent_model_catalog_and_refuses_casefold_collisions(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    satellite = home / "profiles" / "researcher"
+    satellite.mkdir(parents=True)
+    (satellite / "config.yaml").write_text("{}\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = SessionStore(home / "sessions", GatewayConfig())
+    runner = SimpleNamespace(async_session_store=AsyncSessionStore(store), _session_model_overrides={})
+    source = SessionSource(platform=Platform.DISCORD, chat_id="thread-agent", chat_type="thread",
+                           thread_id="thread-agent", parent_chat_id="forum-1")
+    channel = SimpleNamespace(applied_tags=[SimpleNamespace(name="SOL")])
+    event = MessageEvent(text="task", message_type=MessageType.TEXT, source=source,
+                         raw_message=SimpleNamespace(channel=channel))
+    config = {"gateway": {"spawn": {"parent_channel_id": "forum-1", "default_agent": "research",
+                                 "agents": {"research": {"profile": "researcher", "models": {
+                                     "sol": {"model": "agent-model", "provider": "openai-codex"},
+                                     "private": {"model": "agent-only"}}}},
+                                 "models": {"sol": {"model": "global-model"}}}}}
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        key = store.get_or_create_session(source).session_key
+        assert await bind_forum_post(runner, event) is None
+        assert store.get_model_override(key) == {"model": "agent-model", "provider": "openai-codex"}
+        assert store.get_execution_profile(key) == "researcher"
+        store.set_execution_profile(key, None)
+        store.set_model_override(key, None)
+        channel.applied_tags[:] = [SimpleNamespace(name="private")]
+        assert await bind_forum_post(runner, event) is None
+        assert store.get_model_override(key) == {"model": "agent-only"}
+        store.set_execution_profile(key, None)
+        store.set_model_override(key, None)
+        config["gateway"]["spawn"]["models"]["SOL"] = "colliding-model"
+        channel.applied_tags[:] = [SimpleNamespace(name="sol")]
+        error = await bind_forum_post(runner, event)
+        assert error is not None and "Select exactly one" in error
+        assert store.get_execution_profile(key) is None
+        assert store.get_model_override(key) is None
+    store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 async def test_native_forum_first_post_and_followups_use_bound_secrets_after_reload(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     satellite = home / "profiles" / "researcher"

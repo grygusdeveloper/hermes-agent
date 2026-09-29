@@ -32,14 +32,21 @@ async def bind_forum_post(runner, event) -> str | None:
         # later post must not silently re-select its model from mutable tags.
         return None
 
+    agents = spawn.get("agents")
+    agents = agents if isinstance(agents, dict) else {}
+    default_agent = str(spawn.get("default_agent") or "main").strip().lower()
+    agent_spec = agents.get(default_agent)
     models = spawn.get("models")
-    models = models if isinstance(models, dict) else {}
+    models = dict(models) if isinstance(models, dict) else {}
+    # /spawn lets an agent's aliases override global aliases. Native forum posts
+    # must resolve the same catalog, or a tag can silently select a different model.
+    agent_models = agent_spec.get("models") if isinstance(agent_spec, dict) else None
+    if isinstance(agent_models, dict):
+        models.update(agent_models)
     channel = getattr(event.raw_message, "channel", None)
     tags = getattr(channel, "applied_tags", None) or ()
-    selected = [alias for alias in models if any(
-        str(getattr(tag, "name", "") or "").strip().casefold() == str(alias).strip().casefold()
-        for tag in tags
-    )]
+    tag_names = {str(getattr(tag, "name", "") or "").strip().casefold() for tag in tags}
+    selected = [alias for alias in models if str(alias).strip().casefold() in tag_names]
     if len(selected) != 1:
         choices = ", ".join(f"`{alias}`" for alias in models) or "none"
         return f"❌ Select exactly one model tag for this forum post. Available: {choices}"
@@ -57,10 +64,6 @@ async def bind_forum_post(runner, event) -> str | None:
     if not override.get("model"):
         return f"❌ Model tag `{alias}` has no configured model."
 
-    agents = spawn.get("agents")
-    agents = agents if isinstance(agents, dict) else {}
-    default_agent = str(spawn.get("default_agent") or "main").strip().lower()
-    agent_spec = agents.get(default_agent)
     if isinstance(agent_spec, str):
         profile = agent_spec
     elif isinstance(agent_spec, dict):
