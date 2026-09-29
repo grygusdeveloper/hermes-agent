@@ -248,3 +248,69 @@ async def test_model_commit_warns_if_forum_metadata_fails_after_persistence(tmp_
     assert store.get_model_override(key) == {"model": "target"}
     assert store.get_execution_profile(key) == "default"
     store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("one_turn", [True, False])
+async def test_non_session_model_switch_keeps_forum_tag_and_brokered_scope(tmp_path, monkeypatch, one_turn):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = SessionStore(home / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.DISCORD, chat_id="thread", chat_type="thread",
+                           thread_id="thread", parent_chat_id="forum")
+    key = store.get_or_create_session(source).session_key
+    store.set_execution_profile(key, "default")
+    store.set_model_override(key, {"model": "standing"})
+    receiving = SimpleNamespace(set_forum_thread_model_tag=AsyncMock())
+
+    class Runner(GatewayModelCommandsMixin):
+        async_session_store = AsyncSessionStore(store)
+        _session_model_overrides = {}
+
+        def _switch_cached_agent_model(self, result, ctx, picker):
+            return None
+
+        def _record_switch_metrics(self, result, ctx, source):
+            return None
+
+        def _evict_cached_agent(self, session_key):
+            return None
+
+        def _claim_one_turn_restore(self, session_key, snapshot):
+            self.restore = snapshot
+
+        def _channel_override_for(self, source):
+            return None
+
+        async def _model_switch_confirmation(self, *args, **kwargs):
+            return "switched"
+
+        def _delivery_adapter_for(self, source):
+            return receiving
+
+    runner = Runner()
+    ctx = _ModelSwitchContext(session_key=key, source=source, config_path=home / "config.yaml",
+                              persist_global=not one_turn, one_turn=one_turn,
+                              restore_snapshot={"model": "standing"}, current_model="standing")
+    result = SimpleNamespace(new_model="temporary" if one_turn else "global", target_provider="openai-codex",
+                             provider_label="Codex", api_key="", base_url="", api_mode="chat_completions",
+                             request_overrides={}, runtime_capabilities={})
+    with patch("gateway.run._load_gateway_config", return_value={
+        "gateway": {"spawn": {"parent_channel_id": "forum", "models": {"standing": "standing"}}},
+    }), patch("gateway.slash_commands_model._persist_model_switch_to_config", new_callable=AsyncMock) as persist:
+        reply = await runner._commit_model_switch_locked(result, ctx, source=source, picker=False)
+    assert "Forum tag unchanged" in reply
+    assert ("next turn only" if one_turn else "global configuration") in reply
+    receiving.set_forum_thread_model_tag.assert_not_awaited()
+    assert store.get_execution_profile(key) == "default"
+    assert store.get_model_override(key) == ({"model": "standing"} if one_turn else None)
+    if one_turn:
+        persist.assert_not_awaited()
+        assert runner.restore == {"model": "standing"}
+    else:
+        persist.assert_awaited_once()
+    store.close_all_db_handles()
+    restarted = SessionStore(home / "sessions", GatewayConfig())
+    assert restarted.get_execution_profile(key) == "default"
+    assert restarted.get_model_override(key) == ({"model": "standing"} if one_turn else None)
+    restarted.close_all_db_handles()

@@ -5,6 +5,25 @@ from __future__ import annotations
 from gateway.config import Platform
 
 
+async def unsynced_forum_model_warning(
+    runner, source, session_key: str, *, one_turn: bool, global_error: bool = False,
+) -> str | None:
+    """A global/temporary switch does not rewrite a spawned post's durable model tag."""
+    if source.platform != Platform.DISCORD or not source.thread_id:
+        return None
+    if not await runner.async_session_store.get_execution_profile(session_key):
+        return None
+    from gateway.run import _load_gateway_config
+
+    raw = _load_gateway_config() or {}
+    gateway = raw.get("gateway") if isinstance(raw, dict) else None
+    spawn = gateway.get("spawn") if isinstance(gateway, dict) else None
+    if not isinstance(spawn, dict) or str(source.parent_chat_id or "") != str(spawn.get("parent_channel_id") or ""):
+        return None
+    scope = "next turn only" if one_turn else ("this session only" if global_error else "global configuration")
+    return f"⚠️ Forum tag unchanged: this switch affects {scope}, not the post's persistent model tag."
+
+
 async def sync_switched_model_tag(runner, source, session_key: str, result) -> str | None:
     """Best-effort forum metadata after a durable session switch; never change execution scope."""
     if source.platform != Platform.DISCORD or not source.thread_id:

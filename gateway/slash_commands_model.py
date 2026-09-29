@@ -418,7 +418,14 @@ class GatewayModelCommandsMixin:
             reply += "\n" + self._apply_reasoning_selection(
                 ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                 persist_global=ctx.persist_global and global_error is None)
-        if not one_turn and not ctx.persist_global:
+        if one_turn or ctx.persist_global:
+            from gateway.spawn_forum import unsynced_forum_model_warning
+            warning = await unsynced_forum_model_warning(
+                self, source, ctx.session_key, one_turn=one_turn, global_error=global_error is not None,
+            )
+            if warning:
+                reply += "\n" + warning
+        else:
             from gateway.spawn_forum import sync_switched_model_tag
             try:
                 warning = await sync_switched_model_tag(self, source, ctx.session_key, result)
