@@ -28,9 +28,9 @@ async def bind_forum_post(runner, event) -> str | None:
     entry = await runner.async_session_store.get_or_create_session(source)
     bound = await runner.async_session_store.get_execution_profile(entry.session_key)
     if bound:
-        override = await runner.async_session_store.get_model_override(entry.session_key)
-        if isinstance(override, dict) and override.get("model"):
-            return None
+        # /model may intentionally clear the override on a spawned lane. A
+        # later post must not silently re-select its model from mutable tags.
+        return None
 
     models = spawn.get("models")
     models = models if isinstance(models, dict) else {}

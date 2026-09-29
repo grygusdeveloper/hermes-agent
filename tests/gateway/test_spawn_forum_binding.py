@@ -39,10 +39,14 @@ async def test_forum_tag_binds_model_and_execution_durably_across_homes(tmp_path
         channel.applied_tags[:] = [SimpleNamespace(name="other")]
         assert await bind_forum_post(runner, event) is None
         assert store.get_model_override(key)["model"] == "gpt-test"
+        store.set_model_override(key, None)  # /model resets to profile default
+        assert await bind_forum_post(runner, event) is None
+        assert store.get_model_override(key) is None
+        assert store.get_execution_profile(key) == "researcher"
         store.close_all_db_handles()
         restarted = SessionStore(home / "sessions", GatewayConfig())
         assert restarted.get_execution_profile(key) == "researcher"
-        assert restarted.get_model_override(key)["model"] == "gpt-test"
+        assert restarted.get_model_override(key) is None
         restarted.close_all_db_handles()
 
 
