@@ -11,6 +11,7 @@ from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 from gateway.spawn_command import handle_spawn
 from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
 from plugins.platforms.discord.adapter import DiscordAdapter
 from gateway.run import GatewayRunner
 from hermes_constants import get_hermes_home
@@ -213,4 +214,60 @@ async def test_spawn_reports_refused_initial_task_without_claiming_it_was_queued
         scope_id="guild")).session_key
     assert store.get_model_override(key)["model"] == "gpt-test"
     assert store.get_execution_profile(key) == "default"
+    store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_spawn_kickoff_and_followup_deliver_through_receiving_discord_bot(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    satellite = home / "profiles" / "researcher"
+    satellite.mkdir(parents=True)
+    (satellite / "config.yaml").write_text("{}\n")
+    (satellite / ".env").write_text("SPAWN_SCOPE_CHECK=researcher\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = SessionStore(home / "sessions", GatewayConfig())
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._session_model_overrides = {}
+    receiving = DiscordAdapter(PlatformConfig(enabled=True, token="unused", typing_indicator=False))
+    receiving.create_spawn_thread = AsyncMock(return_value={
+        "success": True, "thread_id": "123", "guild_id": "guild"})
+    receiving.send = AsyncMock(return_value=SendResult(success=True, message_id="sent"))
+    runner._delivery_adapter_for = lambda _: receiving
+
+    async def turn(event):
+        key = store.get_or_create_session(event.source).session_key
+        async def execute(*args, **kwargs):
+            from agent.secret_scope import get_secret
+            assert get_hermes_home() == satellite
+            return {"final_response": f"{get_secret('SPAWN_SCOPE_CHECK')}: {event.text}"}
+        runner._run_agent_inner = execute
+        result = await runner._run_agent(event.text, "", [], event.source, "session", session_key=key)
+        return result["final_response"]
+
+    receiving.set_message_handler(turn)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="42", chat_type="channel",
+                           user_id="owner", guild_id="guild")
+    config = {"gateway": {"spawn": {"parent_channel_id": "42", "agents": {"research": "researcher"},
+                                 "models": {"sol": {"model": "gpt-test"}}}}}
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        response = await handle_spawn(runner, MessageEvent(
+            text="/spawn --agent research --model sol --prompt 'Check sources'", source=source))
+    assert "initial task queued" in response
+    await receiving._session_tasks[next(iter(receiving._session_tasks))]
+    receiving.send.assert_awaited_once()
+    assert receiving.send.await_args.kwargs["chat_id"] == "123"
+    assert "researcher: Check sources" in receiving.send.await_args.kwargs["content"]
+    store.close_all_db_handles()
+    store = SessionStore(home / "sessions", GatewayConfig())
+    followup = MessageEvent(text="Another question", source=SessionSource(
+        platform=Platform.DISCORD, chat_id="123", chat_type="thread", thread_id="123",
+        parent_chat_id="42", guild_id="guild", scope_id="guild", user_id="owner"))
+    await receiving.handle_message(followup)
+    assert followup._gateway_accepted
+    await receiving._session_tasks[next(iter(receiving._session_tasks))]
+    assert receiving.send.await_count == 2
+    assert receiving.send.await_args.kwargs["chat_id"] == "123"
+    assert "researcher: Another question" in receiving.send.await_args.kwargs["content"]
     store.close_all_db_handles()
