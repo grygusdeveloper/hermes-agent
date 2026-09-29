@@ -410,6 +410,50 @@ def test_run_prompt_receives_picker_model():
     assert seen["model"] == "gpt-5.6-terra"
 
 
+def test_requested_model_never_falls_back_to_acp_default(tmp_path):
+    server = tmp_path / "model_server.py"
+    server.write_text('''import json
+import sys
+from pathlib import Path
+
+log = Path(sys.argv[1])
+scenario = sys.argv[2]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    with log.open("a", encoding="utf-8") as output:
+        output.write(method + "\\n")
+    if method == "session/new":
+        result = {"sessionId": "s1", "configOptions": [{"id": "model", "category": "model",
+                  "options": [{"value": "auto"}, {"value": "target", "_meta": {
+                      "copilotEnablement": "disabled" if scenario == "disabled" else "enabled"}}]}]}
+    elif method == "session/set_config_option" and scenario == "rejected":
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"],
+                          "error": {"code": -32000, "message": "model unavailable"}}), flush=True)
+        continue
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+''', encoding="utf-8")
+    for scenario in ("unknown", "disabled", "rejected", "selected", "virtual-default"):
+        log = tmp_path / f"{scenario}.log"
+        client = CopilotACPClient(command=sys.executable, args=[str(server), str(log), scenario], acp_cwd=str(tmp_path))
+        model = "missing" if scenario == "unknown" else "copilot-acp" if scenario == "virtual-default" else "target"
+        if scenario in ("unknown", "disabled", "rejected"):
+            try:
+                client._run_prompt("private request", timeout_seconds=10, model=model)
+            except (ValueError, RuntimeError) as exc:
+                assert "model" in str(exc).lower()
+            else:
+                raise AssertionError(f"{scenario} silently used the wrong model")
+        else:
+            client._run_prompt("private request", timeout_seconds=10, model=model)
+        methods = log.read_text(encoding="utf-8").splitlines()
+        assert methods[:2] == ["initialize", "session/new"]
+        assert ("session/prompt" in methods) == (scenario in ("selected", "virtual-default"))
+        assert ("session/set_config_option" in methods) == (scenario in ("rejected", "selected"))
+
+
 def test_list_models_reads_enabled_session_config_options(tmp_path):
     server = tmp_path / "fake_copilot_acp.py"
     server.write_text(

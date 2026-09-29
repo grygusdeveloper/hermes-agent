@@ -470,13 +470,12 @@ class CopilotACPClient:
         with self._session(timeout_seconds) as (session, _request):
             session_id = str(session.get("sessionId") or "").strip()
             if requested_model and requested_model != "copilot-acp":
-                try:
-                    if (selection := _model_selection_request(session, requested_model)) is not None:
-                        _request(*selection)
-                    else:
-                        logger.warning("Copilot ACP does not offer model %r; using the session default.", requested_model)
-                except Exception as exc:
-                    logger.warning("Copilot ACP model selection for %r failed; continuing with the session default: %s", requested_model, exc)
+                selection = _model_selection_request(session, requested_model)
+                if selection is None:
+                    raise ValueError(f"Copilot ACP does not offer requested model {requested_model!r} in this session.")
+                # Never submit the prompt against a different model when the account's
+                # advertised catalog changed or selection itself failed.
+                _request(*selection)
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             prompt = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]}
