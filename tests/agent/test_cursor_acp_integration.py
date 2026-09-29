@@ -51,3 +51,24 @@ for line in sys.stdin:
     with pytest.raises(RuntimeError, match="Cursor account usage limit"):
         client.chat.completions.create(model="cursor-grok-4.6-high", messages=[{"role": "user", "content": "quota"}], timeout=5)
     client.close()
+
+
+def test_copilot_cannot_silently_run_antigravity_alias(tmp_path, monkeypatch):
+    """A legacy AGY marker must not accidentally send Gemini work to Copilot."""
+    from agent.copilot_acp_client import CopilotACPClient
+    from hermes_cli.auth import resolve_external_process_provider_credentials
+    from providers import get_provider_profile
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    child = tmp_path / "copilot"
+    child.write_text("#!/bin/sh\nexit 0\n")
+    child.chmod(0o700)
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", str(child))
+    profile = get_provider_profile("copilot-acp")
+    assert profile is not None
+    creds = resolve_external_process_provider_credentials("copilot-acp")
+    client = profile.create_client(**creds)
+    assert isinstance(client, CopilotACPClient)
+    client.close()
+    with pytest.raises(ValueError, match="matching transport"):
+        profile.create_client(**{**creds, "base_url": "acp://antigravity"})

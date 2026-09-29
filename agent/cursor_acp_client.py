@@ -17,6 +17,8 @@ _selected_model: contextvars.ContextVar[str] = contextvars.ContextVar("cursor_ac
 class CursorACPClient(CopilotACPClient):
     """Reuse the ACP wire/FS safety bridge, not Copilot's model selection or credential env."""
 
+    _expected_base_url = "acp://cursor"
+
     def __init__(self, *, command: str | None = None, acp_command: str | None = None,
                  args: list[str] | None = None, acp_args: list[str] | None = None, **kwargs: Any):
         # Never fall through to Copilot command/args environment overrides.

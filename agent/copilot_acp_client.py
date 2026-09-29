@@ -280,6 +280,7 @@ class CopilotACPClient:
 
     # Declared for agent/auxiliary_client.py: this shim drives an ACP subprocess over stdio, so it is
     # already a complete client (never re-dispatch through a wire adapter) and async-safe as-is.
+    _expected_base_url = ACP_MARKER_BASE_URL
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
@@ -288,7 +289,12 @@ class CopilotACPClient:
         acp_command: str | None = None, acp_args: list[str] | None = None, acp_cwd: str | None = None, command: str | None = None,
         args: list[str] | None = None, **_: Any,
     ):
-        self.api_key, self.base_url = api_key or "copilot-acp", base_url or ACP_MARKER_BASE_URL
+        self.api_key, self.base_url = api_key or "copilot-acp", base_url or self._expected_base_url
+        if self.base_url.rstrip("/") != self._expected_base_url:
+            raise ValueError(
+                f"{self.base_url} is not supported by {type(self).__name__}; "
+                "select a provider with a matching transport"
+            )
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
