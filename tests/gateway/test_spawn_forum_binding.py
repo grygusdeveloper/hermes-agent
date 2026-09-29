@@ -72,6 +72,9 @@ async def test_forum_rejects_ambiguous_tag_and_missing_profile_without_binding(t
         assert "Select exactly one" in await bind_forum_post(runner, event)
         channel.applied_tags[:] = [SimpleNamespace(name="sol"), SimpleNamespace(name="other")]
         assert "Select exactly one" in await bind_forum_post(runner, event)
+        channel.applied_tags[:] = [SimpleNamespace(name="sol"), SimpleNamespace(name="SOL")]
+        duplicate_error = await bind_forum_post(runner, event)
+        assert duplicate_error is not None and "Select exactly one" in duplicate_error
         channel.applied_tags[:] = [SimpleNamespace(name="sol")]
         assert "missing profile" in await bind_forum_post(runner, event)
         assert store.get_execution_profile(key) is None

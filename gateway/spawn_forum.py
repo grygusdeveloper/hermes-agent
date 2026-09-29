@@ -45,9 +45,11 @@ async def bind_forum_post(runner, event) -> str | None:
         models.update(agent_models)
     channel = getattr(event.raw_message, "channel", None)
     tags = getattr(channel, "applied_tags", None) or ()
-    tag_names = {str(getattr(tag, "name", "") or "").strip().casefold() for tag in tags}
+    tag_names = [str(getattr(tag, "name", "") or "").strip().casefold() for tag in tags]
     selected = [alias for alias in models if str(alias).strip().casefold() in tag_names]
-    if len(selected) != 1:
+    # Distinct Discord tags can share a display name. Counting only aliases
+    # would accept two model tags as one and bind a credential scope ambiguously.
+    if len(selected) != 1 or tag_names.count(str(selected[0]).strip().casefold()) != 1:
         choices = ", ".join(f"`{alias}`" for alias in models) or "none"
         return f"❌ Select exactly one model tag for this forum post. Available: {choices}"
     alias = selected[0]
