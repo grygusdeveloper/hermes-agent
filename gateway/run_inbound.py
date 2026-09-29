@@ -1349,6 +1349,12 @@ class GatewayInboundMixin:
         if _handled:
             return _result
 
+        if not is_internal:
+            from gateway.spawn_forum import bind_forum_post
+            binding_error = await bind_forum_post(self, event)
+            if binding_error:
+                return binding_error
+
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.
         if not is_internal:
