@@ -2927,8 +2927,24 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, **turn_kwargs,
     ) -> Dict[str, Any]:
-        """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
-        when multiplexing is off)."""
+        """Scope the turn to its runtime profile, without changing its receiving bot or key."""
+        key = turn_kwargs.get("session_key")
+        execution_profile = (
+            await self.async_session_store.get_execution_profile(key) if key else None
+        )
+        if execution_profile and execution_profile != "default":
+            from hermes_cli.profiles import get_profile_dir, profile_exists
+            from gateway.run import _profile_runtime_scope
+
+            if not profile_exists(execution_profile):
+                return {
+                    "final_response": f"⚠️ Spawned agent profile `{execution_profile}` is no longer installed.",
+                    "messages": [], "api_calls": 0, "completed": False,
+                    "history_offset": len(history), "session_id": session_id,
+                }
+            with _profile_runtime_scope(get_profile_dir(execution_profile)):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id, **turn_kwargs)
         with self._profile_scope_for_source(source):
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 

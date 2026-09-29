@@ -31,6 +31,19 @@ def _hash_id(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
+def sanitize_execution_profile(profile: Any) -> Optional[str]:
+    """Only profile identifiers accepted by the CLI may be persisted as spawn bindings."""
+    if profile in (None, ""):
+        return None
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+    try:
+        canonical = normalize_profile_name(str(profile))
+        validate_profile_name(canonical)
+        return canonical
+    except (TypeError, ValueError):
+        return None
+
+
 def _hash_sender_id(value: str) -> str:
     """Hash a sender ID to ``user_<12hex>``."""
     return f"user_{_hash_id(value)}"
@@ -534,6 +547,8 @@ class SessionEntry:
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
     transport_profile: Optional[str] = None
+    # Brokered Discord workspace: receiving bot/key remain Main; only execution moves.
+    execution_profile: Optional[str] = None
     # Exact session-context/channel inputs from the last human turn. Append-only dataclass field so
     # older positional construction of transport_profile keeps its meaning.
     prompt_pin: Optional[Dict[str, Any]] = None
@@ -572,6 +587,8 @@ class SessionEntry:
                 result["prompt_pin"] = pin
         if self.transport_profile:
             result["transport_profile"] = self.transport_profile
+        if self.execution_profile:
+            result["execution_profile"] = sanitize_execution_profile(self.execution_profile)
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -614,6 +631,7 @@ class SessionEntry:
             model_override=sanitize_model_override(data.get("model_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
+            execution_profile=sanitize_execution_profile(data.get("execution_profile")),
             **plain,
         )
 
@@ -1120,6 +1138,28 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
 
+    def set_execution_profile(self, session_key: str, profile: Optional[str]) -> None:
+        """Commit a brokered workspace binding before publishing it to live readers."""
+        from dataclasses import replace
+
+        cleaned = sanitize_execution_profile(profile)
+        if profile not in (None, "") and cleaned is None:
+            raise ValueError("Invalid execution profile")
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.execution_profile == cleaned:
+                return
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries[session_key]
+            data[session_key] = replace(entry, execution_profile=cleaned).to_dict()
+            self._persist_routing_data(data, generation)
+            entry.execution_profile = cleaned
+
+    def get_execution_profile(self, session_key: str) -> Optional[str]:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return sanitize_execution_profile(entry.execution_profile) if entry else None
+
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         with self._lock:
@@ -1151,6 +1191,7 @@ class SessionStore(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
             transport_profile=old_entry.transport_profile, **fields,
+            execution_profile=old_entry.execution_profile,
         )
         self._entries[session_key] = new_entry
         self._save()
