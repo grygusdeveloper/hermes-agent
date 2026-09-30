@@ -318,12 +318,21 @@ def _probe_ollama(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> O
     return query_ollama_supports_vision(model, base_url, api_key=api_key)
 
 
+def _probe_provider_profile(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """A registered transport may declare image ingress before its models are cataloged."""
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider)
+    return True if profile is not None and profile.supports_vision else None
+
+
 # Capability probes after the config override, in priority order; each returns
 # True/False or None (unknown → next probe). Exceptions are logged and treated as None.
 _VISION_PROBES: Tuple[Tuple[str, Callable[..., Optional[bool]]], ...] = (
     ("managed-runtime caps lookup", _probe_managed_runtime),
     ("caps lookup", _probe_models_dev),
     ("ollama vision probe", _probe_ollama),
+    ("registered provider vision", _probe_provider_profile),
 )
 
 

@@ -18,6 +18,7 @@ register_provider(ClaudeCodeProfile(
     api_mode="chat_completions", env_vars=(), base_url="acp://claude-code",
     auth_type="external_process", process_command="claude", process_args=(),
     supports_model_listing=False, supports_health_check=False,
+    supports_vision=True, supports_vision_tool_messages=False,
     fallback_models=("opus", "sonnet", "haiku", "fable"),
     model_aliases={"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "fable"},
 ))

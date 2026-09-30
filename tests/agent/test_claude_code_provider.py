@@ -390,7 +390,7 @@ def test_registered_native_roundtrip_and_identity_isolation(native, tmp_path, sc
                 invoke(client, history(), model="gemini-test")
             chunks = list(invoke(client, history(), stream=True))
             assert "".join(getattr(c.choices[0].delta, "content", None) or "" for c in chunks if c.choices) == "Native answer."
-            with pytest.raises(ValueError, match="text only"):
+            with pytest.raises(ValueError, match="resolved base64 data URLs"):
                 invoke(client, [{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"fixture"}}]}])
             from agent.agent_runtime_helpers import create_openai_client
             from agent.client_lifecycle import ClientLifecycleMixin

@@ -3,7 +3,7 @@
 Port provenance: clean hermes-main-fork Claude client/session at 9992a59bb6;
 introduction 2a8696c42e. Native system/transcript/resume semantics are retained.
 The initial gate uses structured SDK MCP instead of parsing executable prose.
-Vision and warm final-turn reuse remain separate gates.
+Resolved user images use native content blocks; warm final-turn reuse is separate.
 """
 from __future__ import annotations
 
