@@ -6,6 +6,8 @@ from providers.base import ProviderProfile
 
 
 class ClaudeCodeProfile(ProviderProfile):
+    supports_native_streaming = True
+
     def create_client(self, **client_kwargs: Any) -> Any:
         from agent.claude_code_client import ClaudeCodeClient
         return ClaudeCodeClient(**client_kwargs)

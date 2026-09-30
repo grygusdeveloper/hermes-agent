@@ -7,6 +7,7 @@ not ACP. No HTTP transport or credential reader is present.
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import selectors
 import signal
@@ -22,10 +23,46 @@ from agent.claude_code_events import NativeTurn
 from agent.claude_code_protocol import (
     NAMESPACE, canonical,
     control_response, digest, message_fingerprints, system_and_transcript,
+    final_chunks,
 )
 from hermes_constants import get_hermes_home, get_real_home
 from hermes_platform.resolver.core import locate_command
 from tools.environments.local import served_profile_child_env
+
+
+class NativeStream:
+    """Pull-based stream; close cancels I/O before waiting for the owning reader.
+
+    No native producer thread or unbounded queue: Hermes's existing context-aware
+    streaming worker drives next(). Capture scope even if consumption moves threads.
+    """
+    def __init__(self, session, iterator):
+        self.session, self.iterator = session, iterator
+        self.context = contextvars.copy_context()
+        self.lock = threading.Lock()
+        self.finished = self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self.lock:
+            if self.closed or self.finished:
+                raise StopIteration
+            try:
+                return self.context.run(next, self.iterator)
+            except BaseException:
+                self.finished = True
+                raise
+
+    def close(self):
+        if self.finished or self.closed:
+            return
+        self.closed = True
+        self.session.cancel()
+        with self.lock:
+            self.context.run(self.iterator.close)
+            self.finished = True
 
 
 class ClaudeCodeSession:
@@ -34,6 +71,8 @@ class ClaudeCodeSession:
         self.cwd = cwd
         self._serial = threading.Lock()
         self._guard = threading.RLock()
+        self._reap_guard = threading.Lock()
+        self._reaped_process = None
         self._epoch = 0
         self._closed = False
         self._process = None
@@ -43,15 +82,20 @@ class ClaudeCodeSession:
         self._pending: dict | None = None
         self._buffer = b""
 
-    @staticmethod
-    def _reap(process) -> None:
+    def _reap(self, process) -> None:
         # Always kill the group even if the leader exited: native connectors
         # must not survive cancellation. No stranger-thread FD close.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=5)
+        # cancel() and the reader's finally can race. Reap each owned group
+        # once, never signal a now-recycled PID after another thread waited it.
+        with self._reap_guard:
+            if process is self._reaped_process:
+                return
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            self._reaped_process = process
 
     def cancel(self) -> None:
         with self._guard:
@@ -186,7 +230,8 @@ class ClaudeCodeSession:
         prompt_file.write_text(system)
         prompt_file.chmod(0o600)
         argv = [*command, "-p", "--model", model, "--input-format", "stream-json",
-                "--output-format", "stream-json", "--verbose", "--system-prompt-file", str(prompt_file),
+                "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+                "--system-prompt-file", str(prompt_file),
                 "--tools", "", "--strict-mcp-config", "--mcp-config",
                 canonical({"mcpServers": {"hermes": {"type": "sdk", "name": "hermes"}}} if specs else {"mcpServers": {}}),
                 "--permission-prompt-tool", "stdio", "--setting-sources", "", "--disable-slash-commands"]
@@ -217,11 +262,25 @@ class ClaudeCodeSession:
         self._selector.register(self._process.stderr, selectors.EVENT_READ, "stderr")
         self._send({"type": "control_request", "request_id": "hermes-init", "request": {"subtype": "initialize", "hooks": {}}})
 
-    def run(self, *, model: str, messages: list[dict], specs: list[dict], owner: str | None,
-            timeout: float, effort: str | None = None, required: bool = False):
+    def run(self, **kwargs):
+        iterator = self._iterate(**kwargs, streaming=False)
+        while True:
+            try:
+                next(iterator)
+            except StopIteration as end:
+                return end.value
+
+    def stream(self, **kwargs):
+        with self._guard:
+            epoch = self._epoch
+        return NativeStream(self, self._iterate(**kwargs, streaming=True, request_epoch=epoch))
+
+    def _iterate(self, *, model: str, messages: list[dict], specs: list[dict], owner: str | None,
+                 timeout: float, effort: str | None = None, required: bool = False, streaming: bool,
+                 request_epoch: int | None = None):
         with self._serial:
             with self._guard:
-                epoch = self._epoch
+                epoch = self._epoch if request_epoch is None else request_epoch
             deadline = time.monotonic() + timeout
             parked = False
             self._io_epoch, self._deadline = epoch, deadline
@@ -233,7 +292,8 @@ class ClaudeCodeSession:
                 identity = digest([str(home), owner, self.command, self.cwd or str(home), model, effort, system, specs])
                 fingerprints = message_fingerprints(messages)
                 turn = NativeTurn(self, model=model, messages=messages, specs=specs, identity=identity,
-                                  epoch=epoch, deadline=deadline, transcript=transcript, required=required)
+                                  epoch=epoch, deadline=deadline, transcript=transcript, required=required,
+                                  streaming=streaming)
                 if self._pending:
                     pending = self._pending
                     self._check(pending["epoch"], deadline)
@@ -244,6 +304,7 @@ class ClaudeCodeSession:
                     if len(results) != len(tail) or set(results) != {call["id"] for call in pending["calls"]}:
                         raise RuntimeError("Claude native requires the correlated Hermes tool_result")
                     turn.calls, turn.tool_results = list(pending["calls"]), results
+                    turn.blocks = dict(pending["blocks"])
                     turn.supply_result(pending["event"], pending["call"])
                     turn.session_id = pending["session_id"]
                     self._pending = None
@@ -265,7 +326,14 @@ class ClaudeCodeSession:
                 while True:
                     event = self._event(epoch, deadline)
                     result = turn.dispatch(event)
+                    yield from turn.chunks
+                    turn.chunks.clear()
                     if result is not None:
+                        if streaming:
+                            yield from final_chunks(result)
+                        # Only full consumption may retain the MCP pause or publish
+                        # durable state. Generator.close/error/cancel takes cleanup.
+                        turn.commit()
                         parked = turn.parked
                         return result
             finally:

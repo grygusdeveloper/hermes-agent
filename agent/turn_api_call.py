@@ -46,8 +46,8 @@ class ApiCallVerdict:
 
 def _should_stream(agent: Any) -> bool:
     """Streaming is preferred even without consumers (stale-stream / read-timeout health
-    checks); disabled on provider signal, ACP providers (``acp://`` scheme or an
-    external-process provider profile), MoA without a display consumer, or Mock clients in
+    checks); disabled on provider signal, ACP/external-process providers without
+    an exact-route native-streaming opt-in, MoA without a display consumer, or Mock clients in
     tests (SimpleNamespace, not stream iterators)."""
     if getattr(agent, "_disable_streaming", False):
         return False
@@ -55,7 +55,13 @@ def _should_stream(agent: Any) -> bool:
     from hermes_cli.runtime_provider_backends import _is_external_process_provider
 
     if _base.startswith(("acp://", "acp+tcp://")) or _is_external_process_provider(agent.provider):
-        return False
+        from providers import get_provider_profile
+        profile = get_provider_profile(agent.provider)
+        # A native stdio transport may speak chat chunks despite its legacy URL
+        # marker. Opt-in is provider-owned and bound to its exact transport route.
+        if not (profile and getattr(profile, "supports_native_streaming", False)
+                and _base.rstrip("/") == profile.base_url.lower().rstrip("/")):
+            return False
     if not agent._has_stream_consumers():
         if agent.provider == "moa":
             return False

@@ -699,7 +699,7 @@ class TestStreamingFallback:
             model="claude-sonnet-4.6",
             provider="copilot-acp",
             api_key="test-key",
-            base_url="http://localhost:1234/v1",
+            base_url="acp://copilot",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,

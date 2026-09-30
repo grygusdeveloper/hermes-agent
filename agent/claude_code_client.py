@@ -1,9 +1,9 @@
-"""Synchronous OpenAI-shaped client over the OAuth-owned Claude CLI.
+"""OpenAI-shaped completions and incremental streams over the OAuth-owned Claude CLI.
 
 Port provenance: clean hermes-main-fork Claude client/session at 9992a59bb6;
 introduction 2a8696c42e. Native system/transcript/resume semantics are retained.
 The initial gate uses structured SDK MCP instead of parsing executable prose.
-Streaming, vision and warm final-turn reuse are intentionally not advertised.
+Vision and warm final-turn reuse remain separate gates.
 """
 from __future__ import annotations
 
@@ -32,12 +32,15 @@ class ClaudeCodeClient:
         self.timeout = timeout
         self._session = ClaudeCodeSession(command or acp_command or "claude", cwd or acp_cwd)
         self._auxiliary = auxiliary
+        self._stream = None
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
 
     def cancel(self) -> None:
         self._session.cancel()
 
     def close(self) -> None:
+        if self._stream is not None:
+            self._stream.close()
         self._session.close()
 
     def _create_chat_completion(self, *, model: str, messages: list[dict], tools: list[dict] | None = None,
@@ -45,8 +48,8 @@ class ClaudeCodeClient:
                                 reasoning_effort: str | None = None, **_: Any):
         if not MODEL.fullmatch(model or ""):
             raise ValueError("Claude native requires a Claude model or opus/sonnet/haiku/fable alias")
-        if stream:
-            raise ValueError("Claude native initial gate is synchronous; incremental streaming is pending")
+        if self._stream is not None and not self._stream.finished:
+            raise RuntimeError("Claude native stream must be exhausted or closed before the next request")
         if reasoning_effort not in (None, "low", "medium", "high", "max"):
             raise ValueError("Unsupported Claude native reasoning effort")
         seconds = timeout if timeout is not None else self.timeout
@@ -60,6 +63,10 @@ class ClaudeCodeClient:
         # A main conversation may intentionally have no tools. Aux factories
         # explicitly opt out of durable turn state inside the same context.
         owner = None if self._auxiliary else get_native_transport_identity()
-        return self._session.run(model=model, messages=messages, specs=specs, owner=owner,
-                                 timeout=float(seconds), effort=reasoning_effort,
-                                 required=tool_choice == "required" or isinstance(tool_choice, dict))
+        kwargs: dict[str, Any] = dict(model=model, messages=messages, specs=specs, owner=owner,
+                      timeout=float(seconds), effort=reasoning_effort,
+                      required=tool_choice == "required" or isinstance(tool_choice, dict))
+        if stream:
+            self._stream = self._session.stream(**kwargs)
+            return self._stream
+        return self._session.run(**kwargs)

@@ -147,6 +147,25 @@ def assistant_row(text: str, calls: list[dict]) -> dict:
     return row
 
 
+def stream_chunk(model: str, *, text: str | None = None, reasoning: str | None = None,
+                 calls: list | None = None, finish_reason: str | None = None, usage=None):
+    """The existing generic chat consumer owns accumulation and display."""
+    delta = SimpleNamespace(content=text, reasoning_content=reasoning, tool_calls=calls)
+    return SimpleNamespace(model=model, usage=usage, choices=[SimpleNamespace(
+        index=0, delta=delta, finish_reason=finish_reason)] if usage is None else [])
+
+
+def final_chunks(response):
+    choice = response.choices[0]
+    calls = [SimpleNamespace(index=i, id=c.id, type=c.type, function=c.function)
+             for i, c in enumerate(choice.message.tool_calls)]
+    if calls:
+        yield stream_chunk(response.model, calls=calls)
+    yield stream_chunk(response.model, finish_reason=choice.finish_reason)
+    if not response._hermes_usage_unavailable:
+        yield stream_chunk(response.model, usage=response.usage)
+
+
 def control_response(request_id: str, payload: dict) -> dict:
     return {"type": "control_response", "response": {
         "subtype": "success", "request_id": request_id, "response": payload}}

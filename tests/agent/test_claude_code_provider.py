@@ -28,6 +28,7 @@ args = sys.argv[1:]
 assert "--acp" not in args and "acp" not in args
 assert args[args.index("--input-format") + 1] == "stream-json"
 assert args[args.index("--output-format") + 1] == "stream-json"
+assert "--include-partial-messages" in args
 assert args[args.index("--tools") + 1] == ""
 assert "--strict-mcp-config" in args
 assert args[args.index("--setting-sources") + 1] == ""
@@ -78,9 +79,46 @@ if scenario == "bad-protocol":
     while True: time.sleep(60)
 send({"type":"system", "subtype":"init", "session_id":sid, "model":model})
 def assistant(blocks):
+    send({"type":"stream_event", "session_id":sid, "event":{"type":"message_start"}})
+    for index, block in enumerate(blocks):
+        def partial(event):
+            send({"type":"stream_event", "session_id":sid, "event":event})
+        kind = block["type"]
+        partial({"type":"content_block_start", "index":index, "content_block":{
+            "type":kind, **({"text":""} if kind == "text" else {})}})
+        if kind in ("text", "thinking"):
+            value = block["text" if kind == "text" else "thinking"]
+            split = max(1, len(value) // 2)
+            for part in (value[:split], value[split:]):
+                partial({"type":"content_block_delta", "index":index, "delta":{
+                    "type":"text_delta" if kind == "text" else "thinking_delta",
+                    "text" if kind == "text" else "thinking":part}})
+                if scenario in ("incremental", "partial-block") and index == 0 and part == value[:split]:
+                    (root / "partial-ready").write_text(str(os.getpid()))
+                    until = time.monotonic() + 15
+                    while not (root / "release").exists() and time.monotonic() < until:
+                        time.sleep(0.02)
+                    assert (root / "release").exists(), "fixture consumer never released partial stream"
+                if scenario == "partial-only":
+                    send({"type":"result", "subtype":"success", "session_id":sid})
+                    for line in sys.stdin: pass
+        elif kind == "tool_use":
+            # Deliberately invalid/hostile partial JSON is inert. Only the complete
+            # authoritative assistant plus correlated MCP request offers a call.
+            partial({"type":"content_block_delta", "index":index, "delta":{
+                "type":"input_json_delta", "partial_json":'{"name":"terminal","command":'}})
+        if index < len(blocks) - 1:
+            partial({"type":"content_block_stop", "index":index})
+    (root / "assistant-sent").touch()
+    if scenario == "mismatch":
+        blocks = [{"type":"text", "text":"Different authoritative answer."}]
     send({"type":"assistant", "uuid":str(uuid.uuid4()), "session_id":sid,
           "message":{"role":"assistant", "content":blocks, "stop_reason":"end_turn"}})
-if scenario in ("tools", "batch", "replay", "unoffered", "malformed"):
+    if not (blocks[-1]["type"] == "tool_use" and scenario in ("tools", "batch")):
+        partial({"type":"content_block_stop", "index":index})
+        partial({"type":"message_delta", "delta":{"stop_reason":"end_turn"}})
+        partial({"type":"message_stop"})
+if scenario in ("tools", "batch", "replay", "unoffered", "malformed", "uncorrelated"):
     name = "Read" if scenario == "unoffered" else "mcp__hermes__read_file"
     call_id = "historic" if scenario == "replay" else "toolu_fixture"
     inp = "not-an-object" if scenario == "malformed" else {"path":latest.get("path", "")}
@@ -88,12 +126,18 @@ if scenario in ("tools", "batch", "replay", "unoffered", "malformed"):
     if scenario == "batch":
         blocks.append({"type":"tool_use", "id":"toolu_second", "name":name, "input":{"path":latest["second_path"]}})
     assistant(blocks)
+    if scenario == "uncorrelated":
+        control(3, "tools/call", {"name":"read_file", "arguments":{"path":"different"}})
     if scenario in ("tools", "batch"):
         send({"type":"control_request", "request_id":"permission", "request":{
             "subtype":"can_use_tool", "tool_name":name, "input":inp, "tool_use_id":call_id}})
         permission = read()
         assert permission["response"]["response"]["behavior"] == "allow"
         result = control(3, "tools/call", {"name":"read_file", "arguments":inp})
+        # Exercise an MCP pause with a trailing partial block lifecycle event.
+        send({"type":"stream_event", "session_id":sid, "event":{
+            "type":"content_block_stop", "index":len(blocks) - 1}})
+        send({"type":"stream_event", "session_id":sid, "event":{"type":"message_stop"}})
         assert result["content"][0]["type"] == "text"
         value = json.loads(result["content"][0]["text"])
         assert "native fixture payload" in value["content"]
@@ -108,6 +152,7 @@ if scenario in ("tools", "batch", "replay", "unoffered", "malformed"):
 else:
     text = '<tool_call>{"name":"terminal"}</tool_call>' if scenario == "inert" else "Native answer."
     assistant([{"type":"text", "text":text}, {"type":"thinking", "thinking":"Native reasoning."}])
+(root / "result-sent").touch()
 send({"type":"result", "subtype":"error_during_execution" if scenario == "error" else "success",
       "is_error":scenario == "error", "session_id":sid, "result":"not an executable assistant source",
       "usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":2}})
@@ -177,7 +222,7 @@ def append_answer(messages, response):
     msg = response.choices[0].message
     return messages + [assistant_row(msg.content or "", [
         {"id":c.id, "type":"function", "function":{"name":c.function.name, "arguments":c.function.arguments}}
-        for c in msg.tool_calls])]
+        for c in msg.tool_calls or []])]
 
 
 TOOLS = [{"type":"function", "function":{"name":"read_file", "description":"Read fixture", "parameters":{
@@ -343,8 +388,8 @@ def test_registered_native_roundtrip_and_identity_isolation(native, tmp_path, sc
                 invoke(client, history(), timeout=float("nan"))
             with pytest.raises(ValueError, match="Claude model"):
                 invoke(client, history(), model="gemini-test")
-            with pytest.raises(ValueError, match="synchronous"):
-                invoke(client, history(), stream=True)
+            chunks = list(invoke(client, history(), stream=True))
+            assert "".join(getattr(c.choices[0].delta, "content", None) or "" for c in chunks if c.choices) == "Native answer."
             with pytest.raises(ValueError, match="text only"):
                 invoke(client, [{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"fixture"}}]}])
             from agent.agent_runtime_helpers import create_openai_client
@@ -431,3 +476,168 @@ def test_request_slot_cancellation_and_failure_do_not_publish(native, tmp_path, 
             assert not client._session._process
         finally:
             client.close()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("scenario", ["facade", "identities", "tools", "inert"])
+def test_incremental_native_stream_uses_generic_consumer(native, tmp_path, scenario):
+    """Real provider imports/consumer; only the subprocess is a protocol fixture."""
+    from run_agent import AIAgent
+    from agent.turn_api_call import _should_stream
+    from types import SimpleNamespace
+
+    for provider, base in (("cursor", "acp://cursor"), ("antigravity", "acp://antigravity"),
+                           ("copilot", "acp://copilot"), ("claude-code", "acp://cursor")):
+        assert not _should_stream(SimpleNamespace(provider=provider, base_url=base))
+
+    def actor():
+        return AIAgent(provider="claude-code", model="opus", base_url="acp://claude-code",
+            api_key="claude-code", command=str(tmp_path / "claude"), args=[], session_id="stream-owner",
+            enabled_toolsets=[], skip_memory=True, skip_context_files=True, quiet_mode=True,
+            save_trajectories=False, max_iterations=4)
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    with scope(a, "stream-owner"):
+        agent = actor()
+        assert _should_stream(agent)
+        text, reasoning, prefinal = [], [], []
+        def delta(value):
+            text.append(value)
+            prefinal.append(not (tmp_path / "assistant-sent").exists()
+                            and not (tmp_path / "result-sent").exists())
+            (tmp_path / "release").touch()
+        agent.stream_delta_callback = delta
+        agent.reasoning_callback = reasoning.append
+        try:
+            if scenario == "facade":
+                answer = agent.run_conversation(history("incremental")[1]["content"])
+                assert answer["final_response"] == "Native answer."
+                assert len(text) >= 2 and prefinal[0]
+                assert "".join(text) == "Native answer."
+                assert "".join(reasoning) == "Native reasoning."
+                assert not agent._disable_streaming
+            elif scenario == "identities":
+                messages = history()
+                first = agent._interruptible_streaming_api_call({"model":"opus", "messages":messages})
+                assert first.choices[0].message.content == "Native answer."
+                with scope(b, "stream-owner"):
+                    agent._interruptible_streaming_api_call({"model":"opus", "messages":messages})
+                with scope(a, "child-owner"):
+                    agent._interruptible_streaming_api_call({"model":"opus", "messages":messages})
+                continuation = append_answer(messages, first) + history()[1:]
+                agent._interruptible_streaming_api_call({"model":"opus", "messages":continuation})
+                calls = rows(tmp_path)
+                assert [r["home"] for r in calls] == [str(a), str(b), str(a), str(a)]
+                assert all("--resume" not in r["args"] for r in calls[:3])
+                assert "--resume" in calls[-1]["args"]
+                assert get_native_transport_identity() == "stream-owner"
+                assert len(list((a / "claude-code/checkpoints").glob("*.json"))) == 2
+                assert len(list((b / "claude-code/checkpoints").glob("*.json"))) == 1
+                with scope(a, "deferred-owner"):
+                    deferred = invoke(native, messages, stream=True)
+                with scope(b, "wrong-consumer-owner"):
+                    chunks = list(deferred)
+                    assert chunks[-1].usage.prompt_tokens == 9
+                assert rows(tmp_path)[-1]["home"] == str(a)
+                assert len(list((a / "claude-code/checkpoints").glob("*.json"))) == 3
+                assert len(list((b / "claude-code/checkpoints").glob("*.json"))) == 1
+            elif scenario == "tools":
+                path = tmp_path / "stream-payload.txt"
+                path.write_text("native fixture payload")
+                messages = history("tools", path=str(path))
+                first = agent._interruptible_streaming_api_call({"model":"opus", "messages":messages, "tools":TOOLS})
+                call = first.choices[0].message.tool_calls[0]
+                assert call.id == "toolu_fixture" and call.function.name == "read_file"
+                assert json.loads(call.function.arguments) == {"path":str(path)}
+                assert not list((a / "claude-code/checkpoints").glob("*.json"))
+                from model_tools import handle_function_call
+                result = handle_function_call(call.function.name, json.loads(call.function.arguments), task_id="stream-fixture")
+                followup = append_answer(messages, first) + [{"role":"tool", "tool_call_id":call.id, "content":result}]
+                second = agent._interruptible_streaming_api_call({"model":"opus", "messages":followup, "tools":TOOLS})
+                assert second.choices[0].message.content == "Tool completed."
+                assert second.usage.prompt_tokens == 9 and second.usage.completion_tokens == 3
+                assert len(rows(tmp_path)) == 1
+                assert len(list((a / "claude-code/checkpoints").glob("*.json"))) == 1
+            else:
+                answer = agent._interruptible_streaming_api_call({"model":"opus", "messages":history("inert"), "tools":TOOLS})
+                assert not answer.choices[0].message.tool_calls
+                assert "<tool_call>" in answer.choices[0].message.content
+            assert agent._request_slot("_request_client_cache")["client"]._session._process is None
+        finally:
+            agent.close()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("scenario", ["close-text", "close-final", "close-usage", "cancel-unstarted", "close-client", "cancel", "cancel-blocked",
+    "close-blocked", "error", "mismatch", "partial-only", "bad-protocol", "unoffered", "malformed", "uncorrelated"])
+def test_native_stream_failure_and_abandonment_preserve_checkpoint(native, tmp_path, scenario):
+    """No invalid result or abandoned iterator can publish durable turn state."""
+    a = tmp_path / "a"
+    with scope(a):
+        messages = history()
+        first = invoke(native, messages)
+        checkpoint = next((a / "claude-code/checkpoints").glob("*.json"))
+        before = checkpoint.read_bytes()
+        failing = "partial-block" if scenario in ("close-text", "close-client", "cancel") else (
+            "block" if scenario.endswith("blocked") else "text" if scenario in ("close-final", "close-usage", "cancel-unstarted") else scenario)
+        current = append_answer(messages, first) + history(failing)[1:]
+        stream = invoke(native, current, tools=TOOLS if scenario in ("unoffered", "malformed", "uncorrelated") else [],
+                        stream=True, timeout=20)
+        if scenario == "cancel-unstarted":
+            native.cancel()
+            with pytest.raises(InterruptedError):
+                next(stream)
+            assert checkpoint.read_bytes() == before
+            assert native._session._process is None
+            assert len(rows(tmp_path)) == 1
+            return
+        if scenario.endswith("blocked"):
+            (tmp_path / "ready").unlink()
+            errors = []
+            from agent.memory_provider import spawn_context_thread
+            def read_blocked():
+                try:
+                    next(stream)
+                except BaseException as exc:
+                    errors.append(exc)
+            thread = spawn_context_thread(target=read_blocked, name="native-stream-fixture-blocked")
+            thread.start()
+            deadline = time.monotonic() + 10
+            while not (tmp_path / "ready").exists() and time.monotonic() < deadline:
+                threading.Event().wait(0.02)
+            assert (tmp_path / "ready").exists()
+            pid = int((tmp_path / "ready").read_text())
+            if scenario == "cancel-blocked":
+                native.cancel()
+            else:
+                native.close()
+            thread.join(10)
+            assert not thread.is_alive() and len(errors) == 1 and isinstance(errors[0], InterruptedError)
+        else:
+            first_chunk = next(stream) if scenario != "bad-protocol" else None
+            if first_chunk is not None:
+                assert not getattr(first_chunk.choices[0].delta, "tool_calls", None)
+            pid = int((tmp_path / "ready").read_text())
+            if scenario in ("close-final", "close-usage"):
+                while not (first_chunk.choices and first_chunk.choices[0].finish_reason):
+                    first_chunk = next(stream)
+                if scenario == "close-usage":
+                    usage_chunk = next(stream)
+                    assert not usage_chunk.choices and usage_chunk.usage.prompt_tokens == 9
+                assert checkpoint.read_bytes() == before
+                stream.close()
+            elif scenario == "close-client":
+                native.close()
+            elif scenario == "close-text":
+                stream.close()
+            else:
+                if scenario == "cancel":
+                    native.cancel()
+                with pytest.raises((RuntimeError, ValueError, InterruptedError)):
+                    list(stream)
+                pid = int((tmp_path / "ready").read_text())
+        assert checkpoint.read_bytes() == before
+        assert native._session._process is None
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        stream.close()
