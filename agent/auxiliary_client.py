@@ -5340,7 +5340,8 @@ def _resolve_external_process_branch(req: _ResolveRequest, creds: Dict[str, Any]
         try:
             client = _extproc_profile.create_client(
                 api_key=api_key, base_url=base_url,
-                command=str(creds.get("command", "")).strip() or None, args=list(creds.get("args") or []))
+                command=str(creds.get("command", "")).strip() or None, args=list(creds.get("args") or []),
+                auxiliary=True)
         except Exception:
             logger.warning("resolve_provider_client: profile %r failed to create an external-process client",
                            provider, exc_info=True)

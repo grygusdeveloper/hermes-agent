@@ -1461,7 +1461,7 @@ _PROVIDER_ALIASES: Dict[str, str] = {
     "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
     "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
     "alibaba_coding_plan": "alibaba-coding-plan",
-    "claude": "anthropic", "claude-code": "anthropic",
+    "claude": "anthropic", "claude-oauth": "anthropic",
     "github": "copilot", "github-copilot": "copilot",
     "github-models": "copilot", "github-model": "copilot",
     "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",

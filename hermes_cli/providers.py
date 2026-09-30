@@ -118,7 +118,7 @@ _ALIAS_GROUPS: Dict[str, Tuple[str, ...]] = {
     "nvidia": ("nim", "nvidia-nim", "build-nvidia", "nemotron"),
     "kimi-for-coding": ("kimi", "kimi-coding", "kimi-coding-cn", "moonshot"),
     "stepfun": ("step", "stepfun-coding-plan"), "minimax-cn": ("minimax-china", "minimax_cn"),
-    "anthropic": ("claude", "claude-code"), "github-copilot": ("copilot", "github"),
+    "anthropic": ("claude", "claude-oauth"), "github-copilot": ("copilot", "github"),
     "copilot-acp": ("github-copilot-acp",), "openai-codex": ("chatgpt", "chatgpt-codex"),
     "vercel": ("ai-gateway", "aigateway", "vercel-ai-gateway"),
     "opencode": ("opencode-zen", "zen"), "opencode-go": ("go", "opencode-go-sub"), "kilo": ("kilocode", "kilo-code", "kilo-gateway"),

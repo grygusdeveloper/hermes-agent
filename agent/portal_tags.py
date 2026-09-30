@@ -28,6 +28,22 @@ _conversation_id: ContextVar[Optional[str]] = ContextVar("nous_portal_conversati
 # trees keep sharing their parent's sticky key.
 _affinity_scope: ContextVar[Optional[str]] = ContextVar("hermes_affinity_scope", default=None)
 
+# Native CLI checkpoints belong to an individual agent, NOT the conversation
+# root shared by delegates and auxiliary calls. Threads inherit via copy_context.
+_native_transport_identity: ContextVar[Optional[str]] = ContextVar("hermes_native_transport_identity", default=None)
+
+
+def set_native_transport_identity(identity: Optional[str]):
+    return _native_transport_identity.set(identity or None)
+
+
+def reset_native_transport_identity(token) -> None:
+    _reset_var(_native_transport_identity, token)
+
+
+def get_native_transport_identity() -> Optional[str]:
+    return _native_transport_identity.get()
+
 
 def _reset_var(var: ContextVar, token) -> None:
     """Reset ``var``; a token from another Context (reset on a different thread)

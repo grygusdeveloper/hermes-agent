@@ -45,7 +45,7 @@ class TurnFacadeMixin:
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
             reset_affinity_scope, reset_conversation_context, set_affinity_scope,
-            set_conversation_context,
+            set_conversation_context, set_native_transport_identity, reset_native_transport_identity,
         )
         from agent.prompt_cache_scope import declared_conversation_scope_safe
         from agent.relay_cwd import resolve_relay_scope_cwds
@@ -72,7 +72,7 @@ class TurnFacadeMixin:
         relay_lease = relay_turn = lease = None
         # Scope tokens start None: early returns leave the try before the set_*() calls and
         # the finally resets each one unconditionally.
-        token = affinity_token = acct_token = None
+        token = affinity_token = acct_token = native_token = None
         task_started = task_finished = False
         relay_outcome = "failed"
 
@@ -131,6 +131,7 @@ class TurnFacadeMixin:
             # affinity scope falls back to it; accounting handles route aux usage to the session.
             token = set_conversation_context(self._conversation_root_id())
             affinity_token = set_affinity_scope(declared_conversation_scope_safe(self))
+            native_token = set_native_transport_identity(session_id or effective_task_id)
             # Publish the session accounting handles the same way so auxiliary calls record their token
             # usage into session_model_usage (task dimension) — the fix for aux spend being invisible in
             # analytics (issue #23270).
@@ -211,6 +212,8 @@ class TurnFacadeMixin:
                         reset_conversation_context(token)
                     if affinity_token is not None:
                         reset_affinity_scope(affinity_token)
+                    if native_token is not None:
+                        reset_native_transport_identity(native_token)
                     # Balance note_turn_started so the idle queue's live-turn count cannot leak.
                     with suppress(Exception):
                         _review_queue.note_turn_finished()
