@@ -176,6 +176,42 @@ class GatewaySlashCommandsMixin(
 
     async_session_store: AsyncSessionStore
 
+    async def _handle_favorites_command(self, event: MessageEvent) -> str:
+        """``/favorites [count]`` — the user's newest ⭐-saved Discord answers as jump links."""
+        from gateway.topic_links import sanitize_discord_topic_label
+        source = getattr(event, "source", None)
+        if source is None or source.platform != Platform.DISCORD:
+            return "`/favorites` is currently available in Discord chats."
+        usage = "Usage: `/favorites [count]` (count must be from 1 to 25)"
+        raw_args = event.get_command_args().strip()
+        try:
+            count = int(raw_args.split()[0]) if raw_args else 10
+        except ValueError:
+            return usage
+        if not 1 <= count <= 25:
+            return usage
+        lister = getattr(self.adapters.get(Platform.DISCORD), "list_user_favorites", None)
+        if lister is None:
+            return "Saved favorites are unavailable until the gateway is restarted."
+        if not getattr(source, "user_id", None):
+            return "I couldn't determine who you are to look up your favorites."
+        try:
+            favorites = await lister(str(source.user_id), count)
+        except Exception:
+            logger.warning("Discord /favorites lookup failed", exc_info=True)
+            return "I couldn't read your saved favorites right now."
+        if not favorites:
+            return "You haven't saved any favorites yet. Tap **⭐ Favorite** under a Hermes response to save it."
+        lines = ["## Your favorites"]
+        for idx, fav in enumerate(favorites, 1):
+            title = sanitize_discord_topic_label(str(fav.get("prompt") or fav.get("content") or "Saved response"))
+            # Escape Markdown link-label delimiters without changing the snippet.
+            title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            jump_url = str(fav.get("jump_url") or "")
+            lines.append(f"{idx}. [{title}]({jump_url})" if jump_url else f"{idx}. {title}")
+        lines.extend(["", f"Newest first · showing {len(favorites)} · `/favorites [1–25]`"])
+        return "\n".join(lines)
+
     async def _handle_spawn_command(self, event: MessageEvent) -> str:
         from gateway.spawn_command import handle_spawn
         return await handle_spawn(self, event)

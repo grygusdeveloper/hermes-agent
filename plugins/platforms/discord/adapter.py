@@ -702,6 +702,39 @@ def _looks_like_nonconversational_history_message(content: str) -> bool:
     return any(pattern.match(text) for pattern in _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS)
 
 
+# Env names that may hold the Notion integration secret for the 📚 save control. NOTION_API_KEY is
+# canonical; the others are tolerated aliases already present in existing installs.
+_NOTION_API_KEY_ENV_NAMES = ("NOTION_API_KEY", "NOTION_TOKEN", "NOTION_PAT", "NOTION_API_TOKEN")
+
+
+def _resolve_notion_api_key() -> Optional[str]:
+    """First configured Notion secret (profile-scoped read) from the tolerated env names."""
+    from gateway.platforms._shared import get_scoped_secret
+    for name in _NOTION_API_KEY_ENV_NAMES:
+        value = str(get_scoped_secret(name, None) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def parse_response_save_controls_config(raw: Any) -> Dict[str, Any]:
+    """Normalize ``platforms.discord.response_save_controls`` (⭐ Favorite / 📚 Notion buttons).
+
+    ``true`` enables with defaults; a mapping enables unless ``enabled: false`` and may set
+    ``notion_parent_page_id`` / ``database_path``; anything else (absent, ``false``) disables.
+    """
+    result: Dict[str, Any] = {"enabled": False, "notion_parent_page_id": None, "database_path": None}
+    if raw is True:
+        result["enabled"] = True
+    elif isinstance(raw, dict):
+        result["enabled"] = bool(raw.get("enabled", True))
+        parent = raw.get("notion_parent_page_id")
+        result["notion_parent_page_id"] = str(parent).strip() if parent else None
+        db = raw.get("database_path")
+        result["database_path"] = str(db).strip() if db else None
+    return result
+
+
 def _clean_discord_id(entry: str) -> str:
     """Strip pasted prefixes (``user:123``, ``<@123>``, ``<@!123>``) to a bare ID/username."""
     entry = entry.strip()
@@ -1188,6 +1221,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     # characters — without a cap the adapter posts every 2000-char chunk back-to-back and floods the channel
     # (the incident delivered 60,698 chars as 31 messages).
     MAX_SPLIT_MESSAGES = 8
+    # A streaming update can already carry the complete final text; the consumer would then skip
+    # the identical finalize edit, which is the one edit that attaches the final-only save controls
+    # (⭐ Favorite / 📚 Notion) and persists the logical response. Opt into that explicit edit.
+    REQUIRES_EDIT_FINALIZE = True
 
     # Voice auto-disconnect after N idle seconds (discord.voice_channel_inactivity_timeout_seconds; 0 off).
     VOICE_TIMEOUT = 300
@@ -1298,6 +1335,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        # Durable store behind the save controls; created lazily on first use (off the loop).
+        self._response_save_store = None
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -1351,6 +1390,121 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     def _config_int(self, key: str, default: int, *, env_key: Optional[str] = None) -> int:
         return self._liveness_knob(key, default, int, env_key=env_key)
+
+    # ── Final-response save controls (⭐ Favorite / 📚 Notion) ──────────────────────────────
+    def _response_save_controls_config(self) -> Dict[str, Any]:
+        extra = self.config.extra if isinstance(getattr(self.config, "extra", None), dict) else {}
+        return parse_response_save_controls_config(extra.get("response_save_controls"))
+
+    def _should_attach_save_controls(self, metadata: Optional[Dict[str, Any]]) -> bool:
+        """Only a normal assistant final carries the controls: the feature is enabled, the send is
+        marked ``final_response``, and it is neither a command/system reply nor a status send."""
+        return (
+            isinstance(metadata, dict)
+            and bool(metadata.get("final_response"))
+            and not metadata.get("save_controls_disabled")
+            and not _metadata_marks_nonconversational(metadata)
+            and bool(self._response_save_controls_config()["enabled"])
+        )
+
+    def _get_response_save_store(self):
+        """The durable save store, created on first use. Blocking (SQLite): call off the loop."""
+        if self._response_save_store is None:
+            db_path = self._response_save_controls_config().get("database_path")
+            if not db_path:
+                from hermes_constants import get_hermes_home
+                db_path = get_hermes_home() / "discord_response_saves.sqlite3"
+            from plugins.platforms.discord.response_save_store import DiscordResponseSaveStore
+            self._response_save_store = DiscordResponseSaveStore(db_path)
+        return self._response_save_store
+
+    def _make_response_save_view(self):
+        """A fresh persistent ``ResponseSaveView`` bound to this adapter (None without discord.py)."""
+        if not DISCORD_AVAILABLE or "ResponseSaveView" not in globals():
+            return None
+        return ResponseSaveView(self)
+
+    def _save_view_kwargs(self, attach: bool) -> Dict[str, Any]:
+        """``{"view": ResponseSaveView}`` for a send/edit that carries the save controls, else ``{}``."""
+        view = self._make_response_save_view() if attach else None
+        return {"view": view} if view is not None else {}
+
+    def _register_persistent_response_save_view(self) -> None:
+        """Re-bind ⭐/📚 clicks on earlier answers after a restart (timeout=None + stable custom_ids).
+        Registered even when the feature is off so buttons already posted keep answering."""
+        view = self._make_response_save_view() if self._client else None
+        if view is None:
+            return
+        try:
+            self._client.add_view(view)
+        except Exception:
+            logger.warning("[%s] Failed to register the persistent response-save view", self.name, exc_info=True)
+
+    async def _persist_final_response_record(
+        self, message_id: str, metadata: Dict[str, Any], msg: Any,
+    ) -> None:
+        """Store the complete logical response under its control message (the one with the buttons),
+        so a click — even after a restart — can load it by ``interaction.message.id``."""
+        content = metadata.get("save_response_content") or ""
+        if not message_id or not content:
+            return
+        channel_id = getattr(getattr(msg, "channel", None), "id", None) or metadata.get("thread_id")
+        guild_id = getattr(getattr(msg, "guild", None), "id", None)
+        jump_url = getattr(msg, "jump_url", None)
+        record = {
+            "message_id": str(message_id), "content": str(content), "prompt": metadata.get("save_prompt"),
+            "channel_id": str(channel_id) if channel_id else None,
+            "guild_id": str(guild_id) if guild_id else None,
+            "jump_url": jump_url if isinstance(jump_url, str) and jump_url else None,
+        }
+        try:
+            await asyncio.to_thread(lambda: self._get_response_save_store().save_response(**record))
+        except Exception:
+            logger.warning("[%s] Failed to persist final response %s", self.name, message_id, exc_info=True)
+
+    async def list_user_favorites(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Newest saved favorites of ``user_id``, joined with their responses (backs /favorites)."""
+        return await asyncio.to_thread(
+            lambda: self._get_response_save_store().list_favorites(str(user_id), limit))
+
+    async def _notion_followup(self, interaction: Any, message: str) -> None:
+        """Ephemeral follow-up after a deferred Notion click (best effort)."""
+        try:
+            await interaction.followup.send(message, ephemeral=True)
+        except Exception:
+            logger.debug("[%s] Notion follow-up send failed", self.name, exc_info=True)
+
+    async def _handle_notion_save(self, interaction: Any, message_id: str, record: Dict[str, Any]) -> None:
+        """Save ``record`` as a Notion child page; idempotent through the cached page URL."""
+        existing = record.get("notion_page_url")
+        if existing:
+            await self._notion_followup(interaction, f"📚 Already saved to Notion: {existing}")
+            return
+        parent_page_id = self._response_save_controls_config().get("notion_parent_page_id")
+        api_key = _resolve_notion_api_key()
+        if not api_key or not parent_page_id:
+            await self._notion_followup(
+                interaction, "📚 Notion isn't configured (set NOTION_API_KEY and a parent page ID).")
+            return
+        from plugins.platforms.discord.notion_saver import NotionSaveError, save_response_to_notion
+        try:
+            page_url = await save_response_to_notion(
+                api_key=api_key, parent_page_id=parent_page_id, prompt=record.get("prompt"),
+                response=record.get("content") or "", source_url=record.get("jump_url"),
+            )
+        except NotionSaveError as e:
+            await self._notion_followup(interaction, f"📚 {e}")
+            return
+        except Exception:
+            logger.warning("[%s] Notion save failed", self.name, exc_info=True)
+            await self._notion_followup(interaction, "📚 Notion save failed.")
+            return
+        try:
+            await asyncio.to_thread(
+                lambda: self._get_response_save_store().set_notion_page(message_id, page_url))
+        except Exception:
+            logger.warning("[%s] Failed to cache the Notion page for %s", self.name, message_id, exc_info=True)
+        await self._notion_followup(interaction, f"📚 Saved to Notion: {page_url}")
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits as a retryable fatal so GatewayRunner
@@ -1534,6 +1688,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if self._slash_commands:
                 # Registration walks the skill catalog on disk (#110707); keep the loop free.
                 await asyncio.to_thread(self._register_slash_commands)
+            # Persistent ⭐/📚 save-controls view: clicks on answers posted before a restart still work.
+            self._register_persistent_response_save_view()
             self._disconnecting = False
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
             self._bot_task.add_done_callback(self._handle_bot_task_done)
@@ -3224,13 +3380,21 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             message_ids = []
             reference = self._reply_reference_for_send(reply_to, channel)
+            # Save controls ride the FIRST chunk of a normal final only (Discord renders a view
+            # below its own message); the record keyed by that message holds the whole answer.
+            attach_controls = self._should_attach_save_controls(metadata)
+            first_msg = None
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                send_kwargs: Dict[str, Any] = {
+                    "content": chunk, "reference": chunk_reference,
+                    **self._save_view_kwargs(attach_controls and i == 0),
+                }
                 try:
-                    msg = await channel.send(content=chunk, reference=chunk_reference)
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     if chunk_reference is not None and self._is_reply_reference_rejected(e):
                         logger.warning(
@@ -3238,10 +3402,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             self.name, reply_to,
                         )
                         reference = None
-                        msg = await channel.send(content=chunk, reference=None)
+                        msg = await channel.send(**{**send_kwargs, "reference": None})
                     else:
                         raise
+                if i == 0:
+                    first_msg = msg
                 message_ids.append(str(msg.id))
+            if attach_controls and first_msg is not None:
+                await self._persist_final_response_record(message_ids[0], metadata, first_msg)
             # Track the last sent message for history backfill (skips the full history scan).
             if message_ids:
                 _target_id = thread_id or chat_id
@@ -3373,6 +3541,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        # Only the finalize edit of a normal final carries the save controls (original message only).
+        attach_controls = finalize and self._should_attach_save_controls(metadata)
         try:
             channel = await self._resolve_channel(chat_id)
             msg = channel.get_partial_message(int(message_id))
@@ -3385,7 +3555,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # Pre-flight oversize: final edits split-and-deliver; streaming edits truncate in place.
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 if finalize:
-                    return await self._edit_overflow_split(channel, msg, message_id, content)
+                    return await self._edit_overflow_split(channel, msg, message_id, content, metadata=metadata)
                 formatted = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)[0]
                 _saturated_preview = True
                 # Saturated-preview dedup: past the cap every edit is the same text; skip until finalize.
@@ -3397,14 +3567,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 # Content shrank under the cap: clear saturation state so dedup can't mask a real edit.
                 self._last_overflow_preview.pop(_preview_key, None)
             try:
-                await msg.edit(content=formatted)
+                await msg.edit(content=formatted, **self._save_view_kwargs(attach_controls))
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = formatted
             except Exception as edit_err:
                 # Reactive split: format_message inflation can exceed 2,000 (50035) even after pre-flight.
                 if self._is_length_overflow_error(edit_err):
                     if finalize:
-                        return await self._edit_overflow_split(channel, msg, message_id, content)
+                        return await self._edit_overflow_split(channel, msg, message_id, content, metadata=metadata)
                     truncated = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)[0]
                     if self._last_overflow_preview.get(_preview_key) == truncated:
                         # Saturated-preview dedup (see pre-flight path above).
@@ -3416,6 +3586,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             result = SendResult(success=True, message_id=message_id)
             if finalize:
                 await self._record_response_async((metadata or {}).get("reply_to_message_id"), result, content, True)
+                if attach_controls:
+                    await self._persist_final_response_record(str(message_id), metadata, msg)
             return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
@@ -3439,25 +3611,32 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         )
 
     async def _edit_overflow_split(
-        self, channel: Any, msg: Any, message_id: str, content: str,
+        self, channel: Any, msg: Any, message_id: str, content: str, *,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Deliver an oversized final edit: edit ``message_id`` with chunk 1, send chunks 2..N as
         replies to the previous. Returns ``message_id=<last-id>`` + ``continuation_message_ids``.
         A continuation failure still reports success plus ``partial_overflow`` so the consumer
-        delivers the tail; only a first-chunk edit failure returns ``success=False``."""
+        delivers the tail; only a first-chunk edit failure returns ``success=False``. Save controls
+        stay on the original (first) message, never on a continuation."""
+        attach_controls = self._should_attach_save_controls(metadata)
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
         if len(chunks) <= 1:
             # Defensive: pre-flight should guarantee >1 chunk; otherwise edit normally.
-            await msg.edit(content=chunks[0] if chunks else formatted)
+            await msg.edit(content=chunks[0] if chunks else formatted, **self._save_view_kwargs(attach_controls))
+            if attach_controls:
+                await self._persist_final_response_record(str(message_id), metadata, msg)
             return SendResult(success=True, message_id=message_id)
         try:
-            await msg.edit(content=chunks[0])
+            await msg.edit(content=chunks[0], **self._save_view_kwargs(attach_controls))
         except Exception as e:
             logger.error(
                 "[%s] Overflow split: first-chunk edit failed: %s", self.name, e, exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+        if attach_controls:
+            await self._persist_final_response_record(str(message_id), metadata, msg)
         continuation_ids: list[str] = []
         delivered = 1
         prev_msg = msg
@@ -4616,6 +4795,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._attach_autocomplete(slash_spawn, "model", lambda cfg, i, cur: _spawn_model_choice_specs(
             cfg, selected_agent=str(getattr(getattr(i, "namespace", None), "agent", "") or ""), current=cur))
 
+    def _register_favorites_slash(self, tree) -> None:
+        @tree.command(name="favorites", description="List your saved favorite responses")
+        @discord.app_commands.describe(count="Number of favorites to show (1-25, default 10)")
+        async def slash_favorites(interaction: discord.Interaction, count: int = 10):
+            await self._run_simple_slash(interaction, f"/favorites {count}")
+
     @staticmethod
     def _attach_autocomplete(command, option: str, choices_for) -> None:
         """Give ``option`` a config-driven autocomplete; ``choices_for(raw_config, interaction, current)`` returns
@@ -4652,6 +4837,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if name == "model":
                 self._attach_autocomplete(command, "name", lambda cfg, _i, cur: _model_command_choice_specs(cfg, cur))
         self._register_spawn_slash(tree)
+        self._register_favorites_slash(tree)
         # Auto-register COMMAND_REGISTRY + plugin commands not yet on the tree. Native
         # commands above always survive the 100-command cap; reserve one slot for /skill.
         already_registered: set[str] = set()
@@ -6661,6 +6847,7 @@ def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
     Called at module load and after a lazy install so the classes exist whenever DISCORD_AVAILABLE."""
     global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ResponseSaveView
 
     class _HermesView(discord.ui.View):
         """Shared plumbing for Hermes component views: allowlist auth, single-use
@@ -7270,6 +7457,76 @@ def _define_discord_view_classes() -> None:
                 interaction, discord.Color.blue(),
                 t("platform.discord.prompt.awaiting_typed", user=display_name), log_edit_failure=False)
 
+    class ResponseSaveView(_HermesView):
+        """Persistent ``⭐ Favorite`` / ``📚 Notion`` controls on the first message of a normal final.
+
+        ``timeout=None`` plus stable custom_ids make it persistent: the instance registered at connect
+        (``client.add_view``) re-binds clicks after a restart, and each click loads the durable record
+        keyed by ``interaction.message.id``. Authorization reads the adapter's LIVE allowlists, since
+        one view instance outlives allowlist reloads."""
+
+        FAVORITE_CUSTOM_ID = "hermes:response_save:favorite"
+        NOTION_CUSTOM_ID = "hermes:response_save:notion"
+
+        def __init__(self, adapter):
+            super().__init__(set(), None, timeout=None)
+            self._adapter = adapter
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(
+                interaction, getattr(self._adapter, "_allowed_user_ids", set()),
+                getattr(self._adapter, "_allowed_role_ids", set()))
+
+        async def _load_record(self, interaction: discord.Interaction) -> "tuple[str, Optional[dict]]":
+            message_id = str(getattr(getattr(interaction, "message", None), "id", "") or "")
+            if not message_id:
+                return "", None
+            try:
+                record = await asyncio.to_thread(
+                    lambda: self._adapter._get_response_save_store().get_response(message_id))
+            except Exception:
+                logger.warning("Response-save lookup failed for message %s", message_id, exc_info=True)
+                record = None
+            return message_id, record
+
+        @discord.ui.button(label="Favorite", emoji="⭐", style=discord.ButtonStyle.secondary,
+                           custom_id=FAVORITE_CUSTOM_ID)
+        async def favorite(self, interaction: discord.Interaction, button):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            message_id, record = await self._load_record(interaction)
+            if not record:
+                await interaction.response.send_message(
+                    "I couldn't find the saved data for this response.", ephemeral=True)
+                return
+            user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
+            try:
+                added = await asyncio.to_thread(
+                    lambda: self._adapter._get_response_save_store().add_favorite(message_id, user_id))
+            except Exception:
+                logger.warning("Favorite save failed for message %s", message_id, exc_info=True)
+                await interaction.response.send_message("Saving the favorite failed.", ephemeral=True)
+                return
+            await interaction.response.send_message(
+                "⭐ Saved to your favorites." if added else "⭐ Already in your favorites.", ephemeral=True)
+
+        @discord.ui.button(label="Notion", emoji="📚", style=discord.ButtonStyle.secondary,
+                           custom_id=NOTION_CUSTOM_ID)
+        async def notion(self, interaction: discord.Interaction, button):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            # Defer before any network I/O: Notion can take longer than the 3 s interaction window.
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                logger.debug("Notion click defer failed", exc_info=True)
+            message_id, record = await self._load_record(interaction)
+            if not record:
+                await self._adapter._notion_followup(
+                    interaction, "I couldn't find the saved data for this response.")
+                return
+            await self._adapter._handle_notion_save(interaction, message_id, record)
+
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 
@@ -7790,6 +8047,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key:
                 _env_default(env_key, str(value))
+    # Save controls are structured (Notion parent page, DB path): they belong in extra, not env.
+    response_save_controls = discord_cfg.get("response_save_controls")
+    if response_save_controls is not None:
+        seeded_extra["response_save_controls"] = response_save_controls
     return seeded_extra or None
 
 

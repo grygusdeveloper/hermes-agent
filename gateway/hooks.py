@@ -7,6 +7,15 @@ agent:step (each tool-loop turn), agent:end, command:* (wildcard).  agent:* cont
 platform, user_id, chat_id, thread_id ("" outside a thread), chat_type
 ("dm"|"group"|"forum"|""), session_id, message (500 chars); agent:end adds response,
 model, provider.  Forum follow-ups pass ``message_thread_id=int(thread_id)``.
+
+Successful-delivery events fire only after the platform ACKed a real message, as background
+tasks (a slow hook never delays delivery): ``message:sent`` (final answer), ``approval:sent``
+(dangerous-command approval prompt), ``clarify:sent`` (clarify prompt).  Context
+(gateway/notification_events.py): event_id (``kind:platform:channel:message`` dedupe key),
+kind (final_response|approval|clarify), platform, chat_id, chat_type, message_id, message_url
+(exact Discord link when every id validates, else None), preview (force-redacted, whitespace-
+normalized, ≤240 chars), plus user_id/thread_id/scope_id/session_key/session_id when known.
+Raw adapter responses and unredacted approval commands are never included.
 """
 
 import asyncio

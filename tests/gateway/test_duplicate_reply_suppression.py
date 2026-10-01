@@ -129,3 +129,44 @@ class TestBaseInterruptSuppression:
 # ===================================================================
 # Test 4: stream_consumer.py — cancellation handler delivery confirmation
 # ===================================================================
+
+
+
+class TestFinalDeliveryEvent:
+    """``message:sent`` fires once, after the platform ACK, with the exact delivered message."""
+
+    @staticmethod
+    async def _run(text):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        adapter = StubAdapter()
+        delivered = SendResult(success=True, message_id="1528825062260740297")
+        adapter.send = AsyncMock(return_value=delivered)
+        hooks = SimpleNamespace(emit=AsyncMock())
+        adapter.gateway_runner = SimpleNamespace(hooks=hooks)
+
+        async def handler(event):
+            return "Normal response"
+
+        adapter.set_message_handler(handler)
+        event = _make_event(text=text, chat_id="1505353433685950710", user_id="1922673")
+        await adapter._process_message_background(event, build_session_key(event.source))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return hooks
+
+    @pytest.mark.asyncio
+    async def test_successful_final_delivery_emits_exact_message_event(self):
+        hooks = await self._run("hello")
+        hooks.emit.assert_awaited_once()
+        event_type, context = hooks.emit.await_args.args
+        assert event_type == "message:sent"
+        assert context["kind"] == "final_response"
+        assert context["message_id"] == "1528825062260740297"
+        assert context["preview"] == "Normal response"
+
+    @pytest.mark.asyncio
+    async def test_command_reply_does_not_emit_final_delivery_event(self):
+        hooks = await self._run("/status")
+        hooks.emit.assert_not_awaited()

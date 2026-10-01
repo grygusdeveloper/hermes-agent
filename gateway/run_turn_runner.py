@@ -977,7 +977,8 @@ class TurnRunner:
                     )
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=(ctx._stream_thread_metadata if ctx._stream_thread_metadata is not None
+                                  else ctx._status_thread_metadata),
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
                         ),
@@ -1422,7 +1423,9 @@ class TurnRunner:
         def _text_fallback():
             """Schedule the plain-text prompt when the native card cannot render; None = no such path."""
             coro = text_fallback_coro(ctx._status_adapter, **send_kwargs)
-            return None if coro is None else self._schedule(coro, "Clarify text fallback failed to schedule")
+            return None if coro is None else self._schedule(
+                self._send_prompt_with_delivery_event(coro, event_type="clarify:sent", kind="clarify", preview=question),
+                "Clarify text fallback failed to schedule")
         clarify_mod.register(
             clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
             multi_select=bool(multi_select),
@@ -1444,7 +1447,9 @@ class TurnRunner:
         except Exception:
             logger.debug("Stream-consumer flush before clarify prompt failed", exc_info=True)
         fut = self._schedule(
-            ctx._status_adapter.send_clarify(**send_kwargs),
+            self._send_prompt_with_delivery_event(
+                ctx._status_adapter.send_clarify(**send_kwargs),
+                event_type="clarify:sent", kind="clarify", preview=question),
             "Clarify send failed to schedule",
         )
         # Boundary rule (see _approval_send_outcome): a send timeout is AMBIGUOUS — the card may
@@ -1501,10 +1506,12 @@ class TurnRunner:
         if _renders_exec_approval_buttons(type(adapter)):
             try:
                 fut = self._schedule(
-                    adapter.send_exec_approval(
-                        chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
-                    ),
+                    self._send_prompt_with_delivery_event(
+                        adapter.send_exec_approval(
+                            chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
+                            description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        ),
+                        event_type="approval:sent", kind="approval", preview=desc),
                     "send_exec_approval scheduling error",
                 )
                 if fut is None:
@@ -1567,7 +1574,10 @@ class TurnRunner:
             # Mark as approval prompt so WeCom routes through the control lane.
             metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}
             fut = self._schedule(
-                adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
+                self._send_prompt_with_delivery_event(
+                    adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)),
+                    event_type="approval:sent", kind="approval", preview=desc),
+                "Approval text-send scheduling error",
             )
             if fut is not None:
                 fut.result(timeout=15)
@@ -1576,6 +1586,20 @@ class TurnRunner:
                 register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
         except Exception as e:
             logger.error("Failed to send approval request: %s", e)
+
+    async def _send_prompt_with_delivery_event(self, send_coro, *, event_type: str, kind: str, preview: str):
+        """Await a user-blocking prompt send (approval / clarify) and, once the platform ACKed a real
+        message, fire its post-delivery hook event in the background. The send result is returned
+        unchanged: notification hooks never alter or delay the delivery disposition."""
+        result = await send_coro
+        if getattr(result, "success", False) and getattr(result, "message_id", None):
+            from gateway.notification_events import schedule_delivery_event
+            ctx = self._ctx
+            schedule_delivery_event(
+                hooks=getattr(self._runner, "hooks", None), event_type=event_type, source=ctx.source,
+                message_id=result.message_id, kind=kind, preview=preview,
+                session_key=ctx.session_key, session_id=ctx.session_id)
+        return result
 
     # ── run_sync phases ─────────────────────────────────────────────────────────────────────
 

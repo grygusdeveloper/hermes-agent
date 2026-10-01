@@ -253,10 +253,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         progress = "\n".join(self._tool_progress_lines)
         return "\n\n---\n".join(p for p in (self._accumulated, progress) if p)
 
-    def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None:
+    def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False,
+                           controls: bool = False, save_content: Optional[str] = None) -> dict | None:
         """Per-send metadata.  ``final`` → notify=True (Mattermost treats notify-worthy sends
         as final when a broken thread root may fall back flat); ``expect_edits`` keeps
-        editable previews on Telegram's legacy send path."""
+        editable previews on Telegram's legacy send path.  ``controls`` marks the ONE message
+        of a turn-final answer that carries the Discord save controls (``final_response``) and
+        ``save_content`` is the complete logical answer they persist (see ``_save_controls``)."""
         meta = dict(self.metadata) if self.metadata else {}
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
@@ -264,7 +267,20 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+        if controls:
+            meta.update(self._save_controls(save_content))
         return meta or None
+
+    def _save_controls(self, visible_text: Optional[str]) -> dict:
+        """Final-answer marker for the Discord save controls.  The persisted content is the whole
+        logical answer: on a split turn the visible text is only the tail, so the unsplit
+        ``_stream_ledger`` is used instead."""
+        content = (self._clean_for_display(self._stream_ledger)
+                   if self._turn_split_delivery and self._stream_ledger else visible_text)
+        controls = {"final_response": True}
+        if content:
+            controls["save_response_content"] = content
+        return controls
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
     already_sent = property(lambda self: self._already_sent)

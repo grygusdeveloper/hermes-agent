@@ -762,3 +762,17 @@ def test_build_slash_event_routes_guild_profile_like_messages(adapter, monkeypat
     assert thread_event.source.guild_id == "1"
     assert thread_event.source.parent_chat_id == "100"
     assert thread_event.source.profile == "work"
+
+
+
+@pytest.mark.asyncio
+async def test_registers_native_favorites_slash_command_with_count(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "favorites" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["favorites"](interaction, count=7)
+
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/favorites 7")

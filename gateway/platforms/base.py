@@ -4392,6 +4392,20 @@ class BasePlatformAdapter(ABC):
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
 
+    def _final_text_metadata(self, event: MessageEvent, extracted: "_ExtractedResponse",
+                             metadata: Dict[str, Any], is_ephemeral_response: bool) -> Dict[str, Any]:
+        """Metadata for the final TEXT send. Discord adds the save-controls keys: the complete
+        pre-extraction answer and the raw prompt; command/system replies are not answers, so their
+        controls are disabled. Only this send carries them — TTS, attachment and media-warning
+        sends reuse ``metadata`` and must never grow ⭐/📚 buttons."""
+        if self.platform != Platform.DISCORD:
+            return metadata
+        return {
+            **metadata, "final_response": True, "save_response_content": extracted.pre_extract,
+            "save_prompt": getattr(event, "text", None),
+            **({"save_controls_disabled": True} if is_ephemeral_response or event.is_command() else {}),
+        }
+
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
@@ -4402,6 +4416,14 @@ class BasePlatformAdapter(ABC):
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+        if result.success and result.message_id and not is_ephemeral_response and not event.is_command():
+            # Post-delivery notification hooks (e.g. Bark) see the exact delivered message.
+            from gateway.notification_events import schedule_delivery_event
+            runner = getattr(delivery_adapter, "gateway_runner", None) or self.gateway_runner
+            schedule_delivery_event(
+                hooks=getattr(runner, "hooks", None), event_type="message:sent", source=event.source,
+                message_id=result.message_id, kind="final_response", preview=text_content,
+                session_key=session_key)
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4614,7 +4636,8 @@ class BasePlatformAdapter(ABC):
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
-                        event, session_key, text_content, _final_thread_metadata,
+                        event, session_key, text_content,
+                        self._final_text_metadata(event, extracted, _final_thread_metadata, is_ephemeral_response),
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,

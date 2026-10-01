@@ -85,6 +85,9 @@ class TurnContext:
     _status_adapter: Any = None
     _status_chat_id: Any = None
     _status_thread_metadata: Optional[dict] = None
+    # Stream-consumer metadata: ``_status_thread_metadata`` plus keys that must not leak into
+    # progress/status routing (Discord's ``save_prompt``). None → the consumer uses the status one.
+    _stream_thread_metadata: Optional[dict] = None
     # bound TurnRunner callbacks read via ctx
     progress_callback: Optional[Callable] = None
     voice_ack_callback: Optional[Callable] = None

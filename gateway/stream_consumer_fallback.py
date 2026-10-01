@@ -18,15 +18,19 @@ class StreamFallbackMixin:
     """Non-streaming delivery paths used once progressive edits fail or the turn ends oddly."""
 
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str], *,
-                              final: bool = False) -> Optional[str]:
-        """Send a new chunk threaded to ``reply_to_id``; returns the new message_id."""
+                              final: bool = False, controls: bool = False,
+                              save_content: Optional[str] = None) -> Optional[str]:
+        """Send a new chunk threaded to ``reply_to_id``; returns the new message_id.
+        ``controls``/``save_content``: this chunk carries the Discord save controls for the
+        complete answer (pass it on ONE chunk of a turn-final answer only)."""
         text = self._clean_for_display(text)
         if not text.strip():
             return reply_to_id
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, reply_to=reply_to_id,
-                metadata=self._metadata_for_send(final=final, expect_edits=not final))
+                metadata=self._metadata_for_send(final=final, expect_edits=not final,
+                                                 controls=controls, save_content=save_content))
             if not (result.success and result.message_id):
                 self._edit_supported = False
                 return reply_to_id
@@ -127,9 +131,11 @@ class StreamFallbackMixin:
         # keeps its existing unthreaded delivery on every platform.
         anchor = self._initial_reply_to_id if continuation == final_text else None
         for chunk in chunks:
+            # Only the FIRST continuation chunk carries the save controls (with the whole answer).
             result = await self._send_with_flood_retry(
                 content=chunk, reply_to=None if sent_any_chunk else anchor,
-                retry_log="Flood control on fallback send, retrying in %.1fs")
+                retry_log="Flood control on fallback send, retrying in %.1fs",
+                controls=not sent_any_chunk, save_content=final_text)
             if not result or not result.success:
                 # Partial continuation landed: do NOT set _final_response_sent (the
                 # gateway must still deliver the full answer); _already_sent only
@@ -221,11 +227,13 @@ class StreamFallbackMixin:
                 logger.debug("per-chat limit resolution failed: %s", e)
         return _len_fn, raw_limit
 
-    async def _send_with_flood_retry(self, *, content: str, retry_log: str, reply_to=None):
+    async def _send_with_flood_retry(self, *, content: str, retry_log: str, reply_to=None,
+                                     controls: bool = False, save_content: Optional[str] = None):
         """adapter.send(final metadata) with ONE bounded flood retry; returns the last
         SendResult.  Exceptions propagate (callers decide whether a raise is "ambiguous")."""
         kwargs = dict(chat_id=self.chat_id, content=content,
-                      metadata=self._metadata_for_send(final=True))
+                      metadata=self._metadata_for_send(final=True, controls=controls,
+                                                       save_content=save_content))
         if reply_to is not None:
             kwargs["reply_to"] = reply_to
         result = None
@@ -252,7 +260,8 @@ class StreamFallbackMixin:
         try:
             result = await self._send_with_flood_retry(
                 content=final_text, reply_to=self._initial_reply_to_id,
-                retry_log="Flood control on empty fallback final send; retrying in %.1fs")
+                retry_log="Flood control on empty fallback final send; retrying in %.1fs",
+                controls=True, save_content=final_text)
         except Exception as exc:
             logger.debug("Empty fallback final send failed: %s", exc)
             return "ambiguous" if self._send_failure_may_have_delivered(exc) else "failed"

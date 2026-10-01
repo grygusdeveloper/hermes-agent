@@ -153,3 +153,38 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
+
+
+def test_run_agent_discord_stream_metadata_keeps_raw_prompt(monkeypatch, tmp_path):
+    """Discord streaming metadata carries the raw user text for the save controls, never the
+    enriched model input, and without leaking into the status routing metadata."""
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.session import SessionSource
+
+    _setup_monkeypatches(monkeypatch, tmp_path)
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_delivery_adapter_for", lambda self, source: None)
+    captured = {}
+    original_run_sync = TurnRunner.run_sync
+
+    def _capture(turn_runner):
+        captured["stream"] = dict(turn_runner._ctx._stream_thread_metadata or {})
+        captured["status"] = turn_runner._ctx._status_thread_metadata
+        return original_run_sync(turn_runner)
+
+    monkeypatch.setattr(TurnRunner, "run_sync", _capture)
+
+    async def _run():
+        return await runner._run_agent(
+            message="[Discord context and internal instructions]\nRaw Discord prompt",
+            context_prompt="", history=[],
+            source=SessionSource(platform=Platform.DISCORD, chat_id="67890", chat_type="dm", user_id="u1"),
+            session_id="session-2", session_key="agent:main:discord:dm:67890",
+            save_prompt="Raw Discord prompt",
+        )
+
+    result = asyncio.new_event_loop().run_until_complete(_run())
+    assert result["final_response"] == "Hello from the agent."
+    assert captured["stream"]["save_prompt"] == "Raw Discord prompt"
+    assert "save_prompt" not in (captured["status"] or {})

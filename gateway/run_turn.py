@@ -165,6 +165,17 @@ def hygiene_no_commit_reason(agent) -> str:
     return "in-place commit did not complete"
 
 
+def _with_save_prompt(
+    metadata: Optional[Dict[str, Any]], *, platform: Any, prompt: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Discord only: carry the raw user prompt to the one final message that owns the save
+    controls, so favorites / Notion pages get a useful title even for streamed answers.
+    Other platforms get ``metadata`` back unchanged."""
+    if platform != Platform.DISCORD:
+        return metadata
+    return {**(metadata or {}), "save_prompt": prompt}
+
+
 class GatewayTurnMixin:
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
@@ -567,7 +578,10 @@ class GatewayTurnMixin:
                     session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
                     if session_info:
                         notice = f"{notice}\n\n{session_info}"
-                await adapter.send(source.chat_id, notice, metadata=self._thread_metadata_for_source(source))
+                from gateway.run import _non_conversational_metadata
+                # Lifecycle banner, not an answer: history backfill must not treat it as one.
+                await adapter.send(source.chat_id, notice, metadata=_non_conversational_metadata(
+                    self._thread_metadata_for_source(source), platform=source.platform))
         except Exception as e:
             logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
@@ -1938,6 +1952,15 @@ class GatewayTurnMixin:
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
+            # The base adapter skips its final send (and its ``message:sent``) for a streamed final;
+            # the stream's confirmed message id is the only post-delivery event seam here.
+            _streamed_message_id = agent_result.get("_delivery_message_id")
+            if _streamed_message_id and not _intentional_silence:
+                from gateway.notification_events import schedule_delivery_event
+                schedule_delivery_event(
+                    hooks=self.hooks, event_type="message:sent", source=source,
+                    message_id=_streamed_message_id, kind="final_response", preview=response,
+                    session_key=session_key, session_id=getattr(session_entry, "session_id", None))
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             if response and adapter and not agent_result.get("media_already_delivered"):
@@ -2752,7 +2775,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, save_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2810,7 +2833,10 @@ class GatewayTurnMixin:
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
         _stream_consumer = (
             None if scheduled_heartbeat
-            else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
+            else self._proxy_stream_consumer(
+                source, event_message_id,
+                _with_save_prompt(_thread_metadata, platform=source.platform, prompt=save_prompt),
+                _run_still_current)
         )
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
 
@@ -3830,6 +3856,8 @@ class GatewayTurnMixin:
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
+        # The follow-up's raw text titles its own favorite/Notion save (never the enriched model input).
+        next_save_prompt = pending if isinstance(pending, str) else None
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
         # distinct from the reply anchor above (None in forum topics). Carry it or two chained
         # topic turns with the same text would collide on one obligation id (queued-final-ledger).
@@ -3872,6 +3900,7 @@ class GatewayTurnMixin:
                 # A drained human turn re-pins its channel inputs; make them durable like a first turn.
                 await self._persist_prompt_pins(next_session_key, session_id)
             next_message_type = getattr(pending_event, "message_type", None)
+            next_save_prompt = getattr(pending_event, "text", None)
         else:
             # Event-less interrupt/steer follow-ups continue the effective prompt
             # of the turn they are recursively following.
@@ -3923,7 +3952,7 @@ class GatewayTurnMixin:
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
-                reply_expected=next_reply_expected,
+                reply_expected=next_reply_expected, save_prompt=next_save_prompt,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
@@ -4277,15 +4306,21 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        save_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        # The raw user text (not the enriched model input) titles the answer's favorite/Notion
+        # save; queued follow-ups, which are never titled, pass their own prompt explicitly.
+        if save_prompt is None:
+            save_prompt = title_user_message
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
+                save_prompt=save_prompt,
             )
 
         from run_agent import AIAgent
@@ -4320,6 +4355,8 @@ class GatewayTurnMixin:
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
+        turn_ctx._stream_thread_metadata = _with_save_prompt(
+            _status_thread_metadata, platform=source.platform, prompt=save_prompt)
         # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
         if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
@@ -4367,5 +4404,7 @@ class GatewayTurnMixin:
             )
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
+        from gateway.notification_events import attach_confirmed_stream_delivery_id
+        attach_confirmed_stream_delivery_id(response, turn_ctx.stream_consumer_holder[0])
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
         return response

@@ -28,17 +28,20 @@ class StreamTransportMixin:
 
     _MIN_NEW_MSG_CHARS = 4
 
-    async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
-        """Edit via the adapter, passing routing metadata when supported."""
+    async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False,
+                            metadata_override: Optional[dict] = None):
+        """Edit via the adapter, passing routing metadata when supported.  ``metadata_override``
+        replaces the session metadata (the turn-final edit adds the save-controls keys)."""
         # Contract: adapters must accept finalize= even when False (test-guarded).
         kwargs = dict(chat_id=self.chat_id, message_id=message_id, content=content,
                       finalize=finalize)
-        if self.metadata:
+        metadata = metadata_override if metadata_override is not None else self.metadata
+        if metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -282,7 +285,8 @@ class StreamTransportMixin:
         stale_ids = self._stale_preview_ids()
         try:
             result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+                chat_id=self.chat_id, content=text,
+                metadata=self._metadata_for_send(final=True, controls=is_turn_final, save_content=text))
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
@@ -362,7 +366,7 @@ class StreamTransportMixin:
                     # A failed send disabled edits: a preview sent now could never be updated and
                     # would stay on screen truncated next to the final reply. Send only the final.
                     return False
-                return await self._first_send(text, finalize=finalize)
+                return await self._first_send(text, finalize=finalize, controls=finalize and is_turn_final)
             if not self._edit_supported:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
@@ -446,7 +450,7 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
-    async def _first_send(self, text: str, *, finalize: bool) -> bool:
+    async def _first_send(self, text: str, *, finalize: bool, controls: bool = False) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
@@ -459,7 +463,8 @@ class StreamTransportMixin:
             return False
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize,
+                                             controls=controls, save_content=text))
         if not result.success:
             self._edit_supported = False
             return False
@@ -494,8 +499,11 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
-        result = await self._edit_message(message_id=self._message_id, content=text,
-                                          finalize=finalize)
+        # The turn-final edit carries the save controls; every other edit keeps the session metadata.
+        result = await self._edit_message(
+            message_id=self._message_id, content=text, finalize=finalize,
+            metadata_override=({**(self.metadata or {}), **self._save_controls(text)}
+                               if finalize and is_turn_final else None))
         if not result.success:
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
