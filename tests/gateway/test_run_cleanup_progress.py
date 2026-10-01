@@ -14,6 +14,7 @@ import asyncio
 import importlib
 import inspect as _inspect
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -47,11 +48,12 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
 
     _next_mid = 100
 
-    def __init__(self, platform=Platform.TELEGRAM):
+    def __init__(self, platform=Platform.TELEGRAM, heartbeat_event=None):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
         self.edits = []
         self.deleted = []
+        self.heartbeat_event = heartbeat_event
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -68,6 +70,11 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
         self.sent.append(
             {"chat_id": chat_id, "content": content, "message_id": mid, "metadata": metadata}
         )
+        if (
+            self.heartbeat_event is not None
+            and "Antigravity accepted the prompt — Gemini is reasoning" in str(content)
+        ):
+            self.heartbeat_event.set()
         return SendResult(success=True, message_id=mid)
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
@@ -143,6 +150,39 @@ class FailingAgent:
         }
 
 
+class ProviderProgressAgent:
+    """Keeps a provider call active until the gateway delivers one heartbeat."""
+
+    heartbeat_event: threading.Event | None = None
+
+    def __init__(self, **kwargs):
+        # Force the first 50 ms heartbeat tick to occur before agent_holder is
+        # populated, proving startup does not permanently stop notifications.
+        time.sleep(0.12)
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        # Stay live until the adapter receives the actual heartbeat, so an
+        # unrelated activity-summary read is never taken as proof of delivery.
+        assert self.heartbeat_event is not None
+        assert self.heartbeat_event.wait(timeout=5.0)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    def get_activity_summary(self):
+        return {
+            "api_call_count": 3,
+            "max_iterations": 90,
+            # Deliberately stale: the provider phase must win in the heartbeat.
+            "current_tool": "terminal",
+            "last_activity_desc": "Antigravity accepted the prompt — Gemini is reasoning",
+            "provider_activity": {
+                "active": True,
+                "description": "Antigravity accepted the prompt — Gemini is reasoning",
+                "updated_at": time.time(),
+            },
+        }
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -157,6 +197,7 @@ def _make_runner(adapter):
     runner._session_db = None
     runner._running_agents = {}
     runner._session_run_generation = {}
+    runner._draining = False
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
@@ -186,7 +227,7 @@ def _install_fakes(
     import tools.terminal_tool  # noqa: F401 — register tool emoji
 
     gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda *a, **k: {"api_key": "fake"})
 
     # Wire the per-platform cleanup_progress flag via the config loader the
     # gateway actually reads (``_load_gateway_config`` returns user config).
@@ -204,6 +245,40 @@ def _install_fakes(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_survives_startup_and_prefers_live_provider_phase(monkeypatch, tmp_path):
+    """The first tick lands before the agent exists and while the slot still holds this run's pending
+    sentinel; the heartbeat must keep going and then show the live provider phase, not the stale tool."""
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.05")
+    heartbeat_event = threading.Event()
+    monkeypatch.setattr(ProviderProgressAgent, "heartbeat_event", heartbeat_event)
+    adapter = CleanupCaptureAdapter(platform=Platform.DISCORD, heartbeat_event=heartbeat_event)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(
+        monkeypatch, ProviderProgressAgent, cleanup_on=False, cleanup_platform=Platform.DISCORD,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.DISCORD, chat_id="progress-thread")
+    session_key = "agent:main:discord:progress-thread"
+    run_generation = runner._begin_session_run_generation(session_key)
+    runner._session_state(session_key).turn.agent = gateway_run._AGENT_PENDING_SENTINEL
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-provider-progress",
+        session_key=session_key,
+        run_generation=run_generation,
+    )
+
+    assert result["final_response"] == "done"
+    heartbeat_text = "\n".join(str(item["content"]) for item in [*adapter.sent, *adapter.edits])
+    assert "Antigravity accepted the prompt — Gemini is reasoning" in heartbeat_text
+    assert "terminal" not in heartbeat_text
 
 
 @pytest.mark.asyncio

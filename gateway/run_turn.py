@@ -4176,7 +4176,7 @@ class GatewayTurnMixin:
 
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
-        from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
+        from gateway.run import _AGENT_PENDING_SENTINEL, _float_env, _interim_metadata, _non_conversational_metadata
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
@@ -4190,9 +4190,24 @@ class GatewayTurnMixin:
         _heartbeat_msg_id: Optional[str] = None
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
-            if not self._should_emit_long_running_notification(
-                session_key, agent_holder[0], _executor_task_holder[0]
-            ):
+            _executor_task = _executor_task_holder[0]
+            if _executor_task is not None and _executor_task.done():
+                break
+            # The agent is built inside the executor thread; a tick that wins that startup race must keep
+            # waiting instead of ending notifications before the agent can publish its activity.
+            if agent_holder[0] is None:
+                continue
+            if not self._should_emit_long_running_notification(session_key, agent_holder[0], _executor_task):
+                # The real agent can exist briefly before track_agent() promotes this run's pending claim.
+                # Wait only while the run generation proves the sentinel is still ours; /new or another
+                # run invalidates it and must stop output.
+                _slot_state = self._peek_session_state(session_key) if session_key else None
+                if (
+                    _slot_state is not None and _slot_state.turn.agent is _AGENT_PENDING_SENTINEL
+                    and turn_ctx.run_generation is not None
+                    and self._is_session_run_current(session_key, turn_ctx.run_generation)
+                ):
+                    continue
                 break
             _elapsed_mins = int((time.time() - _notify_start) // 60)
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
@@ -4206,7 +4221,15 @@ class GatewayTurnMixin:
                     _parts = []
                     if _want_iteration_detail:
                         _parts.append(format_iteration_progress(_a["api_call_count"], _a["max_iterations"]))
-                    _action = _a.get("current_tool") or _a.get("last_activity_desc")
+                    # A live provider phase (AGY) is newer than the last completed Hermes tool: prefer it so a
+                    # long provider call is not mislabeled as the stale prior tool. get_activity_summary
+                    # overlays and bounds that phase into last_activity_desc.
+                    _provider_activity = _a.get("provider_activity")
+                    _provider_action = (
+                        str(_a.get("last_activity_desc") or "").strip()
+                        if isinstance(_provider_activity, dict) and _provider_activity.get("active") else ""
+                    )
+                    _action = _provider_action or _a.get("current_tool") or _a.get("last_activity_desc")
                     if _action:
                         _parts.append(str(_action))
                     if _parts:
