@@ -167,6 +167,9 @@ def native(tmp_path, monkeypatch):
     script = tmp_path / "claude"
     script.write_text(f"#!{sys.executable}\n" + CHILD)
     script.chmod(0o700)
+    # The fixture answers one request per process; warm reuse is covered in
+    # test_claude_code_runtime.py.
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
     monkeypatch.setenv("OPENAI_API_KEY", "unrelated-fixture-value")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-fixture-value")
