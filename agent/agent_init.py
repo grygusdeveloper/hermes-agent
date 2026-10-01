@@ -378,6 +378,10 @@ def _resolve_api_mode(agent, api_mode, provider_name, base_url):
     host, url = agent._base_url_hostname, agent._base_url_lower
     if is_actual_route(agent.provider, base_url):
         agent.api_mode = "chat_completions"
+    elif agent.provider == "claude-code" or str(base_url or "").strip().lower().startswith("acp://claude-code"):
+        # The Claude Code bridge only implements chat.completions; a stale api_mode inherited from
+        # another provider (e.g. codex_responses) fails every call with "no attribute 'responses'".
+        agent.api_mode = "chat_completions"
     elif api_mode in _EXPLICIT_API_MODES or (api_mode and api_mode in registered_api_modes()):
         # A provider plugin's own dialect (``register_transport(api_mode, cls)``) is as explicit
         # as the in-tree modes; rewriting it to chat_completions silently dropped its transport.

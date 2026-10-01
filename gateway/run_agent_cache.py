@@ -202,6 +202,12 @@ class GatewayAgentCacheMixin:
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
+        # A credential-less override lands on top of the config runtime. When it names another
+        # provider, the config runtime's api_mode belongs to that provider (e.g. openai-codex's
+        # codex_responses) and must not leak onto the override — clear it so AIAgent re-derives it.
+        override_provider = override.get("provider")
+        if override_provider and override.get("api_mode") is None and override_provider != runtime_kwargs.get("provider"):
+            runtime_kwargs["api_mode"] = None
         for key in _OVERRIDE_APPLY_KEYS:
             val = override.get(key)
             if val is not None:

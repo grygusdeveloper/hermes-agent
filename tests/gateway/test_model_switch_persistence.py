@@ -120,6 +120,72 @@ class TestApplySessionModelOverride:
         assert model == orig_model
         assert rt == orig_rt
 
+    def test_credentialless_override_clears_foreign_api_mode(self):
+        """A credential-less claude-code override on an openai-codex config runtime must not
+        inherit ``codex_responses`` (ClaudeCodeClient has no ``responses`` API)."""
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._session_model_overrides[sk] = {
+            "model": "claude-sonnet-5",
+            "provider": "claude-code",
+            "base_url": "acp://claude-code",
+            "api_key": None,
+            "api_mode": None,
+        }
+
+        model, rt = runner._apply_session_model_override(
+            sk,
+            "gpt-5.6-sol",
+            {
+                "provider": "openai-codex",
+                "api_key": "codex-token",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+            },
+        )
+
+        assert model == "claude-sonnet-5"
+        assert rt["provider"] == "claude-code"
+        assert rt["base_url"] == "acp://claude-code"
+        assert rt["api_mode"] is None
+
+    def test_same_provider_override_keeps_runtime_api_mode(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._session_model_overrides[sk] = {
+            "model": "gpt-5.6-terra",
+            "provider": "openai-codex",
+            "api_mode": None,
+        }
+
+        _model, rt = runner._apply_session_model_override(
+            sk, "gpt-5.6-sol", {"provider": "openai-codex", "api_mode": "codex_responses"},
+        )
+
+        assert rt["api_mode"] == "codex_responses"
+
+
+def test_agent_init_forces_chat_completions_for_claude_code():
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        model="claude-sonnet-5",
+        provider="claude-code",
+        base_url="acp://claude-code",
+        api_key="claude-code",
+        api_mode="codex_responses",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    try:
+        assert agent.api_mode == "chat_completions"
+    finally:
+        try:
+            agent.close()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Tests: _is_intentional_model_switch
