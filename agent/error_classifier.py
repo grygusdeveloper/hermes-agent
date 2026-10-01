@@ -48,6 +48,7 @@ class FailoverReason(enum.Enum):
     image_too_large = "image_too_large"   # Native image part exceeds provider's per-image limit — shrink and retry
     image_corrupt = "image_corrupt"       # Provider can't decode image bytes — strip and retry (shrinking won't help)
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
+    provider_unavailable = "provider_unavailable"  # Local provider runtime cannot start (CLI missing / not executable) — fail fast, fallback
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator account data/privacy policy excluded the only endpoint
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
     model_entitlement = "model_entitlement"  # This account cannot use the requested model — rotate credential (model-scoped), else fall back
@@ -819,6 +820,49 @@ def _nous_welcome_tier(c: _Ctx) -> Optional[Verdict]:
     return _v(_R.format_error, retryable=False, should_fallback=True, error_context=ctx)
 
 
+# ── Claude Code bridge ──────────────────────────────────────────────────
+
+# The bridge's own errors once its in-session retries are spent, and the CLI's
+# subscription-limit wording ("You've hit your session limit · resets 3pm").
+_CLAUDE_CODE_LIMIT_PATTERNS = ("soft usage/limit notice", "claude code rate-limit result", "limit · resets",
+                               "usage limit reached")
+_CLAUDE_CODE_LIMIT_BANNER_RE = re.compile(r"\bhit your (?:[\w-]+ ){0,3}limit\b")
+
+
+def _claude_code_verdict(c: _Ctx) -> Optional[Verdict]:
+    """Claude Code bridge failures the generic pipeline would mislabel.
+
+    Each is deterministic for this request: the bridge already retried what retrying
+    can fix, so Hermes must not burn its own retries (each one a CLI start) before
+    falling back. There is no credential pool for the CLI's own login: never rotate.
+    """
+    if c.provider_slug != "claude-code":
+        return None
+    from agent.claude_code_errors import ClaudeCodeLaunchError
+    # Safety refusal (API stop reason ``refusal``, no CLI fallback model): the same
+    # request gets the same refusal; Hermes's fallback may still answer it.
+    if c.code == "refusal":
+        return _V_CONTENT_BLOCKED
+    # The CLI is missing or not executable: every retry fails identically.
+    if isinstance(c.error, ClaudeCodeLaunchError):
+        return _v(_R.provider_unavailable, **_ABORT_FALLBACK)
+    hard = c.code == "usage_limit_reached"
+    if hard or any(p in c.msg for p in _CLAUDE_CODE_LIMIT_PATTERNS) or _CLAUDE_CODE_LIMIT_BANNER_RE.search(c.msg):
+        context: Dict[str, Any] = {"usage_limit": True}
+        err = c.body.get("error") if isinstance(c.body, dict) else None
+        if isinstance(err, dict):
+            for key in ("rate_limit_type", "resets_at", "resets_in_seconds"):
+                if err.get(key) is not None:
+                    context[key] = err[key]
+            if err.get("resets_at") is not None:
+                context["reset_at"] = err["resets_at"]
+        if hard:
+            context["hard"] = True
+        return _v(_R.rate_limit, retryable=False, should_rotate_credential=False, should_fallback=True,
+                  error_context=context)
+    return None
+
+
 def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     """Highest-priority provider-specific shapes that a status code would misroute."""
     msg, status = c.msg, c.status_code
@@ -953,8 +997,8 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
 # HTTP status → MoA shapes → structured error code → message patterns → SSL → disconnect +
 # large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
-    _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
-    _by_error_code, _by_message, _by_transport,
+    _plugin_verdict, _profile_verdict, _claude_code_verdict, _provider_special_cases, _by_status,
+    _moa_special_cases, _by_error_code, _by_message, _by_transport,
 )
 
 
