@@ -515,6 +515,24 @@ def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dic
     return anthropic_kwargs
 
 
+def _is_keepalive_chunk(chunk: Any) -> bool:
+    """A chunk that carries nothing: no content, reasoning, tool calls, commentary,
+    role, finish reason or usage (a liveness tick)."""
+    if getattr(chunk, "usage", None) is not None:
+        return False
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return False
+    for choice in choices:
+        if getattr(choice, "finish_reason", None) is not None:
+            return False
+        delta = getattr(choice, "delta", None)
+        if delta is not None and any(getattr(delta, field, None) for field in (
+                "role", "content", "tool_calls", "reasoning_content", "reasoning", "commentary")):
+            return False
+    return True
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters: delta
     string lengths plus a framing floor (~3x cheaper than ``len(repr(chunk))``
@@ -3008,7 +3026,9 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._touch_activity("receiving stream response")
         with contextlib.suppress(Exception):
             diag["chunks"] = int(diag.get("chunks", 0)) + 1
-            if diag.get("first_chunk_at") is None:
+            # A liveness tick (all-empty delta, e.g. the Claude Code bridge while Claude
+            # writes tool-call JSON) keeps the stream alive but is not a first token.
+            if diag.get("first_chunk_at") is None and not _is_keepalive_chunk(chunk):
                 diag["first_chunk_at"] = self.last_chunk_time["t"]
             # Delta-length estimate: ~3x cheaper than repr() per chunk.
             diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
@@ -3293,6 +3313,14 @@ class _StreamingCall(StreamingWaitMonitor):
                     continue
                 else:
                     self._emit_text(delta_content)
+
+            # Provider commentary (Claude Code bridge): narration written before tool
+            # calls. Part of the assistant message for history, but it reaches the user
+            # only through the interim-message rail, never the answer stream.
+            commentary = getattr(delta, "commentary", None)
+            if isinstance(commentary, str) and commentary:
+                content_parts.append(commentary)
+                self.agent._fire_streamed_codex_commentary(commentary)
 
             delta_tool_calls = getattr(delta, "tool_calls", None)
             if delta_tool_calls:
