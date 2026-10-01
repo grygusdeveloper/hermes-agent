@@ -224,6 +224,26 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
     return pool is not None and pool.has_available() and len(pool.entries()) > 1
 
 
+def _provider_runtime_activity(agent: Any) -> Optional[dict]:
+    """Backend-owned progress (``client.get_runtime_activity()``, e.g. AGY phases) of the in-flight request
+    client, else the primary client; an active snapshot wins. ``None`` when no client exposes one."""
+    request_cache = getattr(agent, "_request_client_cache", None) or {}
+    snapshots = []
+    for client in (request_cache.get("client"), getattr(agent, "client", None)):
+        getter = getattr(client, "get_runtime_activity", None)
+        if not callable(getter):
+            continue
+        try:
+            snapshot = getter()
+        except Exception:
+            continue
+        if isinstance(snapshot, dict):
+            if snapshot.get("active"):
+                return snapshot
+            snapshots.append(snapshot)
+    return snapshots[0] if snapshots else None
+
+
 class _StreamErrorEvent(Exception):
     """Provider error synthesized from a standalone Responses ``type=error`` SSE frame (Codex-style backends).
 
@@ -886,7 +906,7 @@ class AIAgent(
         provenance = getattr(self, "_last_activity_provenance", None)
         last_activity_at = getattr(self, "_last_activity_ts", None)
         last_activity_description = getattr(self, "_last_activity_desc", None) or ""
-        provider_activity = self._provider_runtime_activity()
+        provider_activity = _provider_runtime_activity(self)
         if provider_activity and provider_activity.get("active"):
             # A live provider phase (AGY) is newer than the last Hermes-side event: surface it and let its
             # timestamp keep the activity clock moving, never backwards.
@@ -907,25 +927,6 @@ class AIAgent(
                 "budget_max": self.iteration_budget.max_total, "provider_activity": provider_activity,
             },
         )
-
-    def _provider_runtime_activity(self) -> dict | None:
-        """Backend-owned progress (``client.get_runtime_activity()``) of the in-flight request client, else the
-        primary client; an active snapshot wins. ``None`` when no client exposes one."""
-        request_cache = getattr(self, "_request_client_cache", None) or {}
-        snapshots = []
-        for client in (request_cache.get("client"), getattr(self, "client", None)):
-            getter = getattr(client, "get_runtime_activity", None)
-            if not callable(getter):
-                continue
-            try:
-                snapshot = getter()
-            except Exception:
-                continue
-            if isinstance(snapshot, dict):
-                if snapshot.get("active"):
-                    return snapshot
-                snapshots.append(snapshot)
-        return snapshots[0] if snapshots else None
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine at session end (idempotent: gateway cleanup and
