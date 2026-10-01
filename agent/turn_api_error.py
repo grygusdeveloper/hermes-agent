@@ -22,7 +22,8 @@ from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, interruptible_backoff_sleep,
     log_api_error_attempt,
     max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
-    recover_before_classification, route_classified_error, settle_delivered_partial,
+    recover_before_classification, remember_claude_code_error, route_classified_error,
+    settle_delivered_partial, with_primary_failure,
 )
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -337,6 +338,7 @@ def settle_unrecovered_error(
             if agent._has_pending_fallback():
                 _label = _NONRETRYABLE_LABELS.get(classified.reason, f"Non-retryable error (HTTP {status_code})")
                 agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
+                remember_claude_code_error(agent, api_error)
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
@@ -346,12 +348,12 @@ def settle_unrecovered_error(
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
-        return _verdict("return", nonretryable_client_error_result(
+        return _verdict("return", _with_primary_failure(agent, nonretryable_client_error_result(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
-        ))
+        )))
 
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for
@@ -369,6 +371,7 @@ def settle_unrecovered_error(
             return _verdict("continue")
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+            remember_claude_code_error(agent, api_error)
         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
         if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
             # Direct ``return _verdict("break")`` is load-bearing: the restart handler
@@ -388,13 +391,13 @@ def settle_unrecovered_error(
                 retry_count = 0
             return _verdict(_ladder["action"], _ladder.get("result"))
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
-        return _verdict("return", max_retries_exhausted_result(
+        return _verdict("return", _with_primary_failure(agent, max_retries_exhausted_result(
             agent, api_error, classified, max_retries=max_retries, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
             messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
-        ))
+        )))
 
     wait_time = compute_error_backoff(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,
@@ -417,3 +420,11 @@ def settle_unrecovered_error(
         # instead of re-firing the stale request.
         return _verdict("break")
     return _verdict("fallthrough")
+
+
+def _with_primary_failure(agent: Any, result: Dict[str, Any]) -> Dict[str, Any]:
+    """A fallback that failed too reports why Claude Code failed first, instead of
+    hiding it behind its own error (7025953856)."""
+    if isinstance(result, dict) and isinstance(result.get("final_response"), str):
+        result["final_response"] = with_primary_failure(agent, result["final_response"])
+    return result

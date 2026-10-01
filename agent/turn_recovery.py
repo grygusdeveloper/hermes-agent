@@ -954,7 +954,57 @@ _NONRETRYABLE_LABELS = {
     FailoverReason.ssl_cert_verification: "The provider's security certificate could not be verified",
     # Only reached after the one-shot image shrink ran (recover_after_classification sets the flag first).
     FailoverReason.image_too_large: "Request still exceeded the provider's size limit after shrinking images",
+    FailoverReason.provider_unavailable: "The provider's local runtime cannot be started",
 }
+
+
+# ── Claude Code bridge: limits and the primary failure behind a fallback ──
+
+
+def is_claude_code_agent(agent: Any) -> bool:
+    return (getattr(agent, "provider", "") or "").strip().lower() == "claude-code"
+
+
+def claude_code_limit_notice(agent: Any, classified: Any) -> str:
+    """User-facing text for a Claude subscription limit, or "".
+
+    The bridge has already retried what can be retried, and a limit that holds
+    until its reset never lifts within Hermes's retry window.
+    """
+    context = getattr(classified, "error_context", None) or {}
+    if not context.get("usage_limit") or not is_claude_code_agent(agent):
+        return ""
+    message = str(getattr(classified, "message", "") or "").strip()
+    if context.get("hard"):
+        # "Claude 5-hour session limit reached — resets 15:00 CEST (in ~2h)"
+        return message or "Claude usage limit reached"
+    return f"Claude usage limit: {message}" if message else "Claude usage limit reached"
+
+
+def _primary_failure(agent: Any) -> str:
+    stored = getattr(agent, "_claude_code_primary_failure", None)
+    if isinstance(stored, tuple) and len(stored) == 2 and stored[0] == getattr(agent, "_current_turn_id", None):
+        return stored[1]
+    return ""
+
+
+def remember_primary_failure(agent: Any, text: str) -> None:
+    """Keep why Claude Code failed before this turn switches to a fallback, so a
+    fallback that fails too cannot hide it behind its own error (first one wins)."""
+    if is_claude_code_agent(agent) and text and not _primary_failure(agent):
+        agent._claude_code_primary_failure = (getattr(agent, "_current_turn_id", None), text)
+
+
+def with_primary_failure(agent: Any, text: str) -> str:
+    notice = _primary_failure(agent)
+    if not notice or is_claude_code_agent(agent):
+        return text
+    return f"{notice}\n\nFallback {agent.provider}/{agent.model} failed too: {text}"
+
+
+def remember_claude_code_error(agent: Any, api_error: Exception) -> None:
+    if is_claude_code_agent(agent):
+        remember_primary_failure(agent, f"Claude Code failed: {agent._summarize_api_error(api_error)}")
 
 
 def _missing_vendor_prefix_suggestion(api_error: Exception, provider: Any, model: Any) -> Optional[str]:
@@ -1854,6 +1904,15 @@ def route_classified_error(
                 return _verdict("break")
         # Compression exhausted or didn't help: fall through to normal error handling.
 
+    # Claude subscription limit, with its reset time. The eager fallback below
+    # switches to a fallback provider when one is configured (announcing the limit
+    # first, not buffered); otherwise the turn ends with the limit as its reply,
+    # once, instead of retrying a limit that holds until its reset (958294bc31).
+    _claude_limit = claude_code_limit_notice(agent, classified)
+    _announce_claude_limit = bool(_claude_limit and not _primary_failure(agent))
+    if _announce_claude_limit:
+        remember_primary_failure(agent, _claude_limit)
+
     # Eager fallback: rate-limit/billing switch immediately (primary won't recover in
     # the retry window); transport errors get 1 retry first.
     is_rate_limited = classified.reason in _RATE_LIMIT_REASONS
@@ -1889,9 +1948,25 @@ def route_classified_error(
         )
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
+            remember_claude_code_error(agent, api_error)
+            if _announce_claude_limit:
+                # Before the fallback's own notice. Without a fallback the limit is
+                # the reply itself.
+                agent._emit_status(f"⏳ {_claude_limit}")
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
+
+    if _claude_limit:
+        # No fallback took over: retries cannot help before the reset (the bridge
+        # already retried the soft cases), and later calls fail fast in the bridge.
+        agent._flush_status_buffer()
+        logger.warning("%sClaude Code limit, not retrying: %s", agent.log_prefix, _claude_limit)
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure({
+            "final_response": _claude_limit, "messages": messages, "api_calls": api_call_count,
+            "completed": False, "failed": True, "error": _claude_limit,
+        }, classified.reason.value, False))
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
     # escalate to the fallback chain once; False -> terminal handling.
@@ -1901,6 +1976,8 @@ def route_classified_error(
         and agent._fallback_index < len(agent._fallback_chain)
     ):
         _retry.auth_failover_attempted = True
+        # An expired Claude Code login must stay visible if the fallback fails too.
+        remember_claude_code_error(agent, api_error)
         agent._buffer_diagnostic_status(
             "🔐 Authentication failed and could not be refreshed — "
             "switching to fallback provider..."
