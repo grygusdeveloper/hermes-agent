@@ -56,7 +56,7 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
     extract_persisted_path,
 )
-from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window, budget_for_transport
 from hermes_cli.observability.shared_metrics_efficiency import note_tool_result, record_tool_batch
 
 # A tool result this large (raw stdout, file dumps) is the biggest allocation a turn ever drops.
@@ -111,18 +111,25 @@ def _ensure_file_checkpoint(agent, function_name: str, function_args: dict, effe
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
-    """Tool-result BudgetConfig scaled to the agent's context window. Unknown length goes
-    through ``budget_for_context_window(None)`` (not DEFAULT_BUDGET) so the MCP threshold
-    override still applies.
+    """Tool-result BudgetConfig scaled to the agent's context window, then clamped to its transport.
+    Unknown length goes through ``budget_for_context_window(None)`` (not DEFAULT_BUDGET) so the MCP
+    threshold override still applies.
 
     Large-context models keep the historical 100K/200K char defaults; small models (e.g. a 65K-token local
     model switched into mid-session) get a budget proportional to their window so a single large tool result
-    can't push the request past the model's limit (#23767). Falls back to the default budget when the
+    can't push the request past the model's limit (#23767). A transport with a stricter ingress limit than
+    its window (Antigravity's single-argv prompt) clamps further. Falls back to the default budget when the
     context length isn't resolvable.
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx) if ctx else None)
+        config = budget_for_context_window(int(ctx) if ctx else None)
+        client = getattr(agent, "client", None)
+        return budget_for_transport(
+            config,
+            provider=getattr(agent, "provider", None) or getattr(client, "provider", None),
+            base_url=getattr(agent, "base_url", None) or getattr(client, "base_url", None),
+        )
     except Exception:
         return DEFAULT_BUDGET
 

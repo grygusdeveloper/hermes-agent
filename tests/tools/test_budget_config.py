@@ -5,8 +5,11 @@ Covers default values, resolve_threshold() priority chain
 and the PINNED_THRESHOLDS escape-hatch for read_file.
 """
 
+import dataclasses
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 
 from tools.budget_config import (
     DEFAULT_BUDGET,
@@ -14,6 +17,7 @@ from tools.budget_config import (
     PINNED_THRESHOLDS,
     BudgetConfig,
     budget_for_context_window,
+    budget_for_transport,
 )
 
 
@@ -175,3 +179,62 @@ class TestMcpPrefixThreshold:
         cfg = budget_for_context_window(16_384)  # scaled default < 50K
         assert cfg.default_result_size < 50_000
         assert cfg.resolve_threshold("mcp_tool") == cfg.default_result_size
+
+
+# ---------------------------------------------------------------------------
+# Transport clamp (Antigravity: one argv value per request)
+# ---------------------------------------------------------------------------
+
+
+class TestTransportBudget:
+    def test_antigravity_turn_budget_fits_one_inline_prompt_in_utf8(self):
+        from agent.antigravity_session import INLINE_PROMPT_LIMIT_BYTES
+        from tools.budget_config import ANTIGRAVITY_TURN_BUDGET_CHARS
+
+        assert ANTIGRAVITY_TURN_BUDGET_CHARS * 4 < INLINE_PROMPT_LIMIT_BYTES
+
+    @pytest.mark.parametrize(
+        "provider, base_url",
+        [("antigravity", "acp://antigravity"), ("antigravity", None), (None, "acp://antigravity/")],
+    )
+    def test_antigravity_clamps_large_context_budget(self, provider, base_url):
+        from tools.budget_config import (
+            ANTIGRAVITY_PREVIEW_SIZE_CHARS, ANTIGRAVITY_RESULT_SIZE_CHARS, ANTIGRAVITY_TURN_BUDGET_CHARS,
+        )
+
+        cfg = budget_for_transport(
+            dataclasses.replace(budget_for_context_window(1_048_576), tool_overrides={"terminal": 80_000}),
+            provider=provider, base_url=base_url,
+        )
+        assert cfg.turn_budget == ANTIGRAVITY_TURN_BUDGET_CHARS
+        assert cfg.preview_size == ANTIGRAVITY_PREVIEW_SIZE_CHARS
+        assert cfg.resolve_threshold("terminal") == ANTIGRAVITY_RESULT_SIZE_CHARS
+        assert cfg.resolve_threshold("mcp_server_tool") == ANTIGRAVITY_RESULT_SIZE_CHARS
+        assert cfg.resolve_threshold("web_search") <= ANTIGRAVITY_RESULT_SIZE_CHARS
+        assert cfg.resolve_threshold("read_file") == float("inf")
+
+    @pytest.mark.parametrize(
+        "provider, base_url",
+        [("openai-codex", "https://chatgpt.com/backend-api/codex"), ("copilot-acp", "acp://antigravity"),
+         ("claude-code", "acp://claude-code"), (None, None)],
+    )
+    def test_other_transports_are_unchanged(self, provider, base_url):
+        original = budget_for_context_window(1_048_576)
+        assert budget_for_transport(original, provider=provider, base_url=base_url) is original
+
+    def test_agent_budget_uses_the_live_transport(self):
+        from agent.tool_executor import _budget_for_agent
+        from tools.budget_config import ANTIGRAVITY_TURN_BUDGET_CHARS
+
+        agent = SimpleNamespace(
+            provider="antigravity",
+            base_url="acp://antigravity",
+            context_compressor=SimpleNamespace(context_length=1_048_576),
+        )
+        assert _budget_for_agent(agent).turn_budget == ANTIGRAVITY_TURN_BUDGET_CHARS
+        # The client's transport counts when the agent itself carries none.
+        agent = SimpleNamespace(
+            context_compressor=SimpleNamespace(context_length=1_048_576),
+            client=SimpleNamespace(base_url="acp://antigravity"),
+        )
+        assert _budget_for_agent(agent).turn_budget == ANTIGRAVITY_TURN_BUDGET_CHARS

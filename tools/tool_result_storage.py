@@ -14,6 +14,7 @@ import shlex
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 
 from tools.budget_config import DEFAULT_PREVIEW_SIZE_CHARS, BudgetConfig, DEFAULT_BUDGET
 
@@ -281,6 +282,46 @@ def _build_persisted_message(preview: str, has_more: bool, original_size: int,
 
 _PERSISTED_PATH_RE = re.compile(r"^Full output saved to: (.+)$", re.MULTILINE)
 
+# Blocks this process issued, keyed by path: ``path -> (full block, compact block)``. Aggregate
+# compaction rewrites only an exact issued block, never text that merely looks like one — a tool can
+# print a lookalike (or read back an old transcript), and dropping its "preview" would discard output
+# that was never saved. Bounded: compaction is best-effort and only matters within the current turn.
+_ISSUED_BLOCKS: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
+_ISSUED_BLOCKS_MAX = 512
+_issued_blocks_lock = threading.Lock()
+
+
+def _build_compact_persisted_message(original_size: int, file_path: str) -> str:
+    """The preview-free form of a persisted block: same tag, size line and path (still parseable by
+    ``extract_persisted_path``)."""
+    size_kb = original_size / 1024
+    size_str = f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
+    return (
+        f"{PERSISTED_OUTPUT_TAG}\n"
+        f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
+        f"Full output saved to: {file_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n"
+        f"{PERSISTED_OUTPUT_CLOSING_TAG}")
+
+
+def _record_issued_block(file_path: str, block: str, original_size: int) -> None:
+    with _issued_blocks_lock:
+        _ISSUED_BLOCKS[file_path] = (block, _build_compact_persisted_message(original_size, file_path))
+        _ISSUED_BLOCKS.move_to_end(file_path)
+        while len(_ISSUED_BLOCKS) > _ISSUED_BLOCKS_MAX:
+            _ISSUED_BLOCKS.popitem(last=False)
+
+
+def _compact_issued_blocks(content: str) -> str:
+    """Swap every block this process issued inside *content* for its preview-free form; everything
+    else (wrappers, appended hints, unrecognised lookalikes) is kept verbatim."""
+    for match in _PERSISTED_PATH_RE.finditer(content):
+        with _issued_blocks_lock:
+            issued = _ISSUED_BLOCKS.get(match.group(1).strip())
+        if issued is not None and issued[0] in content:
+            content = content.replace(issued[0], issued[1], 1)
+    return content
+
 
 def extract_persisted_path(content: str) -> str | None:
     """File path from a <persisted-output> block, or None (lets the result-reference stubbing
@@ -309,7 +350,9 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
     def _persisted(path: str, host_suffix: str = "") -> str:
         logger.info("Persisted large tool result: %s (%s, %d chars -> %s%s)",
                     tool_name, tool_use_id, len(persisted_content), path, host_suffix)
-        return _build_persisted_message(preview, has_more, len(persisted_content), path)
+        block = _build_persisted_message(preview, has_more, len(persisted_content), path)
+        _record_issued_block(path, block, len(persisted_content))
+        return block
 
     # Always persist host-side first: cache/spillover is the single canonical home.
     host_path = _write_to_spillover(persisted_content, filename)
@@ -337,7 +380,8 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
 def enforce_turn_budget(tool_messages: list[dict], env=None,
                         config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
     """Layer 3: persist the largest non-persisted results first until the turn's aggregate is
-    under budget. Mutates the list in-place and returns it."""
+    under budget, then drop the previews of already-persisted results (largest first; paths kept)
+    if the aggregate is still over. Mutates the list in-place and returns it."""
     sizes = [len(msg.get("content", "")) for msg in tool_messages]
     total_size = sum(sizes)
     candidates = [(i, size) for i, size in enumerate(sizes)
@@ -354,7 +398,26 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
             env=env, config=config, threshold=0)
         if replacement != content:
             total_size += len(replacement) - size
+            sizes[idx] = len(replacement)
             tool_messages[idx]["content"] = replacement
             logger.info("Budget enforcement: persisted tool result %s (%d chars)",
                         tool_use_id, size)
+    # Results persisted individually before this pass still carry previews that can add up past a
+    # strict transport budget (Antigravity: 24K chars), so compact the largest while keeping paths.
+    if total_size > config.turn_budget:
+        persisted = [(i, size) for i, size in enumerate(sizes)
+                     if isinstance(tool_messages[i].get("content"), str)
+                     and PERSISTED_OUTPUT_TAG in tool_messages[i]["content"]]
+        for idx, size in sorted(persisted, key=lambda x: x[1], reverse=True):
+            if total_size <= config.turn_budget:
+                break
+            replacement = _compact_issued_blocks(tool_messages[idx]["content"])
+            if len(replacement) < size:
+                total_size += len(replacement) - size
+                tool_messages[idx]["content"] = replacement
+                logger.info("Budget enforcement: compacted persisted preview %s (%d -> %d chars)",
+                            tool_messages[idx].get("tool_call_id", idx), size, len(replacement))
+    if total_size > config.turn_budget:
+        logger.warning("Tool-result aggregate remains over budget after persistence: %d > %d chars",
+                       total_size, config.turn_budget)
     return tool_messages

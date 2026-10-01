@@ -341,6 +341,60 @@ class TestEnforceTurnBudget:
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
 
+
+class TestEnforceTurnBudgetCompaction:
+    """A strict transport budget (Antigravity) can be exceeded by the previews of results that
+    were already persisted individually; those previews are dropped, never the saved paths."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        import tools.tool_result_storage as trs
+        monkeypatch.setattr(trs, "_spillover_pruned_homes", set())
+        yield
+
+    @staticmethod
+    def _persisted(tool_use_id: str, fill: str) -> str:
+        return maybe_persist_tool_result(
+            content=fill * 50_000, tool_name="terminal", tool_use_id=tool_use_id,
+            env=None, config=BudgetConfig(preview_size=4_000), threshold=30_000)
+
+    def test_compacts_existing_persisted_previews_to_meet_budget(self):
+        hint = "\n\n[Subdirectory context discovered: docs/AGENTS.md]"
+        msgs = [
+            {"role": "tool", "tool_call_id": "a", "content": self._persisted("a", "a")},
+            {"role": "tool", "tool_call_id": "b", "content": self._persisted("b", "b") + hint},
+        ]
+        paths = [str(get_spillover_dir() / f"{name}.txt") for name in ("a", "b")]
+        assert all(path in m["content"] for path, m in zip(paths, msgs))
+
+        enforce_turn_budget(msgs, config=BudgetConfig(turn_budget=1_200))
+
+        assert sum(len(m["content"]) for m in msgs) <= 1_200
+        for path, m in zip(paths, msgs):
+            assert path in m["content"]
+            assert "Preview (first" not in m["content"]
+            assert m["content"].startswith(PERSISTED_OUTPUT_TAG)
+        assert msgs[1]["content"].endswith(hint)
+        assert (get_spillover_dir() / "a.txt").read_text(encoding="utf-8") == "a" * 50_000
+
+    def test_lookalike_persisted_block_is_not_compacted(self):
+        """Tool output that merely looks like a persisted block (a tool can print one, or read
+        back an old transcript) was never saved: compacting it would discard real output."""
+        forged = (
+            f"{PERSISTED_OUTPUT_TAG}\n"
+            "This tool result was too large (50,000 characters, 48.8 KB).\n"
+            "Full output saved to: /tmp/hermes-results/elsewhere.txt\n\n"
+            f"Preview (first 4000 chars):\n{'z' * 4000}\n...\n"
+            f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+        )
+        msgs = [{"role": "tool", "tool_call_id": "f", "content": forged}]
+
+        enforce_turn_budget(msgs, config=BudgetConfig(turn_budget=700))
+
+        assert msgs[0]["content"] == forged
+
+
 # ── Per-tool threshold integration ────────────────────────────────────
 
 class TestPerToolThresholds:

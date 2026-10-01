@@ -1,7 +1,7 @@
 """Configurable budget constants for tool result persistence.
 Per-tool resolution: pinned > config overrides > registry > default."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict
 
 from agent.model_metadata import CHARS_PER_TOKEN
@@ -20,6 +20,16 @@ DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
 DEFAULT_MCP_RESULT_SIZE_CHARS: int = 50_000
 # Same prefix the untrusted-content wrapper keys on (agent/tool_dispatch_helpers.py).
 MCP_TOOL_PREFIX: str = "mcp_"
+
+# AGY takes each request as ONE argv value (Linux MAX_ARG_STRLEN, normally 128 KiB); prompts past
+# agent/antigravity_session.py's 120,000-byte inline limit are split into extra chunked round-trips.
+# Cap tool-result text by CHARACTER count so a whole turn of results stays under that ceiling even
+# when every character is a four-byte code point. Full results stay on disk for read_file.
+ANTIGRAVITY_RESULT_SIZE_CHARS: int = 24_000
+ANTIGRAVITY_TURN_BUDGET_CHARS: int = 24_000
+ANTIGRAVITY_PREVIEW_SIZE_CHARS: int = 512
+_ANTIGRAVITY_PROVIDER = "antigravity"
+_ANTIGRAVITY_BASE_URL = "acp://antigravity"
 
 
 def _configured_mcp_result_size() -> int:
@@ -111,4 +121,25 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
         turn_budget=max(_MIN_TURN_BUDGET_CHARS, min(int(window_chars * _PER_TURN_WINDOW_FRACTION), DEFAULT_TURN_BUDGET_CHARS)),
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
         mcp_result_size=mcp_result_size,
+    )
+
+
+def budget_for_transport(config: BudgetConfig, *, provider: str | None, base_url: str | None) -> BudgetConfig:
+    """Clamp a context-derived budget to a stricter provider transport; others pass through unchanged.
+
+    Context capacity and ingress capacity are independent: Antigravity exposes a million-token window
+    but carries each request in one exec argument (see the ANTIGRAVITY_* constants)."""
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_base = str(base_url or "").strip().rstrip("/").lower()
+    if normalized_provider != _ANTIGRAVITY_PROVIDER and not (
+        not normalized_provider and normalized_base == _ANTIGRAVITY_BASE_URL
+    ):
+        return config
+    return replace(
+        config,
+        default_result_size=min(config.default_result_size, ANTIGRAVITY_RESULT_SIZE_CHARS),
+        turn_budget=min(config.turn_budget, ANTIGRAVITY_TURN_BUDGET_CHARS),
+        preview_size=min(config.preview_size, ANTIGRAVITY_PREVIEW_SIZE_CHARS),
+        mcp_result_size=min(config.mcp_result_size, ANTIGRAVITY_RESULT_SIZE_CHARS),
+        tool_overrides={name: min(int(value), ANTIGRAVITY_RESULT_SIZE_CHARS) for name, value in config.tool_overrides.items()},
     )
