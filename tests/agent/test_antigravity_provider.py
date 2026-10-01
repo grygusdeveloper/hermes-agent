@@ -148,3 +148,133 @@ def test_agy_marker_and_completed_tool_call_refuse_wrong_execution(monkeypatch):
     monkeypatch.setattr(client._conversation, "run", lambda *args, **kwargs: (response, ""))
     with pytest.raises(RuntimeError, match="completed tool call"):
         client.chat.completions.create(model="gemini-test", messages=[previous], tools=[{"type": "function"}])
+
+
+def _bare_agent(client, *, last_activity_ts, request_client=None):
+    import threading
+    from types import SimpleNamespace
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.__dict__.update({
+        "client": client,
+        "_client_lock": threading.RLock(),
+        "_request_client_cache": {"client": request_client, "key": None, "poisoned": False,
+                                  "in_use": request_client is not None},
+        "_last_activity_ts": last_activity_ts,
+        "_last_activity_desc": "api_call",
+        "_last_activity_provenance": None,
+        "_current_tool": None,
+        "_api_call_count": 2,
+        "max_iterations": 90,
+        "iteration_budget": SimpleNamespace(used=2, max_total=90),
+    })
+    return agent
+
+
+def test_activity_summary_prefers_active_provider_phase():
+    import time
+    from types import SimpleNamespace
+
+    updated_at = time.time()
+    runtime = {"active": True, "description": "Antigravity accepted the prompt — Gemini is reasoning",
+               "updated_at": updated_at}
+    agent = _bare_agent(SimpleNamespace(get_runtime_activity=lambda: runtime), last_activity_ts=updated_at - 10)
+
+    snapshot = agent.get_activity_summary()
+
+    assert snapshot["last_activity_at"] == updated_at
+    assert snapshot["last_activity_desc"] == runtime["description"]
+    assert snapshot["provider_activity"] == runtime
+
+
+def test_activity_summary_never_moves_activity_clock_backwards():
+    import time
+    from types import SimpleNamespace
+
+    updated_at = time.time()
+    agent = _bare_agent(
+        SimpleNamespace(get_runtime_activity=lambda: {"active": True, "description": "Gemini is reasoning",
+                                                       "updated_at": updated_at}),
+        last_activity_ts=updated_at + 10,
+    )
+
+    snapshot = agent.get_activity_summary()
+
+    assert snapshot["last_activity_at"] == updated_at + 10
+    assert snapshot["last_activity_desc"] == "Gemini is reasoning"
+
+
+def test_activity_summary_ignores_finished_provider_phase():
+    from types import SimpleNamespace
+
+    finished = {"active": False, "description": "Antigravity provider turn ended", "updated_at": 5.0}
+    agent = _bare_agent(SimpleNamespace(get_runtime_activity=lambda: finished), last_activity_ts=100.0)
+
+    snapshot = agent.get_activity_summary()
+
+    assert snapshot["last_activity_desc"] == "api_call"
+    assert snapshot["last_activity_at"] == 100.0
+    assert snapshot["provider_activity"] == finished
+
+
+def test_interrupt_stops_inflight_agy_and_heartbeat_sees_live_phase(tmp_path, monkeypatch):
+    """The request-slot interrupt must kill the running AGY process (not look for sockets), and while it
+    runs the agent activity summary must expose the live AGY phase of the in-flight request client."""
+    import os
+    import threading
+    import time
+    from types import SimpleNamespace
+    from agent.antigravity_client import AntigravityClient
+
+    script = tmp_path / "agy"
+    script.write_text('''#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+print(json.dumps({"event": "init"}), flush=True)
+Path(os.environ["AGY_TEST_PID"]).write_text(str(os.getpid()))
+time.sleep(60)
+print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "late",
+    "conversation_id": "12345678-1234-1234-1234-123456789abc"}}), flush=True)
+''', encoding="utf-8")
+    script.chmod(0o755)
+    pid_file = tmp_path / "agy.pid"
+    monkeypatch.setenv("AGY_PATH", str(script))
+    monkeypatch.setenv("AGY_TEST_PID", str(pid_file))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    client = AntigravityClient(base_url="acp://antigravity", acp_cwd=str(tmp_path))
+    idle_primary = SimpleNamespace(get_runtime_activity=lambda: {"active": False, "description": "",
+                                                                 "updated_at": 0.0})
+    agent = _bare_agent(idle_primary, last_activity_ts=time.time() - 30, request_client=client)
+    outcome = {}
+
+    def _call():
+        try:
+            outcome["result"] = client.chat.completions.create(
+                model="gemini-test", messages=[{"role": "user", "content": "work"}])
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_call, daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert pid_file.exists(), "fake AGY never started"
+    pid = int(pid_file.read_text())
+
+    snapshot = agent.get_activity_summary()
+    assert snapshot["provider_activity"]["active"] is True
+    assert snapshot["last_activity_desc"] == "Antigravity connected — waiting for Gemini"
+
+    started = time.monotonic()
+    agent._abort_request_openai_client(client, reason="interrupt")
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "interrupt did not stop the AGY request"
+    assert time.monotonic() - started < 10
+    assert "result" not in outcome
+    with pytest.raises(ProcessLookupError):
+        for _ in range(100):
+            os.kill(pid, 0)
+            time.sleep(0.05)
+    client.close()

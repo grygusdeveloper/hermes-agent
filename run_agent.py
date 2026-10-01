@@ -884,16 +884,48 @@ class AIAgent(
         from agent.session_activity import build_activity_snapshot
 
         provenance = getattr(self, "_last_activity_provenance", None)
+        last_activity_at = getattr(self, "_last_activity_ts", None)
+        last_activity_description = getattr(self, "_last_activity_desc", None) or ""
+        provider_activity = self._provider_runtime_activity()
+        if provider_activity and provider_activity.get("active"):
+            # A live provider phase (AGY) is newer than the last Hermes-side event: surface it and let its
+            # timestamp keep the activity clock moving, never backwards.
+            provider_description = str(provider_activity.get("description") or "").strip()
+            if provider_description:
+                last_activity_description = provider_description
+            provider_updated_at = provider_activity.get("updated_at")
+            if isinstance(provider_updated_at, (int, float)) and provider_updated_at > 0:
+                last_activity_at = (float(provider_updated_at) if last_activity_at is None
+                                    else max(float(last_activity_at), float(provider_updated_at)))
         return build_activity_snapshot(
-            last_activity_at=getattr(self, "_last_activity_ts", None),
-            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
+            last_activity_at=last_activity_at,
+            last_activity_description=last_activity_description,
             last_activity_provenance=provenance if provenance is not None else ActivityProvenance.UNKNOWN,
             extra={
                 "current_tool": self._current_tool, "api_call_count": self._api_call_count,
                 "max_iterations": self.max_iterations, "budget_used": self.iteration_budget.used,
-                "budget_max": self.iteration_budget.max_total,
+                "budget_max": self.iteration_budget.max_total, "provider_activity": provider_activity,
             },
         )
+
+    def _provider_runtime_activity(self) -> dict | None:
+        """Backend-owned progress (``client.get_runtime_activity()``) of the in-flight request client, else the
+        primary client; an active snapshot wins. ``None`` when no client exposes one."""
+        request_cache = getattr(self, "_request_client_cache", None) or {}
+        snapshots = []
+        for client in (request_cache.get("client"), getattr(self, "client", None)):
+            getter = getattr(client, "get_runtime_activity", None)
+            if not callable(getter):
+                continue
+            try:
+                snapshot = getter()
+            except Exception:
+                continue
+            if isinstance(snapshot, dict):
+                if snapshot.get("active"):
+                    return snapshot
+                snapshots.append(snapshot)
+        return snapshots[0] if snapshots else None
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine at session end (idempotent: gateway cleanup and

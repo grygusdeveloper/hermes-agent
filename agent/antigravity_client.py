@@ -43,6 +43,14 @@ class AntigravityClient(CopilotACPClient):
         self._conversation.abort()
         super().close()
 
+    def cancel(self) -> None:
+        """Cross-thread interrupt: stop the in-flight AGY process group without closing the client.
+
+        The request-slot abort path calls ``cancel()`` on non-HTTP clients; without it the abort falls
+        through to a socket shutdown that finds no sockets and AGY keeps running.
+        """
+        self._conversation.abort()
+
     def get_runtime_activity(self) -> dict[str, Any]:
         return self._conversation.get_progress_snapshot()
 
