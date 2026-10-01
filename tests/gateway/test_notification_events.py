@@ -177,8 +177,8 @@ async def test_prompt_send_wrapper_emits_after_ack_and_returns_result_unchanged(
 
     hooks = SimpleNamespace(emit=AsyncMock())
     runner = TurnRunner.__new__(TurnRunner)
-    runner._runner = SimpleNamespace(hooks=hooks)
     runner._ctx = TurnContext(source=_source(), session_key="k", session_id="s")
+    runner._ctx._hooks_ref = hooks
 
     async def _send(result):
         return result

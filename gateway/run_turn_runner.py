@@ -1596,9 +1596,9 @@ class TurnRunner:
             from gateway.notification_events import schedule_delivery_event
             ctx = self._ctx
             schedule_delivery_event(
-                hooks=getattr(self._runner, "hooks", None), event_type=event_type, source=ctx.source,
+                hooks=getattr(ctx, "_hooks_ref", None), event_type=event_type, source=getattr(ctx, "source", None),
                 message_id=result.message_id, kind=kind, preview=preview,
-                session_key=ctx.session_key, session_id=ctx.session_id)
+                session_key=getattr(ctx, "session_key", None), session_id=getattr(ctx, "session_id", None))
         return result
 
     # ── run_sync phases ─────────────────────────────────────────────────────────────────────
