@@ -2243,6 +2243,20 @@ DEFAULT_CONFIG = {
             # response_store.db write several hundred KB. 0 = store tool outputs verbatim
             # (default: the capped text is what the model is replayed on the next turn).
             "history_tool_output_max_chars": 0,
+            # Scoped server-side Hermes Vault API for Obsidian Bridge (/v1/vault/*): only the
+            # configured roots under base_dir, never an arbitrary filesystem; updates of existing
+            # notes are base-hash checked. Off by default (read/write filesystem surface); enable
+            # on trusted deployments. HERMES_REMOTE_VAULT_{ENABLED,BASE_DIR,ROOTS,WRITABLE,
+            # ALLOW_HIDDEN,MAX_FILE_BYTES} override these keys.
+            "remote_vault": {
+                "enabled": False,
+                "base_dir": "/root/workspace/hermes-vault",
+                "roots": ["Inbox", "Ideas", "Operations", "Projects", "Research", "System",
+                          "research", "inner-brain", "staging", "drafts"],
+                "max_file_bytes": 262144,
+                "allow_hidden": False,
+                "writable": True,
+            },
         },
     },
     # Real-time token streaming to messaging platforms (gateway; restart after enabling). Off by

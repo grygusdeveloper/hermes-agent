@@ -647,6 +647,35 @@ curl http://localhost:8642/v1/toolsets \
 
 `/v1/skills` returns the same metadata the skills hub uses internally. `/v1/toolsets` returns toolsets resolved for the `api_server` platform with the concrete `tools` list each one expands to. Both are advertised under `endpoints.*` in `/v1/capabilities`.
 
+## Remote vault API (`/v1/vault/*`)
+
+A scoped, server-side notes vault for clients such as the Obsidian Bridge remote-vault provider. It exposes only the configured `roots` under `base_dir` — never an arbitrary filesystem — and is **off by default**. All endpoints are gated by `API_SERVER_KEY`.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/vault/roots` | Configured roots that exist on disk |
+| `GET /v1/vault/tree?root=…` | Folders and text notes (`.md`, `.markdown`, `.txt`, `.json`, `.yaml`, `.yml`) with `sha256` |
+| `GET /v1/vault/note?path=…` | One UTF-8 note with its `sha256` |
+| `POST /v1/vault/update` | `{path, content, baseHash}` atomic write; an existing note needs a matching `baseHash` (`428` without one, `409` on mismatch) |
+| `GET /v1/vault/search?q=…&root=…&limit=…` | Literal (not regex) path/content search, redacted snippets, at most 100 results |
+| `GET /v1/vault/attachments?root=…&limit=…` | Metadata only for non-text files, at most 500 results |
+
+Relative paths only: `..`, absolute paths, backslashes, `.git` and hidden segments are refused, and symlinks may not leave their root.
+
+```yaml
+gateway:
+  api_server:
+    remote_vault:
+      enabled: true
+      base_dir: /root/workspace/hermes-vault
+      roots: [Inbox, Projects, Research]
+      max_file_bytes: 262144   # per-note read/write cap
+      allow_hidden: false
+      writable: true           # false makes /v1/vault/update return 403
+```
+
+`HERMES_REMOTE_VAULT_ENABLED`, `HERMES_REMOTE_VAULT_BASE_DIR`, `HERMES_REMOTE_VAULT_ROOTS` (comma-separated), `HERMES_REMOTE_VAULT_WRITABLE`, `HERMES_REMOTE_VAULT_ALLOW_HIDDEN` and `HERMES_REMOTE_VAULT_MAX_FILE_BYTES` override these keys. `/v1/capabilities` reports `features.remote_vault*`, `limits.remote_vault_*` and the `endpoints.remote_vault_*` paths.
+
 ## Long-term memory scoping (`X-Hermes-Session-Key`)
 
 Multi-user frontends like Open WebUI need a stable per-channel identifier for long-term memory (Honcho, etc.) that is **independent** of the transcript-scoped `X-Hermes-Session-Id` (which rotates on `/new`). Pass `X-Hermes-Session-Key` on `/v1/chat/completions`, `/v1/responses`, or `/v1/runs` and Hermes threads it through to `AIAgent(gateway_session_key=...)`, where the Honcho memory provider uses it to derive a stable scope.

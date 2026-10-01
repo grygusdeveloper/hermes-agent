@@ -1,7 +1,7 @@
 """OpenAI-compatible API server platform adapter (aiohttp).
 
 Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/sessions,
-/v1/runs, /api/jobs and /health* (full table: ``APIServerAdapter._http_route_table``); any
+/v1/runs, /api/jobs, /v1/vault/* and /health* (full table: ``APIServerAdapter._http_route_table``); any
 OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_KEY. Under
 ``gateway.multiplex_profiles`` secondary profiles live at ``/p/<profile>/...``.
 """
@@ -137,8 +137,10 @@ from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_remote_vault as _remote_vault
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
+from gateway.platforms.api_server_remote_vault import RemoteVaultRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
@@ -1196,7 +1198,7 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+class APIServerAdapter(OpenAICompatRoutesMixin, RemoteVaultRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -1787,6 +1789,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        # Scoped server-side Hermes Vault for Obsidian Bridge (off unless remote_vault.enabled).
+        routes.extend(_remote_vault._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -2536,6 +2540,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_require_auth
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
+        remote_vault_settings = await asyncio.to_thread(_remote_vault.remote_vault_settings)
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2552,6 +2557,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
                 **_STATIC_FEATURE_FLAGS,
                 "cors": bool(self._cors_origins),
+                **_remote_vault.capability_features(remote_vault_settings),
                 # Always advertised for feature-detection; enabled follows config.
                 "browser_extension_control": {
                     "enabled": self._browser_control_enabled(),
@@ -2571,7 +2577,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "transports": {
                         "local_vps": "websocket-subprotocol-ticket",
                         "cloud": "authenticated-gateway-rpc"}}},
-            "endpoints": {name: {"method": m, "path": p} for name, (m, p) in _CAPABILITY_ENDPOINTS},
+            "limits": _remote_vault.capability_limits(remote_vault_settings),
+            "endpoints": {name: {"method": m, "path": p}
+                          for name, (m, p) in (*_CAPABILITY_ENDPOINTS, *_remote_vault.CAPABILITY_ENDPOINTS)},
         })
 
     # -- Browser-extension control (authenticated local/VPS API) ----------------------
