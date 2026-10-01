@@ -704,7 +704,7 @@ class WebhookAdapter(BasePlatformAdapter):
     # --- Signature validation ---
 
     def _validate_signature(self, request: "web.Request", body: bytes, secret: str) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, Standard Webhooks, Linear, generic HMAC-SHA256)."""
+        """Validate webhook signature (GitHub, GitLab, Svix, Standard Webhooks, Linear, Todoist, generic HMAC-SHA256)."""
         headers = request.headers
 
         def _header(name: str) -> str:
@@ -720,6 +720,13 @@ class WebhookAdapter(BasePlatformAdapter):
             svix = [_header(name) for name in ("webhook-id", "webhook-timestamp", "webhook-signature")]
         if any(svix):
             return _validate_svix_signature(body, secret, *svix)
+        # Todoist: X-Todoist-Hmac-SHA256 = base64 HMAC-SHA256 of the exact raw body, keyed by the app's
+        # client_secret. Presence COMMITS to this scheme: an invalid (or empty) Todoist header must not fall
+        # through to a valid generic header and silently downgrade authentication.
+        todoist_header = "X-Todoist-Hmac-SHA256"
+        if todoist_header in headers or todoist_header.lower() in headers:
+            expected = base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
+            return _hmac_str_equal(_header(todoist_header), expected)
         # Linear (any header case): hex HMAC of the body. GitHub: sha256=<hex>. GitLab: plain token.
         for provided, expected in (
                 (_header("linear-signature"), lambda: _hex_hmac(secret, body)),
