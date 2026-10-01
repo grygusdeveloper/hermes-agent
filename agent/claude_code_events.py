@@ -35,6 +35,8 @@ class NativeTurn:
         self.partial_text = self.partial_reasoning = ""
         self.blocks = {}
         self.publish_state = None
+        # The model the turn's assistant messages name (a CLI fallback model included).
+        self.served_by = None
 
     def dispatch(self, event):
         handler = self._HANDLERS.get(event["type"])
@@ -152,6 +154,7 @@ class NativeTurn:
         self.calls += new_calls
         self.checkpoint_uuid = valid_uuid(event.get("uuid"))
         self.stop_reason = event.get("message", {}).get("stop_reason")
+        self.served_by = event.get("message", {}).get("model") or self.served_by
 
     def on_result(self, event):
         if not self.initialized or event.get("is_error") or event.get("subtype") != "success":
@@ -167,7 +170,8 @@ class NativeTurn:
         sid = valid_uuid(event.get("session_id"))
         if self.session_id and sid != self.session_id:
             raise RuntimeError("Claude CLI changed session identity during a request")
-        result = completion(self.model, self.text, self.reasoning, [], event.get("usage"), self.stop_reason)
+        result = completion(self.model, self.text, self.reasoning, [], event.get("usage"), self.stop_reason,
+                            event.get("modelUsage"), self.served_by)
         self.publish_state = (sid, valid_uuid(self.checkpoint_uuid))
         return result
 

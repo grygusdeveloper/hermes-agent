@@ -593,6 +593,11 @@ DEFAULT_CONFIG = {
         # lower of the ratio threshold and this count. Clamped to the model's context length.
         # Off by default: no single count suits windows from 64K to 1M+, so the ratio decides.
         "threshold_tokens": None,
+        # provider_threshold_tokens: absolute caps that apply only while that provider is active
+        # (the lower of this and threshold_tokens wins). Claude Code re-reads its whole cached
+        # conversation on every call and slows down markedly past ~350k tokens, while its 1M-window
+        # models would only compress at 500k. Set a provider to 0 to disable its cap.
+        "provider_threshold_tokens": {"claude-code": 250_000},
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked

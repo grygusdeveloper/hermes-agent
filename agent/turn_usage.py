@@ -70,6 +70,47 @@ def _fold_moa_usage(agent, canonical_usage):
     return _moa_client, canonical_usage, _moa_ref_cost
 
 
+def _sync_provider_context_window(agent, usage) -> None:
+    """Adopt the context window the Claude Code bridge reports for the served model.
+
+    The bridge reports the window the CLI runs the model with (result ``modelUsage``) as
+    ``usage.context_window``; without it Hermes guesses from its catalog, and a smaller real
+    window would let the CLI reject prompts before Hermes compresses. ``update_model``
+    recomputes the trigger (provider caps included), so this must run before
+    ``update_from_response``. An explicit ``model.context_length`` always wins.
+    """
+    # Only the bridge's own usage object is trusted: an OpenAI-compatible SDK usage model keeps
+    # unknown response fields as attributes, and another provider's extra must not resize Hermes.
+    if (getattr(agent, "provider", "") or "").strip().lower() != "claude-code":
+        return
+    window = getattr(usage, "context_window", None)
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        return
+    configured = getattr(agent, "_config_context_length", None)
+    if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+        return
+    compressor = getattr(agent, "context_compressor", None)
+    current = getattr(compressor, "context_length", None)
+    if compressor is None or current == window:
+        return
+    try:
+        compressor.update_model(
+            model=agent.model, context_length=window, base_url=agent.base_url,
+            api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
+        )
+    except Exception as exc:
+        logger.debug("Context window sync failed: %s", exc)
+        return
+    logger.info(
+        "Context window for %s synced from %s: %s -> %s tokens (compress at %s)",
+        agent.model, agent.provider or "provider", current, window, getattr(compressor, "threshold_tokens", None),
+    )
+    # Persisted so the next agent starts with the real window instead of guessing.
+    with suppress(Exception):
+        from agent.model_metadata import save_context_length
+        save_context_length(agent.model, agent.base_url or "", window)
+
+
 def record_response_usage(
     agent: Any, response: Any, *, messages: List[Dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
@@ -118,6 +159,7 @@ def record_response_usage(
         "cache_write_tokens": canonical_usage.cache_write_tokens,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
+    _sync_provider_context_window(agent, response.usage)
     # Capture the boundary latch before update_from_response() consumes it: only the real
     # prompt count right after a compaction rearms the budget.
     _completed_compaction_pending = bool(

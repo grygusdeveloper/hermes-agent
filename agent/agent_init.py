@@ -1548,6 +1548,19 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     threshold_tokens = cfg.get("threshold_tokens", cfg_get(DEFAULT_CONFIG, "compression", "threshold_tokens"))
     if threshold_tokens is not None:
         threshold_tokens = _positive_int(threshold_tokens)
+    # provider_threshold_tokens: absolute caps applied only while that provider is active (lower of
+    # it and threshold_tokens wins). Default {claude-code: 250000}: Claude Code replays its cached
+    # conversation on every call and slows down markedly past ~350k tokens, while its 1M-window
+    # models would only compress at 500k. A non-positive entry disables that provider's cap.
+    provider_threshold_tokens = cfg.get(
+        "provider_threshold_tokens", cfg_get(DEFAULT_CONFIG, "compression", "provider_threshold_tokens"),
+    )
+    if provider_threshold_tokens is not None and not isinstance(provider_threshold_tokens, dict):
+        logger.warning(
+            "Invalid compression.provider_threshold_tokens=%r (expected a provider -> tokens map); ignoring it.",
+            provider_threshold_tokens,
+        )
+        provider_threshold_tokens = None
     # Non-system head messages to protect (system prompt is always protected); 0 is a
     # legitimate "system prompt + summary + tail".
     protect_first = max(0, int(cfg.get("protect_first_n", 3)))
@@ -1588,6 +1601,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
         threshold_tokens=threshold_tokens,
+        provider_threshold_tokens=provider_threshold_tokens or {},
         checkpoint_required=checkpoint_required,
         # In-place compaction: no session-id rotation. default=True MUST match DEFAULT_CONFIG
         # (a False default flipped agents into rotation mode when the key was omitted).
@@ -2012,7 +2026,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             provider=agent.provider, api_mode=agent.api_mode,
             abort_on_summary_failure=cs.abort_on_summary_failure,
             max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
-            threshold_tokens_cap=cs.threshold_tokens,
+            threshold_tokens_cap=cs.threshold_tokens, provider_threshold_tokens=cs.provider_threshold_tokens,
             proactive_prune_tokens=cs.proactive_prune_tokens,
             proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
@@ -2253,7 +2267,9 @@ def _emit_compression_summary(agent, cs):
         if cs.enabled:
             # The active engine's own threshold — a plugin's differs from cs.threshold.
             _pct = getattr(_cc, "threshold_percent", cs.threshold)
-            _cap = getattr(_cc, "threshold_tokens_cap", None)
+            # Global threshold_tokens and/or the active provider's provider_threshold_tokens (lower wins).
+            _cap_fn = getattr(_cc, "_configured_threshold_cap", None)
+            _cap = _cap_fn() if callable(_cap_fn) else getattr(_cc, "threshold_tokens_cap", None)
             # Name the cap only when it is what set the trigger; on small windows the ratio already sits below it.
             _eff_cap = getattr(_cc, "_effective_threshold_cap", lambda _ctx: None)(_cc.context_length)
             _cap_binds = _eff_cap is not None and _cc.threshold_tokens == _eff_cap

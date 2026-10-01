@@ -168,8 +168,35 @@ def assistant_parts(event: dict, specs: list[dict], historical_ids: set[str]) ->
     return "".join(text), "".join(thinking), calls
 
 
+def context_window(model_usage: Any, served_by: str | None = None) -> int | None:
+    """``contextWindow`` of the model that served the turn (result ``modelUsage``).
+
+    ``modelUsage`` is keyed by full model id and is cumulative over the CLI session (a resumed
+    session restores it), so it can hold another model that once read more. The entry of the
+    model the turn's assistant messages name (``served_by``) wins; without one, the entry that
+    read the most input is the conversation's model (side requests the CLI makes are small).
+    """
+    if not isinstance(model_usage, dict):
+        return None
+
+    def positive(value: Any) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    served = model_usage.get(served_by) if served_by else None
+    if isinstance(served, dict) and positive(served.get("contextWindow")):
+        return served["contextWindow"]
+    best: tuple[int, int] | None = None
+    for entry in model_usage.values():
+        if not isinstance(entry, dict) or not positive(entry.get("contextWindow")):
+            continue
+        read = sum(positive(entry.get(k)) for k in ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"))
+        if best is None or read > best[0]:
+            best = (read, entry["contextWindow"])
+    return best[1] if best else None
+
+
 def completion(model: str, text: str, reasoning: str, calls: list[dict], usage: dict | None = None,
-               stop_reason: str | None = None) -> Any:
+               stop_reason: str | None = None, model_usage: Any = None, served_by: str | None = None) -> Any:
     message = SimpleNamespace(content=text or None, tool_calls=[SimpleNamespace(
         id=c["id"], type="function", function=SimpleNamespace(**c["function"])) for c in calls],
         reasoning=reasoning or None, reasoning_content=reasoning or None, reasoning_details=None)
@@ -180,7 +207,9 @@ def completion(model: str, text: str, reasoning: str, calls: list[dict], usage: 
     return SimpleNamespace(model=model, _hermes_usage_unavailable=not bool(usage), choices=[SimpleNamespace(message=message,
         finish_reason="tool_calls" if calls else {"max_tokens": "length", "refusal": "content_filter"}.get(stop_reason or "", "stop"))],
         usage=SimpleNamespace(prompt_tokens=prompt, completion_tokens=output, total_tokens=prompt + output,
-                              prompt_tokens_details=SimpleNamespace(cached_tokens=cached)))
+                              prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
+                              # The window the CLI runs the model with; the turn loop syncs the compressor to it.
+                              context_window=context_window(model_usage, served_by)))
 
 
 def assistant_row(text: str, calls: list[dict]) -> dict:

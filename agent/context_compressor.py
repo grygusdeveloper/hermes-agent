@@ -2625,15 +2625,23 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         base_percent = resolve_model_threshold(model, self.model_thresholds, self._config_threshold_percent, provider)
         effective_percent = self._effective_threshold_percent(context_length, base_percent)
         threshold = self._compute_threshold_tokens(context_length, effective_percent, self.max_tokens)
-        cap = self._effective_threshold_cap(context_length)
+        cap = self._effective_threshold_cap(context_length, provider)
         if cap is not None:
             threshold = min(threshold, cap)
         return base_percent, effective_percent, threshold
 
-    def _effective_threshold_cap(self, context_length: int) -> int | None:
-        """The configured ``threshold_tokens`` cap clamped to the window; None when no cap is configured."""
-        cap = self.threshold_tokens_cap
-        return min(cap, context_length) if cap is not None and cap > 0 else None
+    def _configured_threshold_cap(self, provider: str | None = None) -> int | None:
+        """The lower of the global ``threshold_tokens`` cap and ``provider_threshold_tokens`` for ``provider``
+        (default: the active one), unclamped; None when neither is configured."""
+        key = (self.provider if provider is None else provider or "").strip().lower()
+        provider_caps = getattr(self, "provider_threshold_tokens", None) or {}
+        caps = [cap for cap in (self.threshold_tokens_cap, provider_caps.get(key)) if cap is not None and cap > 0]
+        return min(caps) if caps else None
+
+    def _effective_threshold_cap(self, context_length: int, provider: str | None = None) -> int | None:
+        """The configured cap (global and/or provider-scoped) clamped to the window; None when no cap is configured."""
+        cap = self._configured_threshold_cap(provider)
+        return min(cap, context_length) if cap is not None else None
 
     def preview_threshold_tokens(self, model: str, context_length: int, provider: str = "") -> int:
         """The trigger ``update_model`` would install, without mutating state."""
@@ -2708,6 +2716,18 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     # Same normalization: a threshold_tokens cap is a positive int, or None for "no cap".
     _coerce_threshold_tokens_cap = _coerce_max_tokens
 
+    @classmethod
+    def _coerce_provider_threshold_tokens(cls, value: Any) -> dict[str, int]:
+        """Normalize ``{provider: cap}``; non-positive, boolean or malformed caps are dropped."""
+        if not isinstance(value, dict):
+            return {}
+        caps: dict[str, int] = {}
+        for provider, cap in value.items():
+            coerced = None if isinstance(cap, bool) else cls._coerce_threshold_tokens_cap(cap)
+            if coerced is not None:
+                caps[str(provider).strip().lower()] = coerced
+        return caps
+
     def _apply_threshold_tokens_cap(self) -> None:
         """Clamp threshold_tokens to the configured cap (itself clamped to the context length) and to the
         auxiliary summariser's window when the feasibility probe installed one."""
@@ -2774,6 +2794,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         base_url: str = "", api_key: str = "", config_context_length: int | None = None, provider: str = "",
         api_mode: str = "", abort_on_summary_failure: bool = False, max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
+        provider_threshold_tokens: dict[str, Any] | None = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
         custom_providers: list | None = None,
@@ -2792,6 +2813,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self.threshold_percent = self._base_threshold_percent
         # Effective trigger = min(ratio threshold, cap); re-applied in update_model().
         self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(threshold_tokens_cap)
+        # compression.provider_threshold_tokens (e.g. {"claude-code": 250000}): applies only while that
+        # provider is active, so a fallback or /model switch keeps its own trigger. Lower cap wins.
+        self.provider_threshold_tokens = self._coerce_provider_threshold_tokens(provider_threshold_tokens)
         # Aux summariser window installed by the feasibility probe; None until it runs.
         self._aux_context_ceiling: int | None = None
         self.protect_first_n, self.protect_last_n = protect_first_n, protect_last_n

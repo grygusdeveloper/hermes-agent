@@ -155,7 +155,8 @@ else:
 (root / "result-sent").touch()
 send({"type":"result", "subtype":"error_during_execution" if scenario == "error" else "success",
       "is_error":scenario == "error", "session_id":sid, "result":"not an executable assistant source",
-      "usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":2}})
+      "usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":2},
+      **({"modelUsage":latest["model_usage"]} if "model_usage" in latest else {})})
 # Native streaming CLI stays open for input. Transport must close/reap it.
 for line in sys.stdin: pass
 '''
