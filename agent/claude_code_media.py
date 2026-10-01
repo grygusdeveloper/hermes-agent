@@ -14,9 +14,13 @@ from agent.image_routing import (
     _UNIVERSALLY_SUPPORTED_MIMES, _sniff_mime_from_bytes,
 )
 
-# Claude's inline image limit is narrower than the generic materialization cap.
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
-MAX_REQUEST_IMAGE_BYTES = 15 * 1024 * 1024
+# Claude Code resizes every base64 image block of a stream-json user message itself
+# (to the API's pixel and 5 MiB limits) before calling the API, so large screenshots
+# and phone photos pass through unchanged, as in the fork (2338745987). These caps
+# only protect stdin and memory: the per-image one is the CLI's own 32 MB of base64.
+MAX_IMAGE_BASE64_CHARS = 32 * 1024 * 1024
+MAX_IMAGE_BYTES = MAX_IMAGE_BASE64_CHARS // 4 * 3
+MAX_REQUEST_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_IMAGES = 100
 
 
@@ -30,14 +34,14 @@ def image_block(part: dict) -> dict:
     mime = "image/jpeg" if mime == "image/jpg" else mime
     if not separator or not header.endswith(";base64") or mime not in _UNIVERSALLY_SUPPORTED_MIMES:
         raise ValueError("Claude native requires supported raster MIME and base64 encoding")
-    if len(data) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
-        raise ValueError("Claude native image exceeds 5 MiB limit")
+    if len(data) > MAX_IMAGE_BASE64_CHARS:
+        raise ValueError("Claude native image exceeds the CLI's 32 MB limit")
     try:
         raw = base64.b64decode(data, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise ValueError("Claude native image has invalid base64 data") from exc
     if not raw or len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError("Claude native image is empty or exceeds 5 MiB limit")
+        raise ValueError("Claude native image is empty or exceeds the CLI's 32 MB limit")
     if _sniff_mime_from_bytes(raw) != mime:
         raise ValueError("Claude native image is corrupt or does not match its MIME")
     # Header sniffing alone does not validate JPEG/GIF/WebP. Require the existing
@@ -47,8 +51,6 @@ def image_block(part: dict) -> dict:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(BytesIO(raw)) as image:
-                if max(image.size) > 8000:
-                    raise ValueError("Claude native image dimensions exceed 8000 pixels")
                 image.verify()
             with Image.open(BytesIO(raw)) as image:
                 image.load()

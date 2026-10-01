@@ -96,6 +96,8 @@ def native(tmp_path, monkeypatch):
     script = tmp_path / "claude-vision-fixture"
     script.write_text(f"#!{sys.executable}\n" + CHILD)
     script.chmod(0o700)
+    # The fixture answers one request per process; warm reuse is covered elsewhere.
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_KEEPALIVE_SECONDS", "0")
     set_multiplex_active(True)
     try:
         with scope(tmp_path / "launch"):
@@ -224,7 +226,7 @@ def test_registered_generic_image_ingress_and_identity(native, tmp_path, scenari
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("bad", ["https", "http-private", "file", "path", "ftp", "svg", "bmp", "mime", "base64", "percent",
-    "empty", "corrupt-png", "corrupt-jpeg", "corrupt-gif", "corrupt-webp", "oversize", "dimensions", "role-system", "role-assistant",
+    "empty", "corrupt-png", "corrupt-jpeg", "corrupt-gif", "corrupt-webp", "oversize", "role-system", "role-assistant",
     "role-tool", "role-unknown", "audio", "unknown-part", "unknown-tool-output", "aggregate", "image-count"])
 def test_invalid_media_fails_before_native_launch(native, tmp_path, bad, monkeypatch):
     from agent import claude_code_protocol as protocol
@@ -247,11 +249,9 @@ def test_invalid_media_fails_before_native_launch(native, tmp_path, bad, monkeyp
         image = part({"corrupt-png":b"\x89PNG\r\n\x1a\n", "corrupt-jpeg":b"\xff\xd8\xffbad",
                       "corrupt-gif":b"GIF89abad", "corrupt-webp":b"RIFFxxxxWEBPbad"}[bad], "image/" + bad[8:])
     elif bad == "oversize":
-        image = part(b"x" * (5 * 1024 * 1024 + 1))
-    elif bad == "dimensions":
-        stream = BytesIO()
-        Image.new("RGB",(8001,1)).save(stream,format="PNG")
-        image = part(stream.getvalue())
+        # Reduced cap: the CLI's own 32 MB base64 limit without a huge fixture.
+        from agent import claude_code_media as media
+        monkeypatch.setattr(media, "MAX_IMAGE_BASE64_CHARS", len(image["image_url"]["url"].partition(",")[2]) - 1)
     elif bad.startswith("role-"):
         role = bad[5:]
     content = [image]
@@ -273,3 +273,20 @@ def test_invalid_media_fails_before_native_launch(native, tmp_path, bad, monkeyp
     assert not (tmp_path / "launched").exists()
     assert native._session._process is None
     assert not list((tmp_path / "a/claude-code/checkpoints").glob("*.json"))
+
+
+@pytest.mark.platforms("posix")
+def test_large_images_are_passed_to_the_cli_to_resize(native, tmp_path):
+    """Regression: images over 5 MiB or 8000 px failed the turn; the CLI resizes them."""
+    wide = BytesIO()
+    Image.new("RGB", (8001, 1), "blue").save(wide, format="PNG")
+    noise = os.urandom(1024 * 3 * 1800)
+    heavy = BytesIO()
+    Image.frombytes("RGB", (1024, 1800), noise).save(heavy, format="PNG")
+    assert len(heavy.getvalue()) > 5 * 1024 * 1024
+    with scope(tmp_path / "a"):
+        content = [{"type": "text", "text": "look"}, part(wide.getvalue()), part(heavy.getvalue())]
+        assert invoke(native, [{"role": "user", "content": content}]) == "FIXTURE_VISION_OK"
+    sent = rows(tmp_path)[-1]["images"]
+    assert [i["sha256"] for i in sent] == [hashlib.sha256(wide.getvalue()).hexdigest(),
+                                          hashlib.sha256(heavy.getvalue()).hexdigest()]
