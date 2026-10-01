@@ -221,7 +221,7 @@ class ClaudeCodeSession:
         return None
 
     def _launch(self, home: Path, system: str, specs: list[dict], model: str, effort: str | None,
-                state: dict | None, epoch: int) -> None:
+                state: dict | None, epoch: int, thinking: str | None = None) -> None:
         command = locate_command(self.command).command
         if not command:
             raise RuntimeError("Claude native CLI is unavailable; no HTTP fallback is permitted")
@@ -237,6 +237,8 @@ class ClaudeCodeSession:
                 "--permission-prompt-tool", "stdio", "--setting-sources", "", "--disable-slash-commands"]
         if effort:
             argv += ["--effort", effort]
+        if thinking:
+            argv += ["--thinking", thinking]
         if state:
             argv += ["--resume", state["session_id"], "--resume-session-at", state["checkpoint"]]
         else:
@@ -277,7 +279,7 @@ class ClaudeCodeSession:
 
     def _iterate(self, *, model: str, messages: list[dict], specs: list[dict], owner: str | None,
                  timeout: float, effort: str | None = None, required: bool = False, streaming: bool,
-                 request_epoch: int | None = None):
+                 request_epoch: int | None = None, thinking: str | None = None):
         with self._serial:
             with self._guard:
                 epoch = self._epoch if request_epoch is None else request_epoch
@@ -289,7 +291,9 @@ class ClaudeCodeSession:
                 home = get_hermes_home().resolve()
                 home.mkdir(parents=True, exist_ok=True)
                 system, transcript = system_and_transcript(messages)
-                identity = digest([str(home), owner, self.command, self.cwd or str(home), model, effort, system, specs])
+                # Thinking joins the identity only when set, so pre-existing checkpoints keep matching.
+                identity = digest([str(home), owner, self.command, self.cwd or str(home), model, effort, system, specs]
+                                  + ([thinking] if thinking else []))
                 fingerprints = message_fingerprints(messages)
                 turn = NativeTurn(self, model=model, messages=messages, specs=specs, identity=identity,
                                   epoch=epoch, deadline=deadline, transcript=transcript, required=required,
@@ -322,7 +326,7 @@ class ClaudeCodeSession:
                         # checkpoint. Only new records go on stdin.
                         _, transcript = system_and_transcript(new)
                         turn.transcript = transcript
-                    self._launch(home, system, specs, model, effort, state, epoch)
+                    self._launch(home, system, specs, model, effort, state, epoch, thinking)
                 while True:
                     event = self._event(epoch, deadline)
                     result = turn.dispatch(event)

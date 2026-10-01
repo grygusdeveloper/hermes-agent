@@ -14,6 +14,33 @@ from typing import Any
 from agent.claude_code_protocol import MARKER, MODEL, tool_specs
 from agent.claude_code_session import ClaudeCodeSession
 from agent.portal_tags import get_native_transport_identity
+from agent.reasoning_effort import clamp_effort
+
+# ``--effort`` / ``--thinking`` choices of Claude Code 2.1.x. Hermes levels outside them clamp to the
+# nearest weaker one (minimal -> low, ultra -> max). "ultracode" is xhigh plus Claude Code's own workflow
+# orchestration, whose native tools are off here (``--tools ""``), so it sends xhigh.
+CLI_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_EFFORT_OVERRIDES = {"ultracode": "xhigh"}
+THINKING_MODES = ("enabled", "adaptive", "disabled")
+
+
+def cli_reasoning(effort: str | None, thinking: str | None = None) -> tuple[str | None, str | None]:
+    """``(--effort, --thinking)`` for a requested Hermes effort and thinking mode.
+
+    ``none`` (reasoning off) turns thinking off at the lowest effort; unknown values raise.
+    """
+    requested = str(effort or "").strip().lower() or None
+    mode = str(thinking or "").strip().lower() or None
+    if mode is not None and mode not in THINKING_MODES:
+        raise ValueError("Unsupported Claude native thinking mode")
+    if requested == "none" or mode == "disabled":
+        return "low", "disabled"
+    if requested is None:
+        return None, mode
+    clamped = clamp_effort(requested, CLI_EFFORTS, _EFFORT_OVERRIDES)
+    if clamped not in CLI_EFFORTS:
+        raise ValueError("Unsupported Claude native reasoning effort")
+    return clamped, mode
 
 
 class ClaudeCodeClient:
@@ -45,13 +72,12 @@ class ClaudeCodeClient:
 
     def _create_chat_completion(self, *, model: str, messages: list[dict], tools: list[dict] | None = None,
                                 tool_choice: Any = None, timeout: Any = None, stream: bool = False,
-                                reasoning_effort: str | None = None, **_: Any):
+                                reasoning_effort: str | None = None, thinking: str | None = None, **_: Any):
         if not MODEL.fullmatch(model or ""):
             raise ValueError("Claude native requires a Claude model or opus/sonnet/haiku/fable alias")
         if self._stream is not None and not self._stream.finished:
             raise RuntimeError("Claude native stream must be exhausted or closed before the next request")
-        if reasoning_effort not in (None, "low", "medium", "high", "max"):
-            raise ValueError("Unsupported Claude native reasoning effort")
+        effort, thinking = cli_reasoning(reasoning_effort, thinking)
         seconds = timeout if timeout is not None else self.timeout
         if seconds is None:
             seconds = 900.0
@@ -64,8 +90,10 @@ class ClaudeCodeClient:
         # explicitly opt out of durable turn state inside the same context.
         owner = None if self._auxiliary else get_native_transport_identity()
         kwargs: dict[str, Any] = dict(model=model, messages=messages, specs=specs, owner=owner,
-                      timeout=float(seconds), effort=reasoning_effort,
+                      timeout=float(seconds), effort=effort,
                       required=tool_choice == "required" or isinstance(tool_choice, dict))
+        if thinking:
+            kwargs["thinking"] = thinking
         if stream:
             self._stream = self._session.stream(**kwargs)
             return self._stream
