@@ -20,6 +20,13 @@ MARKER = "acp://claude-code"
 MODEL = re.compile(r"(?:opus|sonnet|haiku|fable|claude-(?:opus|sonnet|haiku|fable)-[A-Za-z0-9._-]+)(?:\[1m\])?\Z")
 TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 NAMESPACE = "mcp__hermes__"
+# On a full replay, string arguments of older tool calls longer than this (file
+# contents, patches, scripts) are elided: the call already ran, its result follows
+# in the transcript and the file is on disk. The most recent tool-call replies keep
+# their arguments, so a call in progress stays exact (ae77bcfb28).
+ELIDE_ARG_CHARS = 1500
+ELIDE_KEEP_CHARS = 160
+RECENT_TOOL_REPLIES_KEPT = 2
 
 
 def canonical(value: Any) -> str:
@@ -71,7 +78,36 @@ def tool_specs(tools: list[dict] | None, tool_choice: Any) -> list[dict]:
     return specs
 
 
-def system_and_transcript(messages: list[dict]) -> tuple[str, str | list[dict]]:
+def _elided_calls(calls: Any) -> Any:
+    """Historical calls with long string arguments shortened (they already ran)."""
+    if not isinstance(calls, list):
+        return calls
+    shortened = []
+    for call in calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        try:
+            arguments = json.loads(function["arguments"])
+        except (TypeError, KeyError, ValueError):
+            shortened.append(call)
+            continue
+        if not isinstance(arguments, dict) or not any(
+                isinstance(v, str) and len(v) > ELIDE_ARG_CHARS for v in arguments.values()):
+            shortened.append(call)
+            continue
+        elided = {}
+        for key, value in arguments.items():
+            if isinstance(value, str) and len(value) > ELIDE_ARG_CHARS:
+                head = value[:ELIDE_KEEP_CHARS].rstrip()
+                value = (f"{head}\n[... {len(value) - len(head):,} more characters elided: "
+                         "this call already ran; the file is on disk]")
+            elided[key] = value
+        shortened.append({**call, "function": {**function, "arguments": canonical(elided)}})
+    return shortened
+
+
+def system_and_transcript(messages: list[dict], *, elide_old_calls: bool = False) -> tuple[str, str | list[dict]]:
+    """``elide_old_calls``: a full replay shortens long arguments of all but the most
+    recent tool-call replies. Never used for a resumed tail (only new records)."""
     leading = []
     start = 0
     for row in messages:
@@ -82,7 +118,9 @@ def system_and_transcript(messages: list[dict]) -> tuple[str, str | list[dict]]:
     history = []
     blocks = []
     image_count = image_bytes = 0
-    for row in messages[start:]:
+    tool_replies = [i for i, row in enumerate(messages) if i >= start and row.get("tool_calls")]
+    recent = set(tool_replies[-RECENT_TOOL_REPLIES_KEPT:]) if elide_old_calls else set(tool_replies)
+    for position, row in enumerate(messages[start:], start):
         if row.get("role") not in ("user", "assistant", "tool", "system", "developer"):
             raise ValueError("Unsupported Claude native conversation role")
         content = row.get("content")
@@ -117,7 +155,8 @@ def system_and_transcript(messages: list[dict]) -> tuple[str, str | list[dict]]:
             continue
         entry = {"role": row.get("role"), "text": text_content(row.get("content"))}
         if row.get("tool_calls"):
-            entry["completed_historical_calls"] = row["tool_calls"]
+            entry["completed_historical_calls"] = (
+                row["tool_calls"] if position in recent else _elided_calls(row["tool_calls"]))
         if row.get("role") == "tool":
             entry["tool_call_id"] = row.get("tool_call_id")
         history.append(entry)
@@ -220,9 +259,14 @@ def assistant_row(text: str, calls: list[dict]) -> dict:
 
 
 def stream_chunk(model: str, *, text: str | None = None, reasoning: str | None = None,
-                 calls: list | None = None, finish_reason: str | None = None, usage=None):
-    """The existing generic chat consumer owns accumulation and display."""
-    delta = SimpleNamespace(content=text, reasoning_content=reasoning, tool_calls=calls)
+                 calls: list | None = None, finish_reason: str | None = None, usage=None,
+                 commentary: str | None = None):
+    """The existing generic chat consumer owns accumulation and display.
+
+    ``commentary``: narration written before tool calls. It belongs to the message
+    content (history) but reaches the user only through the interim-message rail,
+    never the answer stream (f8a124c66f). An all-empty delta is a liveness tick."""
+    delta = SimpleNamespace(content=text, reasoning_content=reasoning, tool_calls=calls, commentary=commentary)
     return SimpleNamespace(model=model, usage=usage, choices=[SimpleNamespace(
         index=0, delta=delta, finish_reason=finish_reason)] if usage is None else [])
 

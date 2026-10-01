@@ -2686,7 +2686,9 @@ PROCESS_SCHEMA = {
         "Completed results remain retrievable by session_id when resuming their owning conversation "
         "(up to 7 days, newest 64 results per profile; rolling output tail). "
         "poll: status + new output. log: full output, paged. wait: block "
-        "until exit or timeout (partial output on timeout). write vs "
+        "until exit or timeout (partial output on timeout). Every call costs a model turn: for a job "
+        "you expect to run long, wait once with a timeout covering the whole job (up to 1800 s) "
+        "instead of polling. write vs "
         "submit: submit appends Enter — use it to answer prompts; write "
         "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
         "handoff (subagents only): transfer a running process you started to your parent agent, which then "
@@ -2710,7 +2712,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": "Max seconds for 'wait' (up to 1800; pick the whole expected runtime so one wait covers the job).",
                 "minimum": 1
             },
             "offset": {
