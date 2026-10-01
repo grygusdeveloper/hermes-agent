@@ -1419,16 +1419,22 @@ class GatewayInboundMixin:
             # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
             # clears it only once the reply is in the delivery ledger (else a kill in between
             # left neither marker nor ledger row and the persisted reply was never sent).
-            if not getattr(event, "_turn_marker_handoff", False):
-                await self._clear_durable_active_turn(event)
-            # Release only this turn's generation. Eviction may immediately admit a replacement
-            # through the cold path; an unconditional release here would then clear the replacement
-            # sentinel/agent and lease. Reset/stop release their stale slot before installing a
-            # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
-            self._release_running_agent_state(_quick_key, run_generation=_run_generation)
-            # Turn lease is keyed by (routing key, run generation) so this unwind can only free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                if not getattr(event, "_turn_marker_handoff", False):
+                    await self._clear_durable_active_turn(event)
+            finally:
+                # /stop and /new cancel this task: a CancelledError landing on the marker-clear await
+                # above must not skip these, or the next message waits behind a lease nobody releases
+                # until HERMES_TURN_LEASE_TIMEOUT.
+                #
+                # Release only this turn's generation. Eviction may immediately admit a replacement
+                # through the cold path; an unconditional release here would then clear the replacement
+                # sentinel/agent and lease. Reset/stop release their stale slot before installing a
+                # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
+                self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+                # Turn lease is keyed by (routing key, run generation) so this unwind can only free
+                # the lease its own turn acquired, never a newer turn's.
+                self._release_turn_lease(_quick_key, _run_generation)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
