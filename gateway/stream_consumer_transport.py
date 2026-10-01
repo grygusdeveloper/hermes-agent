@@ -503,7 +503,7 @@ class StreamTransportMixin:
         result = await self._edit_message(
             message_id=self._message_id, content=text, finalize=finalize,
             metadata_override=({**(self.metadata or {}), **self._save_controls(text)}
-                               if finalize and is_turn_final else None))
+                               if finalize and is_turn_final and self._adapter_saves_responses else None))
         if not result.success:
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)

@@ -2743,6 +2743,9 @@ class BasePlatformAdapter(ABC):
 
     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
     REQUIRES_EDIT_FINALIZE: bool = False
+    # Surfaces that render per-answer save controls (Discord ⭐/📚): only they receive the
+    # ``final_response`` / ``save_response_content`` keys on stream-consumer final sends.
+    SUPPORTS_RESPONSE_SAVE_CONTROLS: bool = False
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a fresh thread under ``parent_chat_id`` for a CLI→platform session handoff; its id

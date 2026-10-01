@@ -10,9 +10,10 @@ import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
-def _make_adapter() -> MagicMock:
+def _make_adapter(*, saves_responses: bool = True) -> MagicMock:
     adapter = MagicMock()
     adapter.REQUIRES_EDIT_FINALIZE = False
+    adapter.SUPPORTS_RESPONSE_SAVE_CONTROLS = saves_responses
     adapter.MAX_MESSAGE_LENGTH = 4096
     adapter.send = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="m1")
@@ -164,3 +165,33 @@ async def test_finalize_edit_carries_controls_but_interim_edit_keeps_session_met
     final = adapter.edit_message.await_args.kwargs["metadata"]
     assert final == {"thread_id": "t", "final_response": True,
                      "save_response_content": "partial more done"}
+
+
+@pytest.mark.asyncio
+async def test_adapters_without_save_controls_get_unchanged_final_metadata():
+    """Only adapters that render save controls (Discord) get the save keys; every other
+    platform's final sends and finalize edits carry exactly their usual metadata."""
+    adapter = _make_adapter(saves_responses=False)
+    ids = iter(range(1, 20))
+    adapter.send.side_effect = lambda **k: SimpleNamespace(success=True, message_id=f"m{next(ids)}")
+    consumer = GatewayStreamConsumer(adapter=adapter, chat_id="c", metadata={"thread_id": "t"})
+
+    await consumer._send_or_edit("whole answer", finalize=True)
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "t", "notify": True}
+
+    await consumer._send_or_edit("whole answer edited", finalize=True)
+    assert adapter.edit_message.await_args.kwargs["metadata"] == {"thread_id": "t"}
+
+    consumer._message_id = "old"
+    await consumer._send_fallback_final("Z" * 9000)
+    for call in adapter.send.await_args_list[1:]:
+        meta = call.kwargs["metadata"]
+        assert "final_response" not in meta and "save_response_content" not in meta
+
+
+def test_discord_adapter_declares_save_controls_and_base_does_not():
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    assert BasePlatformAdapter.SUPPORTS_RESPONSE_SAVE_CONTROLS is False
+    assert DiscordAdapter.SUPPORTS_RESPONSE_SAVE_CONTROLS is True

@@ -1225,6 +1225,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     # the identical finalize edit, which is the one edit that attaches the final-only save controls
     # (⭐ Favorite / 📚 Notion) and persists the logical response. Opt into that explicit edit.
     REQUIRES_EDIT_FINALIZE = True
+    SUPPORTS_RESPONSE_SAVE_CONTROLS = True
 
     # Voice auto-disconnect after N idle seconds (discord.voice_channel_inactivity_timeout_seconds; 0 off).
     VOICE_TIMEOUT = 300

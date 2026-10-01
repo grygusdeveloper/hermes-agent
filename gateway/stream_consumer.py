@@ -140,6 +140,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # Only platforms needing an explicit finalize call (DingTalk AI Cards) force a
         # redundant final edit; ``is True`` keeps MagicMock adapters out.
         self._adapter_requires_finalize = getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
+        # Save-control keys go only to adapters that render them (Discord); ``is True`` again
+        # keeps MagicMock adapters out, and every other platform's metadata stays unchanged.
+        self._adapter_saves_responses = getattr(adapter, "SUPPORTS_RESPONSE_SAVE_CONTROLS", False) is True
         # Telegram bounds edit retries at 5s; a fallback must not wait longer.
         self._max_fallback_flood_retry_seconds = 5.0
 
@@ -272,9 +275,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return meta or None
 
     def _save_controls(self, visible_text: Optional[str]) -> dict:
-        """Final-answer marker for the Discord save controls.  The persisted content is the whole
-        logical answer: on a split turn the visible text is only the tail, so the unsplit
-        ``_stream_ledger`` is used instead."""
+        """Final-answer marker for the Discord save controls (empty for adapters without them).
+        The persisted content is the whole logical answer: on a split turn the visible text is
+        only the tail, so the unsplit ``_stream_ledger`` is used instead."""
+        if not self._adapter_saves_responses:
+            return {}
         content = (self._clean_for_display(self._stream_ledger)
                    if self._turn_split_delivery and self._stream_ledger else visible_text)
         controls = {"final_response": True}
