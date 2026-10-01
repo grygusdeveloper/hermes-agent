@@ -4,7 +4,9 @@ Hermes must not *enable* multi-process WAL on SQLite builds that still contain
 the upstream WAL-reset corruption bug:
 https://sqlite.org/wal.html#walresetbug
 
-Existing on-disk WAL databases are left alone (no live downgrade).
+Existing on-disk WAL databases are never live-downgraded. This fork goes further than upstream: a vulnerable build
+refuses to join a WAL database at all (WalResetVulnerableError), touching nothing, unless
+HERMES_ALLOW_VULNERABLE_SQLITE_WAL=1 (the Main VPS state.db corruption of 2026-09-27).
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import time
 import pytest
 
 import hermes_state_wal
-from hermes_state_wal import apply_wal_with_fallback, is_sqlite_wal_reset_vulnerable
+from hermes_state_wal import WalResetVulnerableError, apply_wal_with_fallback, is_sqlite_wal_reset_vulnerable
 
 @pytest.fixture(autouse=True)
 def _reset_wal_reset_bug_warnings():
@@ -61,13 +63,12 @@ class TestApplyWalWalResetGate:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
         conn.close()
 
-    def test_existing_wal_left_alone_when_vulnerable(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        """Already-WAL DBs must not be live-downgraded under concurrent openers."""
+    def test_existing_wal_refused_when_vulnerable(self, tmp_path, monkeypatch):
+        """A vulnerable build must not join an already-WAL DB, and must leave it exactly as it was."""
         monkeypatch.setattr(
             hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
         )
+        monkeypatch.delenv(hermes_state_wal.ALLOW_VULNERABLE_WAL_ENV, raising=False)
         path = tmp_path / "prior_wal.db"
         seed = sqlite3.connect(str(path))
         try:
@@ -75,7 +76,35 @@ class TestApplyWalWalResetGate:
             seed.execute("CREATE TABLE t (x INTEGER)")
             seed.execute("INSERT INTO t VALUES (42)")
             seed.commit()
-            assert seed.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        finally:
+            seed.close()
+
+        conn = sqlite3.connect(str(path), timeout=30.0)
+        try:
+            with pytest.raises(WalResetVulnerableError, match="WAL-reset corruption bug"):
+                apply_wal_with_fallback(conn, db_label="prior_wal.db")
+        finally:
+            conn.close()
+        check = sqlite3.connect(str(path))
+        try:
+            assert check.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            assert check.execute("SELECT x FROM t").fetchone()[0] == 42
+        finally:
+            check.close()
+
+    def test_override_keeps_existing_wal_when_vulnerable(self, tmp_path, monkeypatch, caplog):
+        """HERMES_ALLOW_VULNERABLE_SQLITE_WAL=1 restores upstream's keep-WAL-and-warn path."""
+        monkeypatch.setattr(
+            hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
+        )
+        monkeypatch.setenv(hermes_state_wal.ALLOW_VULNERABLE_WAL_ENV, "1")
+        path = tmp_path / "prior_wal.db"
+        seed = sqlite3.connect(str(path))
+        try:
+            seed.execute("PRAGMA journal_mode=WAL")
+            seed.execute("CREATE TABLE t (x INTEGER)")
+            seed.execute("INSERT INTO t VALUES (42)")
+            seed.commit()
         finally:
             seed.close()
 
@@ -84,10 +113,30 @@ class TestApplyWalWalResetGate:
             with caplog.at_level("WARNING", logger="hermes_state"):
                 mode = apply_wal_with_fallback(conn, db_label="prior_wal.db")
             assert mode == "wal"
-            assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
             assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+            assert any("WAL-reset corruption bug" in r.getMessage() for r in caplog.records)
         finally:
             conn.close()
+
+    def test_session_db_refuses_shared_wal_state_db_when_vulnerable(self, tmp_path, monkeypatch):
+        """What a vulnerable `hermes` sees: SessionDB fails loudly instead of sharing a live WAL state.db."""
+        import hermes_state
+
+        monkeypatch.delenv(hermes_state_wal.ALLOW_VULNERABLE_WAL_ENV, raising=False)
+        db = tmp_path / "state.db"
+        monkeypatch.setattr(
+            hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
+        )
+        hermes_state.SessionDB(db_path=db).close()  # a healthy runtime creates the shared WAL store
+        assert sqlite3.connect(str(db)).execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        before = db.read_bytes()
+
+        monkeypatch.setattr(
+            hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
+        )
+        with pytest.raises(WalResetVulnerableError):
+            hermes_state.SessionDB(db_path=db)
+        assert db.read_bytes() == before
 
 _HOLDER_SCRIPT = """
 import sqlite3, sys, time, os
@@ -111,16 +160,17 @@ class TestNoDowngradeUnderConcurrentOpeners:
     destroyed by a live WAL→DELETE flip (observed: disk rows went 10 → 0
     while the writer's memory held 185)."""
 
-    def test_second_process_opener_keeps_wal_when_vulnerable(
-        self, tmp_path, monkeypatch, caplog
+    def test_second_process_opener_refused_when_vulnerable(
+        self, tmp_path, monkeypatch
     ):
         """A REAL second process holds the WAL DB open while the vulnerable
-        gate runs — WAL must be left in place and its committed rows survive.
+        gate runs — the gate refuses, WAL stays in place and the holder's committed rows survive.
 
         All blocked-state assertions run WHILE the holder owns the DB."""
         monkeypatch.setattr(
             hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
         )
+        monkeypatch.delenv(hermes_state_wal.ALLOW_VULNERABLE_WAL_ENV, raising=False)
         db = tmp_path / "live_wal.db"
         seed = sqlite3.connect(str(db))
         try:
@@ -144,22 +194,16 @@ class TestNoDowngradeUnderConcurrentOpeners:
 
             conn = sqlite3.connect(str(db), timeout=30.0)
             try:
-                with caplog.at_level("WARNING", logger="hermes_state"):
-                    mode = apply_wal_with_fallback(conn, db_label="live_wal.db")
+                with pytest.raises(WalResetVulnerableError):
+                    apply_wal_with_fallback(conn, db_label="live_wal.db")
                 # Asserted while the second opener still holds the DB:
                 assert holder.poll() is None, "holder must still be alive here"
-                assert mode == "wal"
                 assert (
                     conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
                     == "wal"
                 )
-                # The concurrent opener's committed row must have survived.
                 rows = {r[0] for r in conn.execute("SELECT x FROM t")}
                 assert rows == {1, 777}
-                assert not any(
-                    "instead of enabling WAL" in r.getMessage()
-                    for r in caplog.records
-                )
             finally:
                 conn.close()
         finally:
@@ -173,18 +217,18 @@ class TestNoDowngradeUnderConcurrentOpeners:
         finally:
             check.close()
 
-    def test_unreadable_mode_keeps_journal_mode_when_vulnerable(
-        self, tmp_path, monkeypatch, caplog
+    def test_unreadable_mode_refused_when_vulnerable(
+        self, tmp_path, monkeypatch
     ):
         """An exclusive-locking holder blocks even the journal-mode read.
 
-        Ownership is then not provably exclusive: the gate must leave the
-        journal mode untouched instead of treating 'could not read the mode'
-        as 'not WAL' and flipping anyway (the incident's exact confusion).
-        Assertions run WHILE the holder's exclusive lock is live."""
+        Ownership is then not provably exclusive: the gate must refuse rather than
+        treat 'could not read the mode' as 'not WAL' (the incident's exact confusion) or
+        join a possibly shared WAL database. Assertions run WHILE the holder's exclusive lock is live."""
         monkeypatch.setattr(
             hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
         )
+        monkeypatch.delenv(hermes_state_wal.ALLOW_VULNERABLE_WAL_ENV, raising=False)
         db = tmp_path / "locked_wal.db"
         seed = sqlite3.connect(str(db))
         try:
@@ -206,16 +250,8 @@ class TestNoDowngradeUnderConcurrentOpeners:
                 # Sanity: the probe really is blocked right now.
                 with pytest.raises(sqlite3.OperationalError):
                     conn.execute("PRAGMA journal_mode").fetchone()
-                with caplog.at_level("WARNING", logger="hermes_state"):
-                    mode = apply_wal_with_fallback(conn, db_label="locked_wal.db")
-                assert mode == "wal"
-                assert any(
-                    "concurrent openers" in r.getMessage() for r in caplog.records
-                )
-                assert not any(
-                    "instead of enabling WAL" in r.getMessage()
-                    for r in caplog.records
-                )
+                with pytest.raises(WalResetVulnerableError, match="could not be read"):
+                    apply_wal_with_fallback(conn, db_label="locked_wal.db")
             finally:
                 conn.close()
         finally:

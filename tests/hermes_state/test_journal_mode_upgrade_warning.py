@@ -276,6 +276,7 @@ class TestTheExistingContractIsUnchanged:
                 "hermes_state_wal.is_sqlite_wal_reset_vulnerable",
                 lambda **kwargs: True,
             )
+            monkeypatch.setenv("HERMES_ALLOW_VULNERABLE_SQLITE_WAL", "1")  # upstream keep-WAL path (fork refuses by default)
             assert apply_wal_with_fallback(conn, db_label="existing-wal.db") == "wal"
             assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         finally:

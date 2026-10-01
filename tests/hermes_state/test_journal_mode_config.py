@@ -179,6 +179,7 @@ def test_configured_delete_never_live_downgrades_existing_wal(monkeypatch, tmp_p
             "hermes_state_wal.is_sqlite_wal_reset_vulnerable",
             lambda **kwargs: True,
         )
+        monkeypatch.setenv("HERMES_ALLOW_VULNERABLE_SQLITE_WAL", "1")  # upstream keep-WAL path (fork refuses by default)
         with caplog.at_level("ERROR", logger="hermes_state"):
             assert apply_wal_with_fallback(conn, db_label="existing-wal.db") == "wal"
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -230,6 +231,7 @@ def test_configured_delete_overridden_warning_fires_once_per_db(monkeypatch, tmp
         "hermes_state_wal.is_sqlite_wal_reset_vulnerable",
         lambda **kwargs: True,
     )
+    monkeypatch.setenv("HERMES_ALLOW_VULNERABLE_SQLITE_WAL", "1")  # upstream keep-WAL path (fork refuses by default)
     db_path = tmp_path / "existing-wal.db"
     conn = sqlite3.connect(db_path)
     try:

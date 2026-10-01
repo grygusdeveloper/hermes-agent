@@ -53,6 +53,32 @@ _CANNOT_VERIFY_DELETE_MSG = ("could not verify journal mode before applying conf
                              "is locked — possible concurrent openers); refusing to downgrade a database this process "
                              "does not exclusively own")
 
+# Main VPS incident (2026-09-27): a second Hermes install whose Python linked SQLite 3.50.4 opened the gateway's WAL
+# state.db beside it; the WAL-reset race (https://sqlite.org/wal.html#walresetbug) then corrupted the database beyond
+# in-place repair. Upstream only warns when a vulnerable build meets an already-WAL file. This fork refuses instead:
+# refusing touches nothing on disk (no live downgrade, no checkpoint, no commit), so every invariant below still holds.
+ALLOW_VULNERABLE_WAL_ENV = "HERMES_ALLOW_VULNERABLE_SQLITE_WAL"
+
+
+class WalResetVulnerableError(sqlite3.OperationalError):
+    """This interpreter's SQLite has the WAL-reset bug and the database is (or may be) shared in WAL mode."""
+
+
+def _refuse_vulnerable_wal(db_label: str, *, indeterminate: bool) -> None:
+    """Raise unless the operator explicitly accepted the risk for this process."""
+    if os.environ.get(ALLOW_VULNERABLE_WAL_ENV) == "1":
+        return
+    state = ("its journal mode could not be read because another process holds it" if indeterminate
+             else "it is in WAL mode")
+    raise WalResetVulnerableError(
+        f"{db_label}: refusing to open — {state}, and this interpreter ({sys.executable}) links SQLite "
+        f"{sqlite3.sqlite_version}, which has the WAL-reset corruption bug (https://sqlite.org/wal.html#walresetbug). "
+        "Sharing the database from this process can corrupt it for every other Hermes process. Run Hermes from its "
+        "release runtime (/usr/local/bin/hermes) or a Python linking SQLite 3.51.3+ (or 3.50.7 / 3.44.6). "
+        f"{ALLOW_VULNERABLE_WAL_ENV}=1 overrides this only for a database no other process opens."
+    )
+
+
 
 def _mode_from_row(row) -> str:
     """Lower-cased mode from a ``PRAGMA journal_mode`` row, ``""`` if no row."""
@@ -428,12 +454,14 @@ def _warn_existing_wal_on_cross_vm_fs(conn: sqlite3.Connection) -> None:
 def _apply_delete_for_wal_reset_bug(conn: sqlite3.Connection, *, db_label: str, require_delete: bool = False) -> str:
     """Avoid enabling WAL when the linked SQLite has the WAL-reset bug.
 
-    Already-WAL on disk: keep WAL (no live downgrade) and warn. Mode unreadable (probe blocked by a concurrent
-    opener): not provably exclusive — leave it and warn; treating "could not read" as "not WAL" once flipped a live
-    WAL state.db to DELETE under a writer, destroying its uncheckpointed commits. Otherwise set DELETE without
-    waiting out openers and warn; an explicit operator request additionally verifies SQLite accepted DELETE."""
+    Already-WAL on disk, or mode unreadable (probe blocked by a concurrent opener): refuse with
+    :class:`WalResetVulnerableError` and touch nothing — joining a shared WAL database from a vulnerable build is how
+    the bug corrupts it, and downgrading it live would destroy other writers' uncheckpointed commits.
+    ``HERMES_ALLOW_VULNERABLE_SQLITE_WAL=1`` restores upstream's keep-WAL-and-warn behaviour. Otherwise set DELETE
+    without waiting out openers and warn; an explicit operator request additionally verifies SQLite accepted DELETE."""
     current = _on_disk_journal_mode(conn)
     if current == "wal":
+        _refuse_vulnerable_wal(db_label, indeterminate=False)
         _log_wal_reset_bug_once(db_label, kept_wal=True)
         if require_delete:
             # Upgrading SQLite doesn't help here; emit the actionable message last.
@@ -444,6 +472,7 @@ def _apply_delete_for_wal_reset_bug(conn: sqlite3.Connection, *, db_label: str, 
     if current is None:
         if require_delete:
             raise sqlite3.OperationalError(_CANNOT_VERIFY_DELETE_MSG)
+        _refuse_vulnerable_wal(db_label, indeterminate=True)
         _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
         return "wal"
     actual = ""
