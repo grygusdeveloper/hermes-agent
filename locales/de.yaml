@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "Modellwechsel zu {model} fehlgeschlagen ({error}); {current} bleibt aktiv."
     err_config_not_updated: "config.yaml nicht aktualisiert ({error})"
     err_stale_override: "in config.yaml gespeichert, aber der veraltete Sitzungs-Override wurde nicht gelöscht ({error})"
+    err_reasoning_alias_global: "Reasoning-Modellaliase sind Sitzungsvoreinstellungen. Wähle einen ohne `--global`."
+    reasoning_preset: "🧠 Reasoning-Aufwand `{effort}` aus dem Alias (nur diese Sitzung)"
     next_turn_only: "    (nur nächster Zug — wird nach einer Antwort zurückgesetzt)"
     switch_cancelled: "🟡 Modellwechsel abgebrochen. Aktuelles Modell unverändert ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Text-Rückfall: Antworten Sie mit `{prefix}approve`, um zu wechseln, oder mit `{prefix}cancel`, um das aktuelle Modell zu behalten._"

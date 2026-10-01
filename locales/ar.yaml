@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "فشل التبديل إلى النموذج {model} ({error})؛ سنبقى على {current}."
     err_config_not_updated: "لم يُحدَّث config.yaml ({error})"
     err_stale_override: "تم الحفظ في config.yaml، لكن لم يُمسح تجاوز الجلسة القديم ({error})"
+    err_reasoning_alias_global: "أسماء النماذج المستعارة ذات الاستدلال إعدادات مسبقة للجلسة. اختر واحدًا بدون `--global`."
+    reasoning_preset: "🧠 جهد الاستدلال `{effort}` من الاسم المستعار (للجلسة فقط)"
     next_turn_only: "    (للدور التالي فقط — يُستعاد بعد ردّ واحد)"
     switch_cancelled: "🟡 أُلغي تبديل النموذج. النموذج الحالي لم يتغيّر ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_بديل نصي: أرسل `{prefix}approve` للتبديل أو `{prefix}cancel` للإبقاء على النموذج الحالي._"

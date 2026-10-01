@@ -141,6 +141,34 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     assert route["runtime"]["capabilities"] == {"openai_native_compaction": True}
 
 
+def test_alias_reasoning_preset_rehydrates_with_model_override(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    store.set_model_override(session_key, {**OVERRIDE, "reasoning_effort": "xhigh"})
+
+    runner = _make_runner(store_factory())
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "api_key": "sk-fresh-from-keychain",
+            "api_mode": "responses",
+            "base_url": "https://api.openai.example/v1",
+            "provider": "openai",
+        },
+    ):
+        runner._rehydrate_session_model_override(session_key)
+
+    conversation = runner._session_state(session_key).conversation
+    assert conversation.model_override["reasoning_effort"] == "xhigh"
+    assert conversation.reasoning_override == {"enabled": True, "effort": "xhigh"}
+    assert conversation.reasoning_override_owner == "model_alias"
+    assert runner._resolve_session_reasoning_config(session_key=session_key) == {
+        "enabled": True, "effort": "xhigh",
+    }
+
+
+
 def test_rehydrate_llamacpp_override_follows_live_managed_port(store_factory):
     """The managed llama.cpp supervisor may come back on an ephemeral port (18434 busy). The persisted
     loopback URL is a snapshot of the previous boot, so rehydration must take the live endpoint."""
@@ -224,3 +252,12 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+    assert sanitize_model_override({**OVERRIDE, "reasoning_effort": "xhigh"}) == {
+        "model": "gpt-5o",
+        "provider": "openai",
+        "base_url": "https://api.openai.example/v1",
+        "reasoning_effort": "xhigh",
+    }
+    invalid = sanitize_model_override({**OVERRIDE, "reasoning_effort": "xhgh"})
+    assert invalid is not None
+    assert "reasoning_effort" not in invalid

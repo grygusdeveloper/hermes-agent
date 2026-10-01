@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "Не вдалося перемкнути модель на {model} ({error}); залишаємось на {current}."
     err_config_not_updated: "config.yaml не оновлено ({error})"
     err_stale_override: "збережено в config.yaml, але застаріле перевизначення сеансу не вдалося скинути ({error})"
+    err_reasoning_alias_global: "Псевдоніми моделей із міркуванням — це пресети сеансу. Виберіть псевдонім без `--global`."
+    reasoning_preset: "🧠 Рівень міркування `{effort}` із псевдоніма (лише цей сеанс)"
     next_turn_only: "    (лише на наступний хід — відновиться після однієї відповіді)"
     switch_cancelled: "🟡 Перемикання моделі скасовано. Поточна модель без змін ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Текстова альтернатива: відповідайте `{prefix}approve`, щоб перемкнути, або `{prefix}cancel`, щоб залишити поточну модель._"

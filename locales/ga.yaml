@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "Theip ar athrú go dtí an tsamhail {model} ({error}); ag fanacht ar {current}."
     err_config_not_updated: "níor nuashonraíodh config.yaml ({error})"
     err_stale_override: "sábháilte i config.yaml, ach níor glanadh an sárú seisiúin seanchaite ({error})"
+    err_reasoning_alias_global: "Is réamhshocruithe seisiúin iad ailiasanna samhla réasúnaíochta. Roghnaigh ceann gan `--global`."
+    reasoning_preset: "🧠 Iarracht réasúnaíochta `{effort}` ón ailias (an seisiún seo amháin)"
     next_turn_only: "    (an chéad seal eile amháin — filleann sé tar éis freagra amháin)"
     switch_cancelled: "🟡 Athrú samhla cealaithe. Samhail reatha gan athrú ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Cúltaca téacs: freagair `{prefix}approve` chun athrú nó `{prefix}cancel` chun an tsamhail reatha a choinneáil._"

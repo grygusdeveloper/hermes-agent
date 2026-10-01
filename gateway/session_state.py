@@ -45,6 +45,9 @@ class ConversationState:
     model_override: Optional[Dict[str, Any]] = None  # /model per-session override
     one_turn_restore: Optional[Dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[Dict[str, Any]] = None  # /reasoning override
+    # "model_alias" when a /model reasoning-alias preset installed reasoning_override (cleared when the
+    # model changes again); None = explicit /reasoning ownership (or no override).
+    reasoning_override_owner: Optional[str] = None
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent
     last_resolved_model: str = ""  # last successfully-resolved non-empty model
     queued_events: List[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)

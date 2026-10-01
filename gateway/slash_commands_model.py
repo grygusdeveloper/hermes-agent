@@ -114,6 +114,9 @@ class _ModelSwitchContext:
             self.current_base_url = override.get("base_url", self.current_base_url)
             self.current_api_key = override.get("api_key", self.current_api_key)
 
+    def alias_reasoning_preset(self, result) -> str:
+        """The reasoning preset the picked alias carries, unless a typed ``--reasoning`` overrides it."""
+        return "" if self.reasoning_effort else (getattr(result, "reasoning_effort", "") or "")
 
 
 _TEXT_LISTING_MODELS = 5
@@ -236,12 +239,18 @@ class GatewayModelCommandsMixin:
             f"{'This override applies to the next turn only. ' if one_turn else ''}"
             f"Adjust your self-identification accordingly.]"
         )
+        preset = ctx.alias_reasoning_preset(result)
         self._session_model_overrides[ctx.session_key] = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
+            # Persisted with the override so the alias preset survives a restart (rehydration re-applies it).
+            **({"reasoning_effort": preset} if preset else {}),
         }
+        # A reasoning alias installs its preset as session reasoning; any other pick retires a preset an
+        # earlier alias installed. An explicit /reasoning choice is left alone either way.
+        self._apply_model_alias_reasoning_override(ctx.session_key, preset)
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
             # command's snapshot is the first temporary model, not the user's standing override.
@@ -341,6 +350,8 @@ class GatewayModelCommandsMixin:
             lines.append(t("gateway.model.saved_global"))
         elif one_turn:
             lines.append(t("gateway.model.next_turn_only"))
+        elif preset := ctx.alias_reasoning_preset(result):
+            lines.append(t("gateway.model.reasoning_preset", effort=preset))
         else:
             lines.append(t("gateway.model.session_only_hint"))
         return "\n".join(lines)
@@ -595,6 +606,12 @@ class GatewayModelCommandsMixin:
         result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
         if error is not None:
             return error
+        if result.reasoning_effort:
+            # Reasoning aliases are session presets: `--global` would persist only the bare model ID.
+            if request.is_global:
+                return t("gateway.model.err_reasoning_alias_global")
+            # A persist-by-default config must not collapse the preset to a bare global model either.
+            ctx.persist_global = False
         guard_fired, guard_reply = await self._model_selection_guard_reply(event, ctx, result)
         if guard_fired:
             return guard_reply
@@ -683,8 +700,11 @@ class GatewayModelCommandsMixin:
             return False
 
     def _set_reasoning_override(self, session_key: str, value) -> None:
-        """Store (or clear with None) the session reasoning override and drop the cached agent."""
+        """Store (or clear with None) an explicit session reasoning override and drop the cached agent.
+        The explicit choice takes ownership from any /model alias preset."""
         self._set_session_reasoning_override(session_key, value)
+        if session_key:
+            self._session_state(session_key).conversation.reasoning_override_owner = None
         self._evict_cached_agent(session_key)
 
     def _apply_reasoning_selection(
@@ -703,9 +723,8 @@ class GatewayModelCommandsMixin:
         if value == "reset":
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
-            self._set_session_reasoning_override(session_key, None)
+            self._set_reasoning_override(session_key, None)
             self._reasoning_config = self._load_reasoning_config()
-            self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
 
         parsed = parse_reasoning_effort(value)

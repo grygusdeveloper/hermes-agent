@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "{model} modeline geçiş başarısız oldu ({error}); {current} modelinde kalınıyor."
     err_config_not_updated: "config.yaml güncellenmedi ({error})"
     err_stale_override: "config.yaml'a kaydedildi, ancak eski oturum geçersiz kılması temizlenemedi ({error})"
+    err_reasoning_alias_global: "Akıl yürütmeli model takma adları oturum ön ayarlarıdır. `--global` olmadan birini seçin."
+    reasoning_preset: "🧠 Takma addan akıl yürütme düzeyi `{effort}` (yalnızca bu oturum)"
     next_turn_only: "    (yalnızca sonraki tur — bir yanıttan sonra geri döner)"
     switch_cancelled: "🟡 Model değişikliği iptal edildi. Geçerli model değişmedi ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Metin alternatifi: geçmek için `{prefix}approve`, geçerli modeli korumak için `{prefix}cancel` yazın._"

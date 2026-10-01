@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "Passaggio al modello {model} non riuscito ({error}); resto su {current}."
     err_config_not_updated: "config.yaml non aggiornato ({error})"
     err_stale_override: "salvato in config.yaml, ma l'override obsoleto della sessione non è stato rimosso ({error})"
+    err_reasoning_alias_global: "Gli alias di modello con ragionamento sono preimpostazioni di sessione. Scegline uno senza `--global`."
+    reasoning_preset: "🧠 Sforzo di ragionamento `{effort}` dall'alias (solo questa sessione)"
     next_turn_only: "    (solo per il prossimo turno — viene ripristinato dopo una risposta)"
     switch_cancelled: "🟡 Cambio di modello annullato. Modello attuale invariato ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Fallback testuale: rispondi `{prefix}approve` per cambiare o `{prefix}cancel` per mantenere il modello attuale._"

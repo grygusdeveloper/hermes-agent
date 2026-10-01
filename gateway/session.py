@@ -477,7 +477,8 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
 
 
 # /model override keys safe to persist; ``api_key``/``api_mode`` must NEVER reach sessions.json.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+# ``reasoning_effort`` is a reasoning-alias preset, re-applied on rehydration.
+PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url", "reasoning_effort")
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -488,6 +489,10 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    if "reasoning_effort" in cleaned:
+        from hermes_constants import parse_reasoning_effort
+        if parse_reasoning_effort(cleaned["reasoning_effort"]) is None:
+            del cleaned["reasoning_effort"]
     return cleaned or None
 
 

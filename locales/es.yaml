@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "El cambio al modelo {model} falló ({error}); se mantiene {current}."
     err_config_not_updated: "config.yaml no se actualizó ({error})"
     err_stale_override: "guardado en config.yaml, pero no se pudo borrar la anulación obsoleta de la sesión ({error})"
+    err_reasoning_alias_global: "Los alias de modelo con razonamiento son ajustes de sesión. Elige uno sin `--global`."
+    reasoning_preset: "🧠 Esfuerzo de razonamiento `{effort}` del alias (solo esta sesión)"
     next_turn_only: "    (solo el próximo turno: se restaura tras una respuesta)"
     switch_cancelled: "🟡 Cambio de modelo cancelado. El modelo actual no cambia ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Alternativa en texto: responde `{prefix}approve` para cambiar o `{prefix}cancel` para conservar el modelo actual._"

@@ -179,6 +179,9 @@ class DirectAlias(NamedTuple):
     provider's secret to an unrelated third party. Both default so positional
     ``DirectAlias(model, provider, base_url)`` keeps working.
 
+    ``reasoning_effort`` is an optional preset (``model_aliases.<name>.reasoning_effort``) the
+    gateway applies as session-scoped reasoning when the alias itself is picked.
+
     See #83612.
     """
     model: str
@@ -186,6 +189,7 @@ class DirectAlias(NamedTuple):
     base_url: str
     api_key: str = ""
     key_env: str = ""
+    reasoning_effort: str = ""
 
 
 # Built-in direct aliases (extended via config.yaml model_aliases:)
@@ -195,6 +199,13 @@ _BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
 def _clean(value: Any) -> str:
     """``str(value or "").strip()`` — the config-field normaliser used throughout this module."""
     return str(value or "").strip()
+
+
+def _alias_reasoning_effort(entry: dict) -> str:
+    """An alias entry's validated reasoning preset (``reasoning_effort``, or ``reasoning``), else ""."""
+    from hermes_constants import parse_reasoning_effort
+    effort = _clean(entry.get("reasoning_effort") or entry.get("reasoning")).lower()
+    return effort if effort and parse_reasoning_effort(effort) is not None else ""
 
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
@@ -223,7 +234,7 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                     merged[name.strip().lower()] = DirectAlias(
                         model=entry.get("model", ""), provider=entry.get("provider", "custom"),
                         base_url=entry.get("base_url", ""), api_key=_clean(entry.get("api_key", "")),
-                        key_env=_clean(entry.get("key_env", "")))
+                        key_env=_clean(entry.get("key_env", "")), reasoning_effort=_alias_reasoning_effort(entry))
 
         model_section = cfg.get("model", {})
         simple_aliases = model_section.get("aliases") if isinstance(model_section, dict) else None
@@ -240,7 +251,8 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                             model=model, provider=_clean(value.get("provider")) or current_provider or "custom",
                             base_url=_clean(value.get("base_url", "")),
                             api_key=_clean(value.get("api_key", "")),
-                            key_env=_clean(value.get("key_env", "")))
+                            key_env=_clean(value.get("key_env", "")),
+                            reasoning_effort=_alias_reasoning_effort(value))
                 elif isinstance(value, str) and value.strip():
                     val = value.strip()
                     provider, model = val.split("/", 1) if "/" in val else (current_provider, val)
@@ -454,6 +466,8 @@ class ModelSwitchResult:
     warning_message: str = ""
     provider_label: str = ""
     resolved_via_alias: str = ""
+    # Reasoning preset of the exact alias picked (validated level word), else "".
+    reasoning_effort: str = ""
     capabilities: Optional[ModelCapabilities] = None
     runtime_capabilities: Optional[dict[str, bool]] = None
     model_info: Optional[ModelInfo] = None
@@ -1183,6 +1197,7 @@ class _Switch:
     new_model: str = ""
     target_provider: str = ""
     resolved_alias: str = ""
+    reasoning_effort: str = ""
     provider_label: str = ""
     api_key: str = ""
     base_url: str = ""
@@ -1583,6 +1598,10 @@ def _resolve_switch_credentials(st: _Switch) -> Optional[ModelSwitchResult]:
         da = DIRECT_ALIASES.get(st.resolved_alias)
         if da is not None and da.base_url:
             _apply_direct_alias_endpoint(st, da)
+        # A full model ID can reverse-resolve to one of several aliases on that model: only an exact
+        # alias input carries a reasoning preset, so config order never silently picks an effort.
+        if da is not None and da.reasoning_effort and st.raw_input.strip().lower() == st.resolved_alias.lower():
+            st.reasoning_effort = da.reasoning_effort
 
     # Fills an empty mode (alias cleared it) and overrides a STALE mode carried from previous
     # session state when the host mandates one wire protocol (e.g. gpt-5.x on api.openai.com
@@ -1732,7 +1751,8 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
         success=True, new_model=st.new_model, target_provider=st.target_provider,
         provider_changed=st.provider_changed, api_key=st.api_key, base_url=st.base_url, api_mode=st.api_mode,
         request_overrides=dict(request_overrides or {}), warning_message=" | ".join(warnings) if warnings else "",
-        provider_label=st.provider_label, resolved_via_alias=st.resolved_alias, capabilities=capabilities,
+        provider_label=st.provider_label, resolved_via_alias=st.resolved_alias, reasoning_effort=st.reasoning_effort,
+        capabilities=capabilities,
         runtime_capabilities={
             k: v for k, v in runtime_capabilities.items() if isinstance(k, str) and isinstance(v, bool)},
         model_info=model_info, is_global=st.is_global)

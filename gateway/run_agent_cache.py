@@ -159,7 +159,7 @@ class GatewayAgentCacheMixin:
             return
         if not persisted:
             return
-        override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
+        override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url", "reasoning_effort")}
         provider = persisted.get("provider")
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
         if is_foreign_provider_endpoint(provider, override.get("base_url")):
@@ -189,6 +189,7 @@ class GatewayAgentCacheMixin:
                     "(provider=%s); using credential-less override", provider, exc_info=True,
                 )
         self._session_state(session_key).conversation.model_override = override
+        self._apply_model_alias_reasoning_override(session_key, persisted.get("reasoning_effort"))
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",
@@ -226,10 +227,34 @@ class GatewayAgentCacheMixin:
             runtime_kwargs["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
         return model, runtime_kwargs
 
+    def _apply_model_alias_reasoning_override(self, session_key: str, reasoning_effort: Optional[str]) -> None:
+        """Install the reasoning preset of a /model alias (owned by the alias), or — for a model
+        without one — retire a preset an earlier alias installed. An explicit /reasoning choice is
+        never touched by a model change."""
+        if not session_key:
+            return
+        conversation = self._session_state(session_key).conversation
+        if reasoning_effort:
+            from hermes_constants import parse_reasoning_effort
+            reasoning = parse_reasoning_effort(reasoning_effort)
+            if reasoning is not None:
+                self._set_session_reasoning_override(session_key, reasoning)
+                conversation.reasoning_override_owner = "model_alias"
+                return
+        if conversation.reasoning_override_owner == "model_alias":
+            self._set_session_reasoning_override(session_key, None)
+            conversation.reasoning_override_owner = None
+
     def _snapshot_session_model_override(self, session_key: str) -> dict:
-        """Capture a gateway session override before a one-turn switch."""
+        """Capture a gateway session override (and its reasoning state) before a one-turn switch."""
         override = self._session_model_override(session_key)
-        return {"had_override": override is not None, "override": dict(override) if override is not None else None}
+        state = self._peek_session_state(session_key)
+        reasoning = state.conversation.reasoning_override if state is not None else None
+        return {
+            "had_override": override is not None, "override": dict(override) if override is not None else None,
+            "reasoning_override": dict(reasoning) if reasoning is not None else None,
+            "reasoning_override_owner": state.conversation.reasoning_override_owner if state is not None else None,
+        }
 
     def _claim_one_turn_restore(self, session_key: str, snapshot: Optional[dict] = None) -> None:
         """Arm the one-shot restore snapshot for ``/model --once`` / ``/moa``. A repeated one-shot
@@ -242,13 +267,22 @@ class GatewayAgentCacheMixin:
             conv.one_turn_restore = dict(snapshot) if snapshot is not None else self._snapshot_session_model_override(session_key)
 
     def _restore_session_model_override(self, session_key: str, snapshot: dict) -> None:
-        """Restore the session override captured before a one-turn switch."""
+        """Restore the session override captured before a one-turn switch. Reasoning state is restored
+        only when a /model alias preset owned it on either side of the window, so an explicit
+        /reasoning choice made during the one-turn window survives."""
         if not session_key:
             return
         if snapshot.get("had_override"):
             self._session_state(session_key).conversation.model_override = dict(snapshot.get("override") or {})
         elif (state := self._peek_session_state(session_key)) is not None:
             state.conversation.model_override = None
+        state = self._peek_session_state(session_key)
+        if state is not None and "reasoning_override" in snapshot and "model_alias" in (
+            state.conversation.reasoning_override_owner, snapshot.get("reasoning_override_owner")
+        ):
+            reasoning = snapshot.get("reasoning_override")
+            state.conversation.reasoning_override = dict(reasoning) if reasoning is not None else None
+            state.conversation.reasoning_override_owner = snapshot.get("reasoning_override_owner")
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent: Any, config_model: str) -> bool:

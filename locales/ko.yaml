@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "{model}(으)로 모델 전환에 실패했어요({error}). {current}을(를) 계속 사용해요."
     err_config_not_updated: "config.yaml이 업데이트되지 않았어요({error})"
     err_stale_override: "config.yaml에 저장했지만 오래된 세션 재정의를 지우지 못했어요({error})"
+    err_reasoning_alias_global: "추론 모델 별칭은 세션 프리셋이에요. `--global` 없이 선택해 주세요."
+    reasoning_preset: "🧠 별칭의 추론 강도 `{effort}` (이 세션에만 적용)"
     next_turn_only: "    (다음 턴에만 적용 — 응답 한 번 후 복원돼요)"
     switch_cancelled: "🟡 모델 전환이 취소됐어요. 현재 모델은 그대로예요({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_텍스트로 답하려면: 전환은 `{prefix}approve`, 현재 모델 유지는 `{prefix}cancel`이라고 답해 주세요._"

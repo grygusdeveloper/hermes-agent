@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "Modelwisseling na {model} het misluk ({error}); bly op {current}."
     err_config_not_updated: "config.yaml nie opgedateer nie ({error})"
     err_stale_override: "in config.yaml gestoor, maar die verouderde sessie-oorskrywing is nie verwyder nie ({error})"
+    err_reasoning_alias_global: "Redeneer-modelaliasse is sessie-voorinstellings. Kies een sonder `--global`."
+    reasoning_preset: "🧠 Redeneer-inspanning `{effort}` van die alias (slegs sessie)"
     next_turn_only: "    (slegs volgende beurt — herstel na een antwoord)"
     switch_cancelled: "🟡 Modelwisseling gekanselleer. Huidige model onveranderd ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Teks-alternatief: antwoord `{prefix}approve` om te wissel of `{prefix}cancel` om die huidige model te behou._"

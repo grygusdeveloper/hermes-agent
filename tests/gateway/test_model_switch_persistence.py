@@ -256,6 +256,88 @@ class TestOneTurnModelOverrideRestore:
 
         assert runner._session_model_overrides[sk] == previous
 
+    def test_restores_reasoning_state_owned_before_one_turn_alias(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._set_session_reasoning_override(sk, {"enabled": True, "effort": "medium"})
+
+        snapshot = runner._snapshot_session_model_override(sk)
+        runner._apply_model_alias_reasoning_override(sk, "xhigh")
+        assert runner._session_state(sk).conversation.reasoning_override_owner == "model_alias"
+
+        runner._restore_session_model_override(sk, snapshot)
+
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override == {"enabled": True, "effort": "medium"}
+        assert conversation.reasoning_override_owner is None
+
+    def test_restore_brings_back_the_alias_preset_a_one_turn_model_retired(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._apply_model_alias_reasoning_override(sk, "xhigh")
+
+        snapshot = runner._snapshot_session_model_override(sk)
+        runner._apply_model_alias_reasoning_override(sk, "")  # plain --once model
+        assert runner._session_state(sk).conversation.reasoning_override is None
+
+        runner._restore_session_model_override(sk, snapshot)
+
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override == {"enabled": True, "effort": "xhigh"}
+        assert conversation.reasoning_override_owner == "model_alias"
+
+    def test_explicit_reasoning_set_during_a_one_shot_window_survives_restore(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._evict_cached_agent = lambda _sk: None
+
+        snapshot = runner._snapshot_session_model_override(sk)
+        runner._set_reasoning_override(sk, {"enabled": True, "effort": "high"})  # /reasoning high
+
+        runner._restore_session_model_override(sk, snapshot)
+
+        assert runner._session_state(sk).conversation.reasoning_override == {"enabled": True, "effort": "high"}
+
+
+class TestModelAliasReasoningLifecycle:
+    def test_alias_transition_then_ordinary_model_clears_only_alias_owned_state(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+
+        runner._apply_model_alias_reasoning_override(sk, "high")
+        runner._apply_model_alias_reasoning_override(sk, "xhigh")
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override == {"enabled": True, "effort": "xhigh"}
+        assert conversation.reasoning_override_owner == "model_alias"
+
+        runner._apply_model_alias_reasoning_override(sk, None)
+        assert conversation.reasoning_override is None
+        assert conversation.reasoning_override_owner is None
+
+    def test_ordinary_model_switch_preserves_explicit_reasoning_choice(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._set_session_reasoning_override(sk, {"enabled": True, "effort": "high"})
+
+        runner._apply_model_alias_reasoning_override(sk, None)
+
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override == {"enabled": True, "effort": "high"}
+        assert conversation.reasoning_override_owner is None
+
+    def test_explicit_reasoning_takes_ownership_from_an_alias_preset(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._evict_cached_agent = lambda _sk: None
+        runner._apply_model_alias_reasoning_override(sk, "xhigh")
+
+        runner._set_reasoning_override(sk, {"enabled": True, "effort": "low"})  # /reasoning low
+        runner._apply_model_alias_reasoning_override(sk, None)  # then a plain /model pick
+
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override == {"enabled": True, "effort": "low"}
+        assert conversation.reasoning_override_owner is None
+
 
 class TestOneTurnNeverPersisted:
     """/model --once must never write through to the session store.
@@ -363,4 +445,98 @@ class TestOneTurnNeverPersisted:
         # The second producer call snapshotted the live gpt-5.5 override; the pending restore
         # must still be the ORIGINAL "no override" state.
         assert runner._pending_one_turn_model_restores[sk]["had_override"] is False
+
+    @staticmethod
+    def _switch_to_reasoning_alias(monkeypatch):
+        from hermes_cli.model_switch import ModelSwitchResult
+
+        monkeypatch.setattr(
+            "hermes_cli.model_switch.switch_model",
+            lambda **kw: ModelSwitchResult(
+                success=True,
+                new_model="gpt-5.6-sol",
+                target_provider="openai-codex",
+                reasoning_effort="xhigh",
+                provider_label="OpenAI Codex",
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_reasoning_alias_global_is_rejected_before_state_change(self, tmp_path, monkeypatch):
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        self._switch_to_reasoning_alias(monkeypatch)
+        config_path = tmp_path / ".hermes" / "config.yaml"
+        before = config_path.read_text()
+
+        result = await runner._handle_model_command(self._event("/model sol-xhigh --global"))
+
+        assert result is not None and "--global" in result
+        assert not runner._session_model_overrides
+        assert config_path.read_text() == before
+        runner.async_session_store.set_model_override.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reasoning_alias_session_path_applies_and_persists_effort(self, tmp_path, monkeypatch):
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        self._switch_to_reasoning_alias(monkeypatch)
+        sk = build_session_key(_make_source())
+
+        result = await runner._handle_model_command(self._event("/model sol-xhigh --session"))
+
+        assert result is not None and "gpt-5.6-sol" in result and "xhigh" in result
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override == {"enabled": True, "effort": "xhigh"}
+        assert conversation.reasoning_override_owner == "model_alias"
+        persisted = runner.async_session_store.set_model_override.await_args.args[1]
+        assert persisted["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_plain_reasoning_alias_forces_session_scope_when_default_persists(self, tmp_path, monkeypatch):
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        self._switch_to_reasoning_alias(monkeypatch)
+        monkeypatch.setattr("hermes_cli.model_switch.resolve_persist_behavior", lambda *a, **k: True)
+        config_path = tmp_path / ".hermes" / "config.yaml"
+        before = config_path.read_text()
+        sk = build_session_key(_make_source())
+
+        result = await runner._handle_model_command(self._event("/model sol-xhigh"))
+
+        assert result is not None and "session" in result.lower()
+        assert config_path.read_text() == before
+        assert runner._session_state(sk).conversation.reasoning_override == {"enabled": True, "effort": "xhigh"}
+        persisted = runner.async_session_store.set_model_override.await_args.args[1]
+        assert persisted["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_typed_reasoning_flag_wins_over_the_alias_preset(self, tmp_path, monkeypatch):
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        self._switch_to_reasoning_alias(monkeypatch)
+        sk = build_session_key(_make_source())
+
+        await runner._handle_model_command(self._event("/model sol-xhigh --session --reasoning low"))
+
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override == {"enabled": True, "effort": "low"}
+        assert conversation.reasoning_override_owner is None
+        persisted = runner.async_session_store.set_model_override.await_args.args[1]
+        assert "reasoning_effort" not in persisted
+
+    @pytest.mark.asyncio
+    async def test_plain_model_after_reasoning_alias_retires_the_preset(self, tmp_path, monkeypatch):
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        self._switch_to_reasoning_alias(monkeypatch)
+        sk = build_session_key(_make_source())
+        await runner._handle_model_command(self._event("/model sol-xhigh --session"))
+        assert runner._session_state(sk).conversation.reasoning_override_owner == "model_alias"
+        from hermes_cli.model_switch import ModelSwitchResult
+        monkeypatch.setattr(
+            "hermes_cli.model_switch.switch_model",
+            lambda **kw: ModelSwitchResult(success=True, new_model="gpt-5.5", target_provider="openrouter"),
+        )
+
+        await runner._handle_model_command(self._event("/model gpt-5.5 --session"))
+
+        conversation = runner._session_state(sk).conversation
+        assert conversation.reasoning_override is None
+        assert conversation.reasoning_override_owner is None
 

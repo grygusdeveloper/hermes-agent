@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "A(z) {model} modellre váltás nem sikerült ({error}); marad: {current}."
     err_config_not_updated: "a config.yaml nem frissült ({error})"
     err_stale_override: "a config.yaml-be mentve, de az elavult munkamenet-felülírás nem törlődött ({error})"
+    err_reasoning_alias_global: "Az érvelési modellálnevek munkamenet-beállítások. Válassz egyet `--global` nélkül."
+    reasoning_preset: "🧠 Érvelési szint `{effort}` az álnévből (csak ebben a munkamenetben)"
     next_turn_only: "    (csak a következő körre — egy válasz után visszaáll)"
     switch_cancelled: "🟡 Modellváltás megszakítva. A jelenlegi modell változatlan ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Szöveges mód: írd be: `{prefix}approve` a váltáshoz, `{prefix}cancel` a jelenlegi modell megtartásához._"

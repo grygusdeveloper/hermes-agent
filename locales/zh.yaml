@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "切换到模型 {model} 失败（{error}）；继续使用 {current}。"
     err_config_not_updated: "config.yaml 未更新（{error}）"
     err_stale_override: "已保存到 config.yaml，但过期的会话覆盖未被清除（{error}）"
+    err_reasoning_alias_global: "推理模型别名是会话预设。请不要加 `--global` 选择。"
+    reasoning_preset: "🧠 别名的推理强度 `{effort}`（仅限本会话）"
     next_turn_only: "    （仅下一回合生效——一次响应后恢复）"
     switch_cancelled: "🟡 已取消切换模型。当前模型不变（{model}）。"
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_文字回退方式：回复 `{prefix}approve` 切换，或回复 `{prefix}cancel` 保留当前模型。_"

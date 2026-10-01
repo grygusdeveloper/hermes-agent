@@ -70,6 +70,8 @@ gateway:
     err_switch_failed: "モデルを {model} に切り替えられませんでした ({error})。{current} を継続します。"
     err_config_not_updated: "config.yaml を更新できませんでした ({error})"
     err_stale_override: "config.yaml に保存しましたが、古いセッションの上書き設定をクリアできませんでした ({error})"
+    err_reasoning_alias_global: "推論付きのモデルエイリアスはセッション用のプリセットです。`--global` なしで選んでください。"
+    reasoning_preset: "🧠 エイリアスの推論レベル `{effort}`（このセッションのみ）"
     next_turn_only: "    (次のターンのみ — 1 回応答した後に元へ戻ります)"
     switch_cancelled: "🟡 モデルの切り替えをキャンセルしました。現在のモデルは変わりません ({model})。"
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_テキスト代替: 切り替えるには `{prefix}approve`、現在のモデルを維持するには `{prefix}cancel` と返信してください。_"
