@@ -130,6 +130,45 @@ def test_malformed_and_empty_input_never_raises():
     assert cleaned == "hi"
 
 
+def test_unescaped_structured_arguments_are_repaired():
+    """Exact malformed shape seen in production: the arguments object is wrapped
+    in string quotes without escaping its own quotes."""
+    calls, cleaned = extract_tool_calls_from_text(
+        '<tool_call>{"id": "call_find_rei_3", "type": "function", '
+        '"function": {"name": "search_files", "arguments": '
+        '"{"pattern": "*rei*", "target": "files", '
+        '"path": "/root/workspace", "limit": 60}"}}</tool_call>'
+    )
+    assert cleaned == ""
+    assert [(c.id, c.function.name) for c in calls] == [("call_find_rei_3", "search_files")]
+    assert json.loads(calls[0].function.arguments) == {
+        "pattern": "*rei*", "target": "files", "path": "/root/workspace", "limit": 60,
+    }
+
+
+def test_unescaped_arguments_with_nested_strings_are_repaired():
+    calls, cleaned = extract_tool_calls_from_text(
+        '<tool_call>{"id": "call_rei_locate_final", "type": "function", '
+        '"function": {"name": "terminal", "arguments": '
+        '"{"command": "echo \\"}\\" && ls -la /root/assets/", "timeout": 30}"}}</tool_call>'
+    )
+    assert cleaned == ""
+    assert [c.function.name for c in calls] == ["terminal"]
+    assert json.loads(calls[0].function.arguments) == {
+        "command": 'echo "}" && ls -la /root/assets/', "timeout": 30,
+    }
+
+
+def test_unrepairable_arguments_are_still_dropped():
+    calls, cleaned = extract_tool_calls_from_text(
+        '<tool_call>{"id": "c1", "type": "function", "function": '
+        '{"name": "terminal", "arguments": "{"command": "ls"}</tool_call>after'
+    )
+    assert calls == []
+    assert cleaned == "after"
+
+
+
 # ── streaming shape ──────────────────────────────────────────────────────────
 
 

@@ -114,12 +114,59 @@ def render_tool_bridge_sections(
     return sections
 
 
+_UNESCAPED_ARGUMENTS_RE = re.compile(r'"arguments"\s*:\s*"(?=[{[])')
+_CLOSERS = {"{": "}", "[": "]"}
+
+
+def _repair_unescaped_structured_arguments(raw_json: str) -> str | None:
+    """Repair ``"arguments": "{...}"`` whose inner JSON was not escaped, else None.
+
+    Models occasionally emit the arguments object inside a quoted string without escaping its quotes:
+    the outer tool-call JSON is then invalid although the arguments object itself is valid. Drop only
+    that redundant wrapper quote pair; ``_parse_tool_call`` re-serializes the dict canonically."""
+    marker = _UNESCAPED_ARGUMENTS_RE.search(raw_json)
+    if marker is None:
+        return None
+    start = marker.end()
+    stack: list[str] = []
+    in_string = escaped = False
+    end = -1
+    for index in range(start, len(raw_json)):
+        char = raw_json[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in _CLOSERS:
+            stack.append(_CLOSERS[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+            if not stack:
+                end = index
+                break
+    if end < 0 or end + 1 >= len(raw_json) or raw_json[end + 1] != '"':
+        return None
+    # ``start - 1`` is the redundant opening quote; ``end + 1`` its matching closing quote.
+    return raw_json[: start - 1] + raw_json[start : end + 1] + raw_json[end + 2 :]
+
+
 def _parse_tool_call(raw_json: str, ordinal: int) -> ChatCompletionMessageToolCall | None:
     """One ``<tool_call>`` JSON body → tool call, or None when malformed. Missing id → ``acp_call_<ordinal>``."""
     try:
         obj = json.loads(raw_json)
     except Exception:
-        return None
+        repaired = _repair_unescaped_structured_arguments(raw_json)
+        if repaired is None:
+            return None
+        try:
+            obj = json.loads(repaired)
+        except Exception:
+            return None
     named = _named_function(obj)
     if named is None:
         return None
