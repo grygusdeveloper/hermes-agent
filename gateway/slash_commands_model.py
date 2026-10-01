@@ -119,6 +119,12 @@ class _ModelSwitchContext:
         return "" if self.reasoning_effort else (getattr(result, "reasoning_effort", "") or "")
 
 
+def _alias_reasoning_preset(ctx, result) -> str:
+    """``ctx.alias_reasoning_preset(result)``, or no preset for callers that pass a bare context namespace."""
+    preset = getattr(ctx, "alias_reasoning_preset", None)
+    return preset(result) if callable(preset) else ""
+
+
 _TEXT_LISTING_MODELS = 5
 
 
@@ -239,7 +245,7 @@ class GatewayModelCommandsMixin:
             f"{'This override applies to the next turn only. ' if one_turn else ''}"
             f"Adjust your self-identification accordingly.]"
         )
-        preset = ctx.alias_reasoning_preset(result)
+        preset = _alias_reasoning_preset(ctx, result)
         self._session_model_overrides[ctx.session_key] = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
@@ -250,7 +256,8 @@ class GatewayModelCommandsMixin:
         }
         # A reasoning alias installs its preset as session reasoning; any other pick retires a preset an
         # earlier alias installed. An explicit /reasoning choice is left alone either way.
-        self._apply_model_alias_reasoning_override(ctx.session_key, preset)
+        if hasattr(self, "_apply_model_alias_reasoning_override"):
+            self._apply_model_alias_reasoning_override(ctx.session_key, preset)
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
             # command's snapshot is the first temporary model, not the user's standing override.
@@ -350,7 +357,7 @@ class GatewayModelCommandsMixin:
             lines.append(t("gateway.model.saved_global"))
         elif one_turn:
             lines.append(t("gateway.model.next_turn_only"))
-        elif preset := ctx.alias_reasoning_preset(result):
+        elif preset := _alias_reasoning_preset(ctx, result):
             lines.append(t("gateway.model.reasoning_preset", effort=preset))
         else:
             lines.append(t("gateway.model.session_only_hint"))
