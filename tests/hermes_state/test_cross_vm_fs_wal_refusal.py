@@ -104,6 +104,8 @@ class TestWalRefusalOnCrossVmFs:
         # reporter with a corrupting state.db and no signal. Keep WAL (never live-downgrade) but say so, once.
         # The WAL-reset-vulnerable SQLite path (Debian/Ubuntu system Pythons) returns early too and must not be silent.
         monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda *a, **k: wal_reset_vulnerable)
+        if wal_reset_vulnerable:  # the fork refuses this path by default; the override keeps upstream's keep-WAL path
+            monkeypatch.setenv("HERMES_ALLOW_VULNERABLE_SQLITE_WAL", "1")
         db = tmp_path / "already-wal.db"
         seed = sqlite3.connect(str(db))
         if str(seed.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower() != "wal":
