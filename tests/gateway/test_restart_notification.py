@@ -387,3 +387,26 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     adapter.send.assert_not_awaited()
 
 
+
+
+
+@pytest.mark.asyncio
+async def test_discord_shutdown_notice_is_marked_non_conversational():
+    """Discord history backfill must not treat the shutdown banner as an assistant answer."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7")
+    source.platform = Platform.DISCORD
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config.platforms = {Platform.DISCORD: runner.config.platforms[Platform.TELEGRAM]}
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=None)
+    runner._cache_session_source(session_key, source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="shutdown"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.kwargs["metadata"] == {
+        "thread_id": "topic-7", "non_conversational": True, "_interim_send": True,
+    }

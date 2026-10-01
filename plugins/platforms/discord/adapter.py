@@ -240,6 +240,13 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
+    re.compile(r"^\s*⚠️\s+Gateway\s+(?:restarting|shutting down)\b[\s\S]*$", re.IGNORECASE),
+    re.compile(r"^\s*⚠️\s+Iteration\s+budget\s+exhausted\b[\s\S]*$", re.IGNORECASE),
+    # Session lifecycle banners are gateway control output, even when sent by an
+    # older build that did not persist the non-conversational message ID.
+    re.compile(r"^\s*◐\s+Session automatically reset\b[\s\S]*$", re.IGNORECASE),
+    # /topics index replies are control output, never conversational answers.
+    re.compile(r"^\s*##\s+Recent answered topics\b[\s\S]*$", re.IGNORECASE),
 )
 try:
     import discord
@@ -3066,6 +3073,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             current_existing_payload = self._existing_command_to_payload(current)
             current_payload = self._canonicalize_app_command_payload(current_existing_payload)
             desired_payload = self._canonicalize_app_command_payload(desired)
+            # Discord expands omitted install metadata to the application's defaults on readback
+            # (e.g. ``integration_types=[0, 1]``). An unset desired value does not constrain that
+            # field, so the server default is equivalent; explicit values still detect real drift.
+            for field_name in ("contexts", "integration_types"):
+                if desired_payload.get(field_name) is None:
+                    current_payload.pop(field_name, None)
+                    desired_payload.pop(field_name, None)
             if current_payload == desired_payload:
                 summary["unchanged"] += 1
                 continue

@@ -1059,3 +1059,20 @@ class TestNonConversationalTrackerOffload:
         assert sorted(writes[-1]) == ["1", "2"]
 
 
+
+
+
+@pytest.mark.parametrize("text", [
+    "⚠️ Gateway restarting — Your current task will be interrupted.",
+    "⚠️ Gateway shutting down — Your current task will be interrupted.",
+    "⚠️ Iteration budget exhausted (90/90) — asking model to summarise",
+    "◐ Session automatically reset (inactive). Conversation history cleared.",
+    "## Recent answered topics\n1. [x](https://discord.com/channels/1/2/3)",
+])
+def test_legacy_lifecycle_banners_are_nonconversational(text):
+    assert discord_platform._looks_like_nonconversational_history_message(text)
+
+
+def test_answer_mentioning_restart_is_still_conversational():
+    assert not discord_platform._looks_like_nonconversational_history_message(
+        "The gateway restarting earlier was caused by the update.")

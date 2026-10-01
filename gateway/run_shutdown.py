@@ -994,7 +994,10 @@ class GatewayShutdownMixin:
     async def _send_shutdown_notice(
         self, adapter, chat_id: str, msg: str, kind: str, platform_str: str, **send_kwargs
     ) -> bool:
-        """Send one shutdown notice; True when delivered. Failures are debug-logged, never raised."""
+        """Send one shutdown notice; True when delivered. Failures are debug-logged, never raised.
+        Lifecycle banner, not an answer: Discord marks it non-conversational for history backfill."""
+        from gateway.run import _non_conversational_metadata
+        send_kwargs["metadata"] = _non_conversational_metadata(send_kwargs.get("metadata"), platform=platform_str)
         where = "home channel " if kind == "home channel" else ""
         fail_fmt = f"Failed to send shutdown notification to {where}%s:%s: %s"
         if not await self._send_notice_logged(adapter, chat_id, msg, platform_str, fail_fmt, **send_kwargs):
