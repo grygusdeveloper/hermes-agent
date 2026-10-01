@@ -359,6 +359,125 @@ def _truncate_discord_component_text(text: str, limit: int) -> str:
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
 
 
+# Main VPS customization: autocomplete for /spawn agent + model and /model name, ported from the fork's
+# main-vps-custom (the integration re-port onto upstream's table-driven slash commands dropped it). Choices
+# are read from config on each keystroke; free text is still accepted for anything not listed.
+def _alias_reasoning_suffix(raw_config: Any, model: str, raw_spec: Any) -> str:
+    """`` · <effort>`` for an alias: its own reasoning_effort wins, else the effort configured for the model."""
+    effort = ""
+    if isinstance(raw_spec, dict):
+        effort = str(raw_spec.get("reasoning_effort") or raw_spec.get("reasoning") or "").strip().lower()
+        if effort:
+            from hermes_constants import parse_reasoning_effort
+            parsed = parse_reasoning_effort(effort)
+            effort = str(parsed.get("effort") or "").strip() if parsed is not None else ""
+    if effort:
+        return f" · {effort}"
+    from hermes_constants import resolve_reasoning_config
+    reasoning = resolve_reasoning_config(raw_config, model)
+    if isinstance(reasoning, dict):
+        if reasoning.get("enabled") is False:
+            return " · none"
+        if reasoning.get("effort"):
+            return f" · {reasoning['effort']}"
+    return ""
+
+
+def _alias_route(model: str, provider: str) -> str:
+    return f"{provider}/{model}" if provider and not model.casefold().startswith(f"{provider}/".casefold()) else model
+
+
+def _spawn_autocomplete_sections(raw_config: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(gateway.spawn, gateway.spawn.agents)`` as dicts, empty when absent or malformed."""
+    gateway_cfg = raw_config.get("gateway") if isinstance(raw_config, dict) else None
+    spawn_cfg = gateway_cfg.get("spawn") if isinstance(gateway_cfg, dict) else None
+    spawn_cfg = spawn_cfg if isinstance(spawn_cfg, dict) else {}
+    agents_cfg = spawn_cfg.get("agents")
+    return spawn_cfg, agents_cfg if isinstance(agents_cfg, dict) else {}
+
+
+def _spawn_agent_choice_specs(raw_config: Any, current: str = "") -> list[tuple[str, str]]:
+    """``(label, alias)`` for the configured spawn agents matching ``current`` (Discord caps choices at 25)."""
+    _, agents_cfg = _spawn_autocomplete_sections(raw_config)
+    needle = str(current or "").strip().casefold()
+    choices: list[tuple[str, str]] = []
+    for raw_alias, raw_spec in sorted(agents_cfg.items(), key=lambda item: str(item[0])):
+        alias = str(raw_alias).strip()
+        if not alias or len(alias) > 100:
+            continue
+        if isinstance(raw_spec, str):
+            profile = raw_spec.strip() or alias
+        elif isinstance(raw_spec, dict):
+            profile = str(raw_spec.get("profile") or alias).strip()
+        else:
+            profile = alias
+        label = f"{alias} — profile {profile}"
+        if needle and needle not in alias.casefold() and needle not in label.casefold():
+            continue
+        choices.append((_truncate_discord_component_text(label, 100), alias))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def _spawn_model_choice_specs(raw_config: Any, selected_agent: str = "", current: str = "") -> list[tuple[str, str]]:
+    """``(label, alias)`` for the spawn model aliases valid for ``selected_agent`` (global, then agent-level)."""
+    spawn_cfg, agents_cfg = _spawn_autocomplete_sections(raw_config)
+    agent_spec = agents_cfg.get(str(selected_agent or spawn_cfg.get("default_agent") or "main").strip().lower())
+    models: dict[str, Any] = {}
+    if isinstance(spawn_cfg.get("models"), dict):
+        models.update(spawn_cfg["models"])
+    if isinstance(agent_spec, dict) and isinstance(agent_spec.get("models"), dict):
+        models.update(agent_spec["models"])
+    needle = str(current or "").strip().casefold()
+    choices: list[tuple[str, str]] = []
+    for raw_alias, raw_spec in sorted(models.items(), key=lambda item: str(item[0])):
+        alias = str(raw_alias).strip()
+        if not alias or len(alias) > 100:
+            continue
+        if isinstance(raw_spec, str):
+            model, provider = raw_spec.strip(), ""
+        elif isinstance(raw_spec, dict):
+            model = str(raw_spec.get("model") or "").strip()
+            provider = str(raw_spec.get("provider") or "").strip()
+        else:
+            continue
+        if not model:
+            continue
+        label = f"{alias} — {_alias_route(model, provider)}" + _alias_reasoning_suffix(raw_config, model, raw_spec)
+        if needle and needle not in alias.casefold() and needle not in label.casefold():
+            continue
+        choices.append((_truncate_discord_component_text(label, 100), alias))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def _model_command_choice_specs(raw_config: Any, current: str = "") -> list[tuple[str, str]]:
+    """``(label, alias)`` for ``/model`` from top-level ``model_aliases``; each alias binds its own
+    provider/model/base URL through the gateway's model-switch resolver."""
+    aliases = raw_config.get("model_aliases") if isinstance(raw_config, dict) else None
+    aliases = aliases if isinstance(aliases, dict) else {}
+    needle = str(current or "").strip().casefold()
+    choices: list[tuple[str, str]] = []
+    for raw_alias, raw_spec in sorted(aliases.items(), key=lambda item: str(item[0])):
+        alias = str(raw_alias).strip()
+        if not alias or len(alias) > 100 or not isinstance(raw_spec, dict):
+            continue
+        model = str(raw_spec.get("model") or "").strip()
+        provider = str(raw_spec.get("provider") or "").strip()
+        if not model:
+            continue
+        label = str(raw_spec.get("label") or f"{alias} — {_alias_route(model, provider)}").strip()
+        label += _alias_reasoning_suffix(raw_config, model, raw_spec)
+        if needle and all(needle not in c.casefold() for c in (alias, label, model, provider)):
+            continue
+        choices.append((_truncate_discord_component_text(label, 100), alias))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
     """Abort the active aiohttp transport after a bounded close times out."""
     socket = getattr(websocket, "socket", None)
@@ -4479,6 +4598,30 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 if value.strip():
                     parts.extend((f"--{key}", shlex.quote(value.strip())))
             await self._run_simple_slash(interaction, " ".join(parts))
+        self._attach_autocomplete(slash_spawn, "agent", lambda cfg, _i, cur: _spawn_agent_choice_specs(cfg, cur))
+        self._attach_autocomplete(slash_spawn, "model", lambda cfg, i, cur: _spawn_model_choice_specs(
+            cfg, selected_agent=str(getattr(getattr(i, "namespace", None), "agent", "") or ""), current=cur))
+
+    @staticmethod
+    def _attach_autocomplete(command, option: str, choices_for) -> None:
+        """Give ``option`` a config-driven autocomplete; ``choices_for(raw_config, interaction, current)`` returns
+        ``(label, value)`` pairs. Never raises into Discord: a failure only means no suggestions."""
+        register = getattr(command, "autocomplete", None)
+        if not callable(register):
+            return
+
+        async def _suggest(interaction: discord.Interaction, current: str):
+            try:
+                from gateway.run import _load_gateway_config
+                specs = choices_for(_load_gateway_config() or {}, interaction, current)
+                return [discord.app_commands.Choice(name=label, value=value) for label, value in specs]
+            except Exception:
+                logger.debug("Discord %s autocomplete failed", option, exc_info=True)
+                return []
+
+        decorator = register(option)
+        if callable(decorator):
+            decorator(_suggest)
 
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
@@ -4489,9 +4632,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if template is None:
                 self._register_thread_slash(tree, name, description)
                 continue
-            tree.command(name=name, description=description)(
+            command = tree.command(name=name, description=description)(
                 self._slash_proxy(name, args, template, followup, strip=name != "insights")
             )
+            if name == "model":
+                self._attach_autocomplete(command, "name", lambda cfg, _i, cur: _model_command_choice_specs(cfg, cur))
         self._register_spawn_slash(tree)
         # Auto-register COMMAND_REGISTRY + plugin commands not yet on the tree. Native
         # commands above always survive the 100-command cap; reserve one slot for /skill.

@@ -84,6 +84,17 @@ class FakeTree:
 
     def command(self, *, name, description):
         def decorator(fn):
+            callbacks = {}
+
+            def autocomplete(option_name):
+                def register(callback):
+                    callbacks[option_name] = callback
+                    return callback
+
+                return register
+
+            fn.autocomplete = autocomplete
+            fn.autocomplete_callbacks = callbacks
             self.commands[name] = fn
             return fn
 
@@ -112,6 +123,86 @@ def adapter():
     # construct a full auth context (allowlist / channel scope).
     adapter._check_slash_authorization = AsyncMock(return_value=True)
     return adapter
+
+# ------------------------------------------------------------------
+# /model and /spawn autocomplete (Main VPS customization)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_model_slash_autocomplete_lists_configured_aliases(adapter):
+    adapter._register_slash_commands()
+    callback = adapter._client.tree.commands["model"].autocomplete_callbacks["name"]
+    config = {
+        "agent": {"reasoning_overrides": {"gpt-5.6-terra": "high"}},
+        "model_aliases": {
+            "terra": {"label": "Terra", "provider": "openai-codex", "model": "gpt-5.6-terra"},
+            "luna": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        },
+    }
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        choices = await callback(SimpleNamespace(), "ter")
+
+    assert [(choice.name, choice.value) for choice in choices] == [("Terra · high", "terra")]
+
+
+@pytest.mark.asyncio
+async def test_spawn_autocomplete_uses_configured_agents_and_models(adapter):
+    config = {
+        "agent": {
+            "reasoning_effort": "medium",
+            "reasoning_overrides": {"gpt-5.6-luna": "xhigh", "gpt-5.6-terra": "xhigh"},
+        },
+        "gateway": {
+            "spawn": {
+                "default_agent": "main",
+                "models": {"shared": {"provider": "openrouter", "model": "shared/model"}},
+                "agents": {
+                    "main": {
+                        "profile": "default",
+                        "models": {
+                            "luna": {"provider": "openai-codex", "model": "gpt-5.6-luna", "reasoning_effort": "high"},
+                            "terra": {"provider": "openai-codex", "model": "gpt-5.6-terra"},
+                        },
+                    },
+                    "research": {"profile": "researcher"},
+                    "openrouter": {"profile": "openrouter"},
+                },
+            }
+        },
+    }
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        adapter._register_slash_commands()
+        command = adapter._client.tree.commands["spawn"]
+        agent_choices = await command.autocomplete_callbacks["agent"](SimpleNamespace(namespace=SimpleNamespace()), "re")
+        model_choices = await command.autocomplete_callbacks["model"](
+            SimpleNamespace(namespace=SimpleNamespace(agent="main")), "")
+
+    assert [(choice.name, choice.value) for choice in agent_choices] == [("research — profile researcher", "research")]
+    labels = {choice.value: choice.name for choice in model_choices}
+    assert labels["luna"] == "luna — openai-codex/gpt-5.6-luna · high"
+    assert labels["terra"] == "terra — openai-codex/gpt-5.6-terra · xhigh"
+    assert labels["shared"] == "shared — openrouter/shared/model · medium"
+
+
+@pytest.mark.asyncio
+async def test_spawn_autocomplete_filters_selected_agent_and_caps_choices(adapter):
+    agents: dict[str, object] = {f"worker-{index:02d}": {"profile": f"worker-{index:02d}"} for index in range(30)}
+    agents["main"] = {"profile": "default", "models": {"luna": {"provider": "openai-codex", "model": "gpt-5.6-luna"}}}
+    agents["research"] = {"profile": "researcher",
+                          "models": {"terra": {"provider": "openai-codex", "model": "gpt-5.6-terra"}}}
+    config = {"gateway": {"spawn": {"default_agent": "main", "agents": agents}}}
+    with patch("gateway.run._load_gateway_config", return_value=config):
+        adapter._register_slash_commands()
+        command = adapter._client.tree.commands["spawn"]
+        all_agents = await command.autocomplete_callbacks["agent"](SimpleNamespace(namespace=SimpleNamespace()), "")
+        research_models = await command.autocomplete_callbacks["model"](
+            SimpleNamespace(namespace=SimpleNamespace(agent="research")), "ter")
+
+    assert len(all_agents) == 25
+    assert [(choice.name, choice.value) for choice in research_models] == [
+        ("terra — openai-codex/gpt-5.6-terra", "terra")]
+
 
 
 # ------------------------------------------------------------------
