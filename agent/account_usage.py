@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -12,7 +13,7 @@ from agent.anthropic_credentials import _is_oauth_token, resolve_anthropic_token
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.auth_codex import _codex_pool_route_base_url
 from hermes_cli.runtime_provider import resolve_runtime_provider
-from hermes_time import safe_strftime
+from hermes_time import get_timezone, safe_strftime
 
 if TYPE_CHECKING:
     from typing import TypeGuard
@@ -647,9 +648,163 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     return _snapshot("openrouter", "credits_api", windows, details)
 
 
+# ---------------------------------------------------------------------------
+# Claude Code: the Claude subscription behind the local CLI. Its plan windows come from the
+# CLI's last ``rate_limit_event`` (persisted by agent.claude_code_limits); no credentials are read.
+# ---------------------------------------------------------------------------
+
+# ``rate_limit_info.unifiedWindows`` keys (utilization as a fraction) in display order.
+_CLAUDE_WINDOW_LABELS: tuple[tuple[str, str], ...] = (
+    ("five_hour", "Current session (5h)"),
+    ("seven_day", "Current week"),
+    ("seven_day_opus", "Opus week"),
+    ("seven_day_sonnet", "Sonnet week"),
+    ("seven_day_overage_included", "Week incl. extra usage"),
+)
+# The same windows in the one-line /status summary.
+_CLAUDE_SHORT_LABELS: tuple[tuple[str, str], ...] = (
+    ("five_hour", "5h"), ("seven_day", "week"), ("seven_day_opus", "Opus week"), ("seven_day_sonnet", "Sonnet week"),
+)
+_CLAUDE_LIMIT_LABELS = {
+    "five_hour": "5-hour session limit", "seven_day": "weekly limit", "seven_day_opus": "weekly Opus limit",
+    "seven_day_sonnet": "weekly Sonnet limit", "seven_day_overage_included": "weekly limit",
+    "overage": "extra-usage limit",
+}
+
+
+def _claude_epoch(value: Any) -> Optional[float]:
+    """Reset time in epoch seconds (the CLI reports seconds, older builds milliseconds)."""
+    if not _is_finite_num(value) or value <= 0:
+        return None
+    return float(value) / 1000.0 if value > 1e12 else float(value)
+
+
+def _claude_plan_windows(info: dict) -> dict[str, tuple[Optional[float], Optional[float]]]:
+    """``window -> (utilization fraction, reset epoch)``; the info's own ``rateLimitType`` fills in a
+    window ``unifiedWindows`` does not list."""
+    windows: dict[str, tuple[Optional[float], Optional[float]]] = {}
+
+    def utilization(value: Any) -> Optional[float]:
+        return float(value) if _is_finite_num(value) and value >= 0 else None
+
+    unified = info.get("unifiedWindows")
+    for name, window in (unified.items() if isinstance(unified, dict) else ()):
+        if isinstance(name, str) and isinstance(window, dict):
+            windows[name] = (utilization(window.get("utilization")), _claude_epoch(window.get("resetsAt")))
+    kind = info.get("rateLimitType")
+    if isinstance(kind, str) and kind and kind not in windows:
+        windows[kind] = (utilization(info.get("utilization")), _claude_epoch(info.get("resetsAt")))
+    return windows
+
+
+def _claude_status_live(info: dict, now: float) -> bool:
+    """Whether the info's ``status`` (for its ``rateLimitType`` window) still applies: not once that window reset."""
+    resets_at = _claude_epoch(info.get("resetsAt"))
+    kind, unified = info.get("rateLimitType"), info.get("unifiedWindows")
+    if resets_at is None and isinstance(kind, str) and isinstance(unified, dict) and isinstance(unified.get(kind), dict):
+        resets_at = _claude_epoch(unified[kind].get("resetsAt"))
+    return resets_at is None or resets_at > now
+
+
+def _claude_rate_limit_snapshot() -> Optional[dict]:
+    """The persisted ``{"info", "recorded_at", "warned"}`` plan snapshot, or None (fail-open)."""
+    try:
+        from agent.claude_code_limits import read_rate_limit_snapshot
+
+        snapshot = read_rate_limit_snapshot()
+    except Exception as exc:
+        logger.debug("Claude plan snapshot unavailable: %s", exc)
+        return None
+    return snapshot if isinstance(snapshot, dict) and isinstance(snapshot.get("info"), dict) else None
+
+
+def _claude_clock(epoch: float, now: float) -> str:
+    """``14:02`` today, ``Mon 14:02`` otherwise, in Hermes's configured timezone (else server-local)."""
+    zone = get_timezone()
+    moment = datetime.fromtimestamp(epoch, tz=zone) if zone is not None else datetime.fromtimestamp(epoch).astimezone()
+    today = datetime.fromtimestamp(now, tz=moment.tzinfo).date()
+    return safe_strftime(moment, "%H:%M" if moment.date() == today else "%a %H:%M")
+
+
+def build_claude_code_usage_snapshot(
+    rate_limit: Optional[dict], *, recorded_at: Optional[float] = None, now: Optional[float] = None,
+) -> Optional[AccountUsageSnapshot]:
+    """Claude plan windows for /usage from the CLI's last ``rate_limit_info`` (as of ``recorded_at``).
+    A window whose reset passed since the report is listed as reset, not with its stale figure."""
+    if not isinstance(rate_limit, dict) or not rate_limit:
+        return None
+    now = time.time() if now is None else now
+    labels = dict(_CLAUDE_WINDOW_LABELS)
+    order = {key: index for index, (key, _label) in enumerate(_CLAUDE_WINDOW_LABELS)}
+    windows: list[AccountUsageWindow] = []
+    details: list[str] = []
+    plan = sorted(_claude_plan_windows(rate_limit).items(), key=lambda item: order.get(item[0], len(order)))
+    for key, (utilization, resets_at) in plan:
+        if utilization is None:
+            continue
+        label = labels.get(key) or key.replace("_", " ").capitalize()
+        if resets_at is not None and resets_at <= now:
+            stamp = datetime.fromtimestamp(resets_at, tz=timezone.utc).astimezone()
+            details.append(f"{label}: reset at {safe_strftime(stamp, '%Y-%m-%d %H:%M %Z')}, after this report")
+            continue
+        windows.append(AccountUsageWindow(label=label, used_percent=utilization * 100.0, reset_at=_parse_dt(resets_at)))
+    status = str(rate_limit.get("status") or "") if _claude_status_live(rate_limit, now) else ""
+    if status and status != "allowed":
+        kind = str(rate_limit.get("rateLimitType") or "")
+        label = _CLAUDE_LIMIT_LABELS.get(kind) or kind.replace("_", " ")
+        details.append(f"Status: {status.replace('_', ' ')}" + (f" ({label})" if label else ""))
+    overage = str(rate_limit.get("overageStatus") or "")
+    if overage:
+        reason = str(rate_limit.get("overageDisabledReason") or "").replace("_", " ")
+        details.append(f"Extra usage: {overage.replace('_', ' ')}" + (f" ({reason})" if reason else ""))
+    if _is_finite_num(recorded_at) and recorded_at > 0:
+        stamp = datetime.fromtimestamp(float(recorded_at), tz=timezone.utc).astimezone()
+        details.append(f"As reported by Claude Code at {safe_strftime(stamp, '%Y-%m-%d %H:%M %Z')}")
+    if not windows and not details:
+        return None
+    return _snapshot("claude-code", "claude_code_rate_limit", windows, details, title="Claude plan limits")
+
+
+def _fetch_claude_code_account_usage(
+    base_url: Optional[str] = None, api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    snapshot = _claude_rate_limit_snapshot()
+    if snapshot is None:
+        return None
+    return build_claude_code_usage_snapshot(snapshot["info"], recorded_at=snapshot.get("recorded_at"))
+
+
+def claude_code_plan_line(now: Optional[float] = None) -> str:
+    """``Claude plan: 5h 28% · week 41% (as of 14:02)`` for /status, or "" without data."""
+    snapshot = _claude_rate_limit_snapshot()
+    if snapshot is None:
+        return ""
+    info, recorded_at = snapshot["info"], snapshot.get("recorded_at")
+    now = time.time() if now is None else now
+    windows = _claude_plan_windows(info)
+    parts = []
+    for key, label in _CLAUDE_SHORT_LABELS:
+        utilization, resets_at = windows.get(key, (None, None))
+        # A window that reset since the report no longer has its figure.
+        if utilization is not None and (resets_at is None or resets_at > now):
+            parts.append(f"{label} {utilization:.0%}")
+    status = str(info.get("status") or "") if _claude_status_live(info, now) else ""
+    if status == "rejected":
+        parts.append("limit reached")
+    elif status == "allowed_warning":
+        parts.append("near a limit")
+    if not parts:
+        return ""
+    text = "Claude plan: " + " · ".join(parts)
+    if _is_finite_num(recorded_at) and recorded_at > 0:
+        text += f" (as of {_claude_clock(float(recorded_at), now)})"
+    return text
+
+
+
 _USAGE_FETCHERS: dict[str, Callable[[Optional[str], Optional[str]], Optional[AccountUsageSnapshot]]] = {
     "openai-codex": _fetch_codex_account_usage, "anthropic": _fetch_anthropic_account_usage,
-    "openrouter": _fetch_openrouter_account_usage,
+    "openrouter": _fetch_openrouter_account_usage, "claude-code": _fetch_claude_code_account_usage,
 }
 
 

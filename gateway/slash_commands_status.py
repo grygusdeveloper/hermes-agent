@@ -303,6 +303,12 @@ class GatewayStatusCommandsMixin:
                            pct=f"{mark}{pct}"))
         elif context_used:
             lines.append(t("gateway.status.context_used", used=mark + _fmt(context_used)))
+        if str(provider_name or "").strip().lower() == "claude-code":
+            # The subscription windows the CLI last reported (persisted, so it survives restarts).
+            from agent.account_usage import claude_code_plan_line
+            plan_line = await _quiet(lambda: asyncio.to_thread(claude_code_plan_line), "")
+            if plan_line:
+                lines.append(plan_line)
         state = t("gateway.status.state_yes") if fields["agent_running"] else t("gateway.status.state_no")
         lines += [t("gateway.status.tokens", tokens=fields["tokens"]),
                   t("gateway.status.agent_running", state=state)]

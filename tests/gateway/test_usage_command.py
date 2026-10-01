@@ -306,3 +306,34 @@ class TestUsageContextBreakdown:
         # Zero-token category is dropped, not rendered.
         assert "Conversation" not in result
 
+
+class TestUsageClaudeCode:
+    """/usage on Claude Code: the plan windows the CLI last reported (no credentials read)."""
+
+    @pytest.mark.asyncio
+    async def test_claude_code_plan_windows_come_from_the_persisted_snapshot(self, monkeypatch):
+        import sys
+        import time
+        import types
+
+        reset = time.time() + 3600
+        limits = types.ModuleType("agent.claude_code_limits")
+        limits.read_rate_limit_snapshot = lambda: {
+            "info": {"status": "allowed", "unifiedWindows": {
+                "five_hour": {"utilization": 0.35, "resetsAt": reset},
+                "seven_day": {"utilization": 0.63, "resetsAt": reset + 86400},
+            }},
+            "recorded_at": time.time() - 60, "warned": {},
+        }
+        monkeypatch.setitem(sys.modules, "agent.claude_code_limits", limits)
+        monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])
+        agent = _make_mock_agent(provider="claude-code", model="claude-opus-5", base_url="acp://claude-code")
+        agent.get_rate_limit_state.return_value = None
+        runner = _make_runner(SK, cached_agent=agent)
+        runner._context_breakdown_lines = lambda _agent, _source: []
+
+        result = await runner._handle_usage_command(MagicMock())
+
+        assert "Claude plan limits" in result and "Provider: claude-code" in result
+        assert "Current session (5h): 65% remaining (35% used)" in result
+        assert "Current week: 37% remaining (63% used)" in result

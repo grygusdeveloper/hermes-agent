@@ -765,3 +765,68 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
+
+
+def _status_entry():
+    return SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+
+
+@pytest.fixture
+def claude_plan_snapshot(monkeypatch):
+    """agent.claude_code_limits.read_rate_limit_snapshot stand-in (owned by the limits module)."""
+    import sys
+    import types
+
+    reads = []
+    reset = time.time() + 3600
+    limits = types.ModuleType("agent.claude_code_limits")
+
+    def read_rate_limit_snapshot():
+        reads.append(True)
+        return {"info": {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": 0.28, "resetsAt": reset},
+            "seven_day": {"utilization": 0.41, "resetsAt": reset + 86400},
+        }}, "recorded_at": time.time(), "warned": {}}
+
+    limits.read_rate_limit_snapshot = read_rate_limit_snapshot
+    monkeypatch.setitem(sys.modules, "agent.claude_code_limits", limits)
+    return reads
+
+
+@pytest.mark.asyncio
+async def test_status_command_shows_claude_plan_windows_for_claude_code(claude_plan_snapshot):
+    runner = _make_runner(_status_entry())
+    runner._running_agents[build_session_key(_make_source())] = SimpleNamespace(
+        model="claude-opus-5",
+        provider="claude-code",
+        context_compressor=SimpleNamespace(last_prompt_tokens=1_000, context_length=1_000_000),
+        interrupt=MagicMock(),
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "Claude plan: 5h 28% · week 41% (as of " in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_has_no_claude_line_for_other_providers(claude_plan_snapshot):
+    runner = _make_runner(_status_entry())
+    runner._running_agents[build_session_key(_make_source())] = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        context_compressor=SimpleNamespace(last_prompt_tokens=1, context_length=10),
+        interrupt=MagicMock(),
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "Claude plan" not in result
+    assert claude_plan_snapshot == []
