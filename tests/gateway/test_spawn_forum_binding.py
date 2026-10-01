@@ -314,3 +314,127 @@ async def test_non_session_model_switch_keeps_forum_tag_and_brokered_scope(tmp_p
     assert restarted.get_execution_profile(key) == "default"
     assert restarted.get_model_override(key) == ({"model": "standing"} if one_turn else None)
     restarted.close_all_db_handles()
+
+
+_TITLE_CONFIG = {"gateway": {"spawn": {
+    "parent_channel_id": "forum-1",
+    "models": {
+        "sol-high": {"label": "Sol High", "model": "gpt-5.6-sol", "provider": "openai-codex",
+                     "reasoning_effort": "high"},
+        "sol-xhigh": {"label": "Sol XHigh", "model": "gpt-5.6-sol", "provider": "openai-codex",
+                      "reasoning_effort": "xhigh"},
+    },
+}}}
+
+
+class _TitleAdapter:
+    def __init__(self, thread):
+        self.renames = []
+        self._client = SimpleNamespace(get_channel=lambda _id: None, fetch_channel=AsyncMock(return_value=thread))
+
+    async def rename_thread(self, thread_id, name, *, only_if_current_name=None):
+        self.renames.append((thread_id, name, only_if_current_name))
+        return True
+
+
+class _TitleRunner:
+    _is_discord_spawn_forum_lane = GatewayRunner._is_discord_spawn_forum_lane
+    _is_discord_auto_thread_lane = GatewayRunner._is_discord_auto_thread_lane
+    _is_relay_discord_channel_lane = GatewayRunner._is_relay_discord_channel_lane
+    _spawn_forum_title_rename = GatewayRunner._spawn_forum_title_rename
+    _sanitize_discord_thread_title = GatewayRunner._sanitize_discord_thread_title
+    _rename_discord_auto_thread_for_session_title = GatewayRunner._rename_discord_auto_thread_for_session_title
+    _session_key_for_source = GatewayRunner._session_key_for_source
+
+    def __init__(self, adapter, override):
+        self.adapters = {Platform.DISCORD: adapter}
+        self.async_session_store = SimpleNamespace(get_model_override=AsyncMock(return_value=override))
+        self.config = GatewayConfig()
+
+    def _delivery_adapter_for(self, source):
+        return self.adapters[source.platform]
+
+
+def _forum_source(parent="forum-1"):
+    return SessionSource(platform=Platform.DISCORD, chat_id="12345", chat_type="thread", thread_id="12345",
+                         parent_chat_id=parent, user_id="owner-1")
+
+
+async def _semantic_rename(thread, title="Fix dot title inference", source=None):
+    adapter = _TitleAdapter(thread)
+    runner = _TitleRunner(adapter, {"model": "gpt-5.6-sol", "provider": "openai-codex"})
+    with patch("gateway.run._load_gateway_config", return_value=_TITLE_CONFIG):
+        await runner._rename_discord_auto_thread_for_session_title(source or _forum_source(), "session-1", title)
+    return adapter.renames
+
+
+@pytest.mark.asyncio
+async def test_placeholder_forum_topic_takes_one_guarded_semantic_rename_with_tagged_label():
+    thread = SimpleNamespace(name=".", applied_tags=[SimpleNamespace(name="sol-xhigh")])
+
+    # Both aliases share the wire model and the persisted override has no effort: the post's model tag decides.
+    assert await _semantic_rename(thread) == [("12345", "Fix dot title inference · Sol XHigh", ".")]
+
+
+@pytest.mark.asyncio
+async def test_hearted_placeholder_keeps_heart_through_semantic_rename():
+    thread = SimpleNamespace(name="❤️ New chat · Sol High", applied_tags=[SimpleNamespace(name="sol-high")])
+
+    assert await _semantic_rename(thread) == [
+        ("12345", "❤️ Fix dot title inference · Sol High", "❤️ New chat · Sol High"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["Benchmark flaky auth · Sol High", "my own words", None])
+async def test_human_title_or_unknown_name_is_never_renamed(name):
+    thread = SimpleNamespace(name=name, applied_tags=[SimpleNamespace(name="sol-high")])
+
+    assert await _semantic_rename(thread) == []
+
+
+@pytest.mark.asyncio
+async def test_thread_outside_spawn_forum_is_not_a_semantic_rename_lane():
+    thread = SimpleNamespace(name=".", applied_tags=[])
+
+    assert await _semantic_rename(thread, source=_forum_source(parent="other-channel")) == []
+
+
+def test_title_callback_schedules_semantic_rename_only_in_spawn_forum():
+    from gateway.run_turn_runner import TurnRunner
+
+    scheduled = []
+
+    class LaneRunner:
+        _is_telegram_topic_lane = lambda self, source: False  # noqa: E731
+        _is_discord_auto_thread_lane = GatewayRunner._is_discord_auto_thread_lane
+        _is_relay_discord_channel_lane = GatewayRunner._is_relay_discord_channel_lane
+        _is_discord_spawn_forum_lane = GatewayRunner._is_discord_spawn_forum_lane
+
+        def _schedule_discord_semantic_thread_rename(self, source, session_id, title):
+            scheduled.append((source.thread_id, session_id, title))
+
+    holder = SimpleNamespace(_runner=LaneRunner())
+
+    def attach(source):
+        agent = SimpleNamespace(session_id="sess-1", _session_db=None)
+        TurnRunner._attach_session_title_callback(holder, agent, SimpleNamespace(source=source))
+        return getattr(agent, "_on_session_title", None)
+
+    with patch("gateway.run._load_gateway_config", return_value=_TITLE_CONFIG):
+        callback = attach(_forum_source())
+        assert attach(_forum_source(parent="other-channel")) is None
+    callback("fix the dot title", "derived")
+    callback("Fix dot title inference", "llm")
+
+    assert scheduled == [("12345", "sess-1", "Fix dot title inference")]
+
+
+@pytest.mark.parametrize(("name", "placeholder"), [
+    (".", True), ("❤️ .", True), ("New chat · Sol High", True), ("untitled", True), ("—", True),
+    ("Fix dot title · Sol High", False), ("main · Sol High", False), ("❤️ Research plan", False),
+])
+def test_spawn_topic_placeholder_boundary(name, placeholder):
+    from gateway.spawn_command import _is_topic_placeholder
+
+    assert _is_topic_placeholder(name) is placeholder

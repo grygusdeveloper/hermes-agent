@@ -288,6 +288,47 @@ class GatewayTopicThreadsMixin:
             and getattr(source, "delivered_via_upstream_relay", False) is True
         )
 
+    def _is_discord_spawn_forum_lane(self, source: SessionSource) -> bool:
+        """Native Discord thread/forum post under ``gateway.spawn.parent_channel_id`` (shape + config only).
+        Its placeholder title (``.``, ``New chat · Model``) waits for the semantic session title."""
+        parent_chat_id = getattr(source, "parent_chat_id", None)
+        if (
+            source.platform != Platform.DISCORD or not getattr(source, "thread_id", None) or not parent_chat_id
+            or getattr(source, "delivered_via_upstream_relay", False) is True
+        ):
+            return False
+        from gateway.run import _load_gateway_config
+        raw = _load_gateway_config() or {}
+        gateway = raw.get("gateway") if isinstance(raw, dict) else None
+        spawn = gateway.get("spawn") if isinstance(gateway, dict) else None
+        parent_id = str(spawn.get("parent_channel_id") or "").strip() if isinstance(spawn, dict) else ""
+        return bool(parent_id) and str(parent_chat_id) == parent_id
+
+    async def _spawn_forum_title_rename(self, source: SessionSource, adapter, title: str) -> Optional[Tuple[str, str]]:
+        """``(name, guard)`` for the single semantic rename of a placeholder spawn topic, else ``None``.
+        Fails closed when Discord cannot report the current name and never clobbers a human title; the
+        guard makes the rename a no-op if the topic is renamed between this read and the edit."""
+        from gateway.run import _load_gateway_config
+        from gateway.spawn_command import _is_topic_placeholder, _topic_model_label, _topic_title
+        client = getattr(adapter, "_client", None)
+        thread = None
+        with suppress(Exception):
+            thread_id = int(str(source.thread_id))
+            get_channel = getattr(client, "get_channel", None)
+            thread = get_channel(thread_id) if callable(get_channel) else None
+            if thread is None:
+                thread = await client.fetch_channel(thread_id)
+        current_name = getattr(thread, "name", None)
+        if not isinstance(current_name, str) or not current_name.strip() or not _is_topic_placeholder(current_name):
+            return None
+        override = None
+        with suppress(Exception):
+            override = await self.async_session_store.get_model_override(self._session_key_for_source(source))
+        tag_names = tuple(str(getattr(tag, "name", "") or "") for tag in (getattr(thread, "applied_tags", None) or ()))
+        label = _topic_model_label(_load_gateway_config() or {}, override, tag_names)
+        heart = "❤️ " if current_name.strip().startswith("❤") else ""
+        return _topic_title(f"{heart}{title}", label), current_name
+
     def _relay_auto_thread_info(self, source: SessionSource) -> Optional[Tuple[str, str]]:
         """(thread_id, initial_name) when the RELAY connector auto-threaded our reply — the title-turn
         sibling of _is_discord_auto_thread_lane (whose markers only exist from turn 2 on; the title
@@ -341,7 +382,8 @@ class GatewayTopicThreadsMixin:
         """Best-effort semantic rename of a newly auto-created Discord thread. ``relay_info`` is the
         connector's (thread_id, initial_name) feedback, supplied on the title turn where the source
         is the parent-channel event without auto-thread markers (see _relay_auto_thread_info)."""
-        if relay_info is None and not await asyncio.to_thread(self._is_discord_auto_thread_lane, source):
+        spawn_forum = relay_info is None and await asyncio.to_thread(self._is_discord_spawn_forum_lane, source)
+        if relay_info is None and not spawn_forum and not await asyncio.to_thread(self._is_discord_auto_thread_lane, source):
             # Relay title turn with no feedback captured at schedule time: the title comes off the
             # user's opening message, so it beats the delivery that produces the connector's
             # send-result feedback by the whole length of the turn. None here = a true miss.
@@ -356,7 +398,16 @@ class GatewayTopicThreadsMixin:
             return
         relay = relay_info is not None
         target_thread_id = relay_info[0] if relay else str(source.thread_id)
-        thread_name = self._sanitize_discord_thread_title(title)
+        guard = getattr(source, "auto_thread_initial_name", None)
+        if spawn_forum:
+            # Placeholder spawn topics take exactly one rename (Discord allows 2 per 10 min), to
+            # ``essence · model`` keeping a /heart prefix; any other title belongs to the user.
+            planned = await self._spawn_forum_title_rename(source, adapter, title)
+            if planned is None:
+                return
+            thread_name, guard = planned
+        else:
+            thread_name = self._sanitize_discord_thread_title(title)
         # Relay: ask the CONNECTOR to enforce the no-clobber guard from its own created-name memory —
         # the gateway can't reproduce the initial name byte-for-byte (normalization drift silently
         # declined every rename). Its egress guard resolves the tenant from caches keyed by the PARENT
@@ -364,11 +415,11 @@ class GatewayTopicThreadsMixin:
         # the initial name.
         rename_kwargs = (
             {"prefer_connector_created": True, "parent_chat_id": str(source.chat_id) if source.chat_id else None}
-            if relay else {"only_if_current_name": getattr(source, "auto_thread_initial_name", None)}
+            if relay else {"only_if_current_name": guard}
         )
         logger.info(
             "discord auto-thread rename: thread=%s lane=%s new_title=%r",
-            target_thread_id, "relay" if relay else "native", thread_name,
+            target_thread_id, "relay" if relay else ("spawn-forum" if spawn_forum else "native"), thread_name,
         )
         try:
             renamed = await rename_thread(target_thread_id, thread_name, **rename_kwargs)
@@ -417,7 +468,7 @@ class GatewayTopicThreadsMixin:
         if not title:
             return
         relay_info = None
-        if not self._is_discord_auto_thread_lane(source):
+        if not self._is_discord_auto_thread_lane(source) and not self._is_discord_spawn_forum_lane(source):
             # Relay title turn: the source is the PARENT channel event (thread didn't exist at
             # ingest). The auto-title races the delivery that fills the send-result cache, so a
             # miss HERE is not a verdict: schedule whenever the SHAPE matches; the async rename

@@ -352,6 +352,7 @@ def _mk_runner_stub():
         _relay_auto_thread_info = GatewayRunner._relay_auto_thread_info
         _await_relay_auto_thread_info = GatewayRunner._await_relay_auto_thread_info
         _is_discord_auto_thread_lane = GatewayRunner._is_discord_auto_thread_lane
+        _is_discord_spawn_forum_lane = GatewayRunner._is_discord_spawn_forum_lane
         _sanitize_discord_thread_title = GatewayRunner._sanitize_discord_thread_title
         _rename_discord_auto_thread_for_session_title = (
             GatewayRunner._rename_discord_auto_thread_for_session_title
